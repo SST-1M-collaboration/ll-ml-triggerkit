@@ -17,8 +17,10 @@ Design points agreed for the package refactor:
 * ``targets``: ``"class"`` (the binary gamma/NSB label, mandatory) plus the
   auxiliary ``"true_image"`` and ``"peak_time"`` maps, which the streaming reader
   emits on request. Any other target raises ``NotImplementedError``.
-* ``gated_by``: reserved for the TDSCAN->CNN cascade (train the downstream stage
-  only on events that pass a frozen upstream chain). Not wired yet.
+* ``gated_by``: cascade training -- keep only the events one or more frozen
+  upstream chains fire on, so a downstream stage learns on what reaches it. The
+  gates see the whole datacube (two streaming TDSCAN filters on the same data);
+  a gate that would need a shorter, trigger-aligned window (CNN) is refused.
 * ``gamma_rotations``: reserved for hexagonal rotation augmentation. Rotation
   differs by representation (TDSCAN = pixel-index permutation; CNN = grid H x W
   after remapping), so it needs a real algorithm; for now anything other than
@@ -26,6 +28,9 @@ Design points agreed for the package refactor:
 """
 
 import warnings
+
+import numpy as np
+import tensorflow as tf
 
 from triggerkit.FileIO.paths import normalize_files
 from triggerkit.FileIO.FileOpenerCTAO import (
@@ -74,8 +79,12 @@ class TriggerDataset:
     targets : tuple of str
         Which targets the pipeline carries: ``"class"`` (mandatory), optionally
         ``"true_image"`` / ``"peak_time"``. Other values raise ``NotImplementedError``.
-    gated_by : TriggerChain or None
-        Reserved for cascade training. Not implemented yet.
+    gated_by : TriggerChain, sequence of TriggerChain, or None
+        Frozen upstream chain(s): only the events EVERY one of them fires on are
+        kept, in both splits, after the NSB roll augmentation (so the gate sees the
+        same NSB as the trained chain). Each gate must be compiled and see the whole
+        datacube. The per-split caps (``max_*_samples_*``) count events READ, before
+        the gate; the gate runs again at every epoch (the NSB rolls change).
     gamma_rotations : tuple of int
         Reserved for hex rotation augmentation. Non-``(0,)`` warns and is ignored.
     seed : int
@@ -138,12 +147,22 @@ class TriggerDataset:
         self.targets = tuple(targets)
         self._validate_targets()
 
-        if gated_by is not None:
-            raise NotImplementedError(
-                "gated_by (cascade gating: train only on events passing a frozen "
-                "upstream chain) is not wired yet; planned for the cascade step."
-            )
-        self.gated_by = None
+        if gated_by is None:
+            self.gated_by = []
+        elif isinstance(gated_by, (list, tuple)):
+            self.gated_by = list(gated_by)
+        else:
+            self.gated_by = [gated_by]
+        for k, gate in enumerate(self.gated_by):
+            if getattr(gate, "model", None) is None:
+                raise ValueError(f"gated_by[{k}] has no model: call compile_chain() first.")
+            if gate.num_samples != getattr(gate, "file_num_samples", gate.num_samples):
+                raise ValueError(
+                    f"gated_by[{k}] takes {gate.num_samples} of the {gate.file_num_samples} "
+                    "samples: a gate must see the whole datacube (use TriggerCascade windows "
+                    "for windowed stages).")
+            if gate.num_pixels != self.gated_by[0].num_pixels:
+                raise ValueError("all gated_by chains must take the same number of pixels.")
 
         self.gamma_rotations = tuple(gamma_rotations)
         if self.gamma_rotations != (0,):
@@ -226,7 +245,9 @@ class TriggerDataset:
             shuffle, roll_seed = False, self.seed + 2905  # 1337 -> 4242, as before
 
         return SimTelTFDatasetConfig(
-            batch_size=self.batch_size,
+            # gated: read big batches so the gate model runs on many events at once;
+            # the survivors are re-batched to batch_size in _gate()
+            batch_size=max(self.batch_size, 1024) if self.gated_by else self.batch_size,
             shuffle_samples=shuffle,
             sample_shuffle_buffer=10000,
             seed=self.seed,
@@ -259,12 +280,48 @@ class TriggerDataset:
         pedestal, event_id, tel_id, and the scalar event features). Packing to
         model inputs happens downstream.
         """
-        return SimTelTFDataset(
+        ds = SimTelTFDataset(
             gamma_files=gamma_files,
             nsb_files=self.nsb_files,
             opener_cls=self.opener_cls,
             config=self._config(training=training),
         ).dataset()
+        return self._gate(ds) if self.gated_by else ds
+
+    # ------------------------------------------------------------------ #
+    def gate_mask(self, wf, ped):
+        """Boolean (B,) mask of the events every ``gated_by`` chain fires on (numpy in/out)."""
+        keep = np.ones(wf.shape[0], dtype=bool)
+        for gate in self.gated_by:
+            rows = np.flatnonzero(keep)
+            if rows.size == 0:
+                break
+            out = gate.model(gate.pack_model_inputs(tf.convert_to_tensor(wf[rows]),
+                                                    tf.convert_to_tensor(ped[rows])), training=False)
+            out = tf.reshape(tf.cast(out, tf.float32), (rows.size, -1))
+            fired = tf.reduce_max(out, axis=1).numpy() > 0.5
+            keep[rows[~fired]] = False
+        return keep
+
+    def _gate(self, ds):
+        """Keep the events the gates fire on, then re-batch to full ``batch_size`` batches."""
+        n_pix = self.gated_by[0].num_pixels
+        n_t = self.gated_by[0].num_samples
+
+        def mask(wf, ped):
+            return self.gate_mask(wf.numpy().reshape(-1, n_pix, n_t).astype(np.uint16),
+                                  ped.numpy().reshape(-1, n_pix).astype(np.int32))
+
+        def gate(features, label):
+            keep = tf.py_function(mask, [features["waveform"], features["pedestal"]], tf.bool)
+            keep.set_shape([None])
+            features = {key: tf.boolean_mask(value, keep) for key, value in features.items()}
+            return features, tf.boolean_mask(label, keep)
+
+        # drop_remainder: the number of survivors changes every epoch (NSB rolls, shuffle),
+        # so the last batch can hold a single event, which XLA cannot compile
+        return (ds.map(gate).unbatch().batch(self.batch_size, drop_remainder=True)
+                .prefetch(tf.data.AUTOTUNE))
 
     # ------------------------------------------------------------------ #
     def train_val_datasets(self):

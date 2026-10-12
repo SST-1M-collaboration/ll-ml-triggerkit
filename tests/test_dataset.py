@@ -51,8 +51,8 @@ def test_argument_validation():
         ds(3, targets=("true_image",))               # 'class' is mandatory
     with pytest.raises(NotImplementedError):
         ds(3, targets=("class", "bogus"))
-    with pytest.raises(NotImplementedError):
-        ds(3, gated_by=object())
+    with pytest.raises(ValueError, match="compile_chain"):
+        ds(3, gated_by=object())                    # a gate must be a compiled chain
 
 
 def test_supported_aux_targets_and_single_nsb_string():
