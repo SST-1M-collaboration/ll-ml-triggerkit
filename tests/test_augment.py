@@ -84,3 +84,14 @@ def test_unknown_condition_and_kind(square_cam):
 def test_duplicate_rows_get_unique_names(square_cam):
     folds = make_rotation_folds(square_cam, [_spec(), _spec()], CONDS)
     assert len({f.name for f in folds}) == 2
+
+
+def test_condition_without_files_is_rejected_not_an_empty_fold(square_cam):
+    """A glob that matched nothing used to give a fold that silently reads zero events."""
+    from triggerkit.augment import make_condition_folds
+    with pytest.raises(ValueError, match="'low'.*no gamma or no NSB"):
+        make_rotation_folds(square_cam, [_spec(conditions=["low"])], {"low": ([], ["n.h5"])})
+    with pytest.raises(ValueError, match="'low'.*no gamma or no NSB"):
+        make_rotation_folds(square_cam, [_spec(conditions=["low"])], {"low": (["g.h5"], [])})
+    with pytest.raises(ValueError, match="'low'.*no gamma or no NSB"):
+        make_condition_folds(square_cam, {"low": ([], ["n.h5"], 5, 5)})

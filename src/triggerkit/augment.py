@@ -227,6 +227,9 @@ def make_condition_folds(geometry, conditions):
     folds = []
     for name, spec in conditions.items():
         gamma_files, nsb_files, gamma_events, nsb_events = spec
+        if not normalize_files(gamma_files) or not normalize_files(nsb_files):
+            raise ValueError(
+                f"condition {name!r} has no gamma or no NSB file (check the paths / glob that build it).")
         folds.append(Fold(
             name, gamma_index=identity, nsb_index=identity,
             config={"condition": name},
@@ -402,6 +405,10 @@ def make_rotation_folds(geometry, specs, condition_files, *, seed=1337, tol_frac
                     f"fold spec #{i}: condition {cond!r} not found in "
                     f"condition_files (available: {sorted(condition_files)}).")
             gamma_files, nsb_files = condition_files[cond]
+            if not normalize_files(gamma_files) or not normalize_files(nsb_files):
+                raise ValueError(
+                    f"fold spec #{i}: condition {cond!r} has no gamma or no NSB file "
+                    "(check the paths / glob that build it).")
 
             # Fold name must be unique (it keys the /folds table and
             # StatPlotter's fold lookup); a _<n> suffix only if it still

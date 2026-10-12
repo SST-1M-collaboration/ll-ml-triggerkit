@@ -1,108 +1,89 @@
-"""Compute SST-1M trigger statistics for the REAL patch7 telescope trigger.
+"""Statistics of the REAL SST-1M patch7 trigger -- one self-contained script.
 
-This is the deployed hardware trigger with the research TDSCAN filter removed:
+The trigger has no learned weight: sum every 7-patch cluster per time slice, take
+the camera-wide maximum, fire when it crosses ``tau``. ``tau`` is tuned once to
+the target NSB rate on the REFERENCE simulation, then frozen for every fold.
 
-    [fadc?] -> [subtract?] -> digital_sum(patch7) -> camera-wide max-pool
-            -> trainable threshold
+Edit the three blocks below, then run ``python examples/stats_patch7.py``:
+  1. SIMULATIONS -- the files of each simulated NSB condition (low, medium, ...)
+  2. FOLDS       -- the folds, each one saying which simulation(s) it runs on
+  3. the settings (target rate, output folder)
 
-i.e. the DigiCam digital-sum trigger. Each 7-pixel patch is summed per time
-slice, the camera-wide maximum over all patches and all time slices is taken,
-and the event fires when that maximum crosses ``tau``. There is NO learned
-layer -- ``tau`` is the only free parameter, tuned once to the target NSB rate
-and frozen. Same threshold-tuning / statistics / fold plumbing as
-``stats_tdscan.py``; only the body differs (digital_sum instead of tdscan).
-
-Run it (quote the globs; repeat --condition for several NSB conditions, the
-first one is the reference):
-
-    python examples/stats_patch7.py --condition medium "GAMMA_GLOB" "NSB_GLOB" [--output FOLDER] [--quick]
-
-The output HDF5 lands in --output (default: simu_sst1m_tel2_patch7).
+Everything lands in ONE statistics HDF5, every event tagged with its fold.
 """
 
+import glob
 import os
 
-import stats_common
 from triggerkit.TriggerChain import TriggerChain
 from triggerkit.augment import make_rotation_folds
 
-# --- Config ------------------------------------------------------------------
-BASE_NAME = "simu_cross"
-TARGET_RATE_HZ = 50_000
-SEED = 1337
+# --- 1. SIMULATIONS: name -> (gamma files, NSB files) -------------------------
+# The name is what the folds below refer to, and what ends their names
+# (rot0_original_medium). Add a line for every simulated NSB level you have.
+SIMULATIONS = {
+    "low":    (sorted(glob.glob("/data/sst1m/gamma_low/*.h5")),
+               sorted(glob.glob("/data/sst1m/nsb_low/*.h5"))),
+    "medium": (sorted(glob.glob("/data/sst1m/gamma_medium/*.h5")),
+               sorted(glob.glob("/data/sst1m/nsb_medium/*.h5"))),
+}
+REFERENCE = "medium"   # the chain and tau are built on this simulation
 
-# Threshold seed / sharpness. tau is retuned to TARGET_RATE_HZ below; TAU_INIT is
-# only the starting point. binary_output=True -> hard fire/no-fire decision.
-TAU_INIT = 10.0
-TAU_TEMP = 10.0
+# --- 2. FOLDS ------------------------------------------------------------------
+# One dict per fold. Required: gamma_events, nsb_events (how many events of each
+# kind) and conditions (the SIMULATIONS it runs on -- one fold is created per name).
+# Optional, to transform the events:
+#   gamma_deg (120/240), gamma_time_shift, nsb_kind ("rolled"/"shuffle") + nsb_param,
+#   nsb_time_shift.
+# patch7 learns nothing, so nothing should move between folds.
+FOLDS = [
+    # the untouched events, on both simulations -> rot0_original_low, rot0_original_medium
+    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["low", "medium"]},
+    # the other folds only on the medium simulation
+    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "gamma_deg": 120},
+    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "gamma_deg": 240},
+    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "nsb_kind": "rolled", "nsb_param": 1},
+    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "nsb_kind": "shuffle", "nsb_param": 2024},
+    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "gamma_time_shift": 5},
+    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "gamma_time_shift": 5, "nsb_time_shift": 5},
+]
 
-# Optional front-end stages before the digital sum (both off = the plain patch7
-# trigger on the raw waveform). Set FADC=True to add the shared FADC baseline
-# front-end; set SUBTRACT_VALUE to a scalar to subtract a pedestal before summing.
-FADC = False
-SUBTRACT_VALUE = None
-
-# Cross-validation folds: stats_common.STANDARD_FOLDS, identical to
-# stats_tdscan.py so the two runs compare fold by fold. patch7 learns nothing,
-# so they are a pure consistency check: gamma efficiency must not change under
-# a camera rotation, nor the NSB rate under an NSB reshuffle or time roll.
-FOLD_ROWS = stats_common.STANDARD_FOLDS
+# --- 3. Settings ---------------------------------------------------------------
+TARGET_RATE_HZ = 50_000                  # NSB rate tau is tuned to
+TAU_TUNING_EVENTS = 25_000               # NSB events used to tune tau
+OUTPUT_FOLDER = "simu_sst1m_tel2_patch7"
+BASE_NAME = "simu_cross"                 # start of the output file name
 
 
 def main():
-    args = stats_common.argument_parser(__doc__.splitlines()[0], "simu_sst1m_tel2_patch7").parse_args()
-    conditions = stats_common.condition_files(args)
-    gamma_files, nsb_files = next(iter(conditions.values()))  # reference condition
-    output_folder = args.output
+    gamma_files, nsb_files = SIMULATIONS[REFERENCE]
 
-    # --- The real patch7 trigger, built directly on the chain (no body) ------
-    # digital_sum(patch7) needs no learned weights, so there is nothing to build
-    # a dedicated body for -- three add_stage calls are the whole trigger.
+    # --- The chain: digital sum -> max over the camera -> threshold ----------
     chain = TriggerChain(gamma_files, simtel_nsb_path=nsb_files)
-    if FADC:
-        chain.add_stage("fadc")
-    if SUBTRACT_VALUE is not None:
-        chain.add_stage("shift", value=SUBTRACT_VALUE)
     chain.add_stage("digital_sum", mode="patch7")
     chain.add_stage("global_max_pooling_2d")
-    threshold_layer = chain.add_stage(
-        "threshold", init_tau=TAU_INIT, temp=TAU_TEMP, binary_output=True)
-
-    # find_threshold_for_target_rate needs chain.model to locate the threshold.
+    threshold = chain.add_stage("threshold", init_tau=10.0, temp=10.0, binary_output=True)
     chain.compile_chain()
 
-    # Tune tau ONCE on the nominal NSB and freeze it for every fold, so a rate
-    # drift across folds is a real signal rather than a re-tuning artefact.
+    # --- Tune tau once on the reference NSB events, then freeze it -----------
     tau, predicted_rate = chain.find_threshold_for_target_rate(
         target_rate_hz=TARGET_RATE_HZ,
-        tolerance_hz=2,
-        N_event_esimate_threshold=stats_common.threshold_events(args),
+        N_event_esimate_threshold=TAU_TUNING_EVENTS,
         batch_size=1024,
-        # same NSB sample compute_statistics evaluates below: the originals,
-        # not the rolled copies find_threshold_for_target_rate defaults to
-        nsb_skip_original_events=False,
-        nsb_roll_copies=0,
+        nsb_skip_original_events=False,   # tune on the same untouched NSB events
+        nsb_roll_copies=0,                # that compute_statistics evaluates below
     )
-    print(f"tau={tau}  predicted_rate={predicted_rate} Hz (frozen for all folds)")
-    threshold_layer.tau.assign(tau)
+    threshold.tau.assign(tau)
+    print(f"tau={tau}  (predicted NSB rate {predicted_rate:.0f} Hz, frozen for every fold)")
 
-    os.makedirs(output_folder, exist_ok=True)
-
-    # All folds go into ONE statistics HDF5 (each event tagged with a `fold`
-    # column, per-fold summaries in the /folds group). The pixel permutation is
-    # applied to the raw waveform + pedestal before the digital sum, so folds
-    # work here exactly as for TDSCAN.
-    #
-    # DATASET-level NSB augmentation stays OFF (nsb_roll_copies=0,
-    # nsb_skip_original_events=False): each NSB event is yielded exactly once,
-    # untouched, so the fold's own nsb_index is the ONLY NSB transform.
-    specs = stats_common.fold_specs(FOLD_ROWS, list(conditions), args.quick)
-    folds = make_rotation_folds(chain.geom, specs, conditions, seed=SEED)
+    # --- Statistics for every fold -------------------------------------------
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    folds = make_rotation_folds(chain.geom, FOLDS, SIMULATIONS)
     chain.compute_statistics(
-        base_name=BASE_NAME, folder=output_folder, batch_size=512,
-        tel_id_only=1, nsb_roll_copies=0, nsb_skip_original_events=False,
+        base_name=BASE_NAME, folder=OUTPUT_FOLDER, batch_size=512, tel_id_only=1,
+        nsb_roll_copies=0, nsb_skip_original_events=False,   # each NSB event read once, untouched
         ignore_errors=False, folds=folds)
-    print(f"Wrote per-event statistics under {output_folder}/")
+    print(f"Statistics written under {OUTPUT_FOLDER}/")
 
 
 if __name__ == "__main__":
