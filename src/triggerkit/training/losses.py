@@ -64,6 +64,8 @@ class PairwiseAUCLossMulti(tf.keras.losses.Loss):
         y_pred = tf.cast(y_pred, tf.float32)
         if y_pred.shape.rank == 1:
             y_pred = y_pred[:, None]
+        elif y_pred.shape.rank == 3:      # (B, boards, F) with (B, boards) labels: one sample per board
+            y_pred = tf.reshape(y_pred, [-1, y_pred.shape[-1]])
         y_true = tf.cast(tf.reshape(y_true, [-1]), tf.float32)
         pos = tf.boolean_mask(y_pred, y_true > 0.5)
         neg = tf.boolean_mask(y_pred, y_true < 0.5)

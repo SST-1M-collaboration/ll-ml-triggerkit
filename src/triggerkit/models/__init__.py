@@ -9,18 +9,24 @@
 * :func:`hex3d_hybrid_layers` / :func:`hex3d_hybrid_body` -- Jakub's hex CNN preset
   layer list (needs the ``[hexcnn]`` extra).
 * :class:`ScatterToGrid` / :class:`TimeMean` / :class:`GlobalHexMean` -- adapter layers.
+* :class:`CameraBoardSplitter` + :class:`ScatterToBoards` / :class:`UnfoldBoards` /
+  :class:`BoardMax` -- run the CNN per FPGA trigger board (B1X/B2X/B3X) with shared weights.
 
 There is no registry / ``get_body("name")``: construct a body directly and pass
 it to :func:`build_chain`.
 """
 
+from triggerkit.models.boards import BOARDS, CameraBoardSplitter
 from triggerkit.models.base import TriggerBody, build_chain
 from triggerkit.models.grid import GridTransform
 from triggerkit.models.hexcnn import hex3d_hybrid_body, hex3d_hybrid_layers
 from triggerkit.models.layers import (
+    BoardMax,
     GlobalHexMean,
+    ScatterToBoards,
     ScatterToGrid,
     TimeMean,
+    UnfoldBoards,
 )
 from triggerkit.models.sequential import SequentialBody
 from triggerkit.models.tdscan import TDSCANBody, generate_lin_space_edges
@@ -39,6 +45,11 @@ __all__ = [
     "TimeMean",
     "GlobalHexMean",
     "GridTransform",
+    "BOARDS",
+    "CameraBoardSplitter",
+    "ScatterToBoards",
+    "UnfoldBoards",
+    "BoardMax",
 ]
 
 

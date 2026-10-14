@@ -11,7 +11,9 @@ the ConfigFile_SST1M/*.csv files they replace:
 * patch7_clusters():   patches of the patch7 cluster of each patch, itself first
 * patch_positions():   (432, 2) position of each patch = its first pixel
 * tdscan_neighbors(e): TDSCAN neighbourhood of radius e, one slot per hexagon cell
+* board_patches(b):    patches seen by trigger board b (own + overlap), see BOARDS
 """
+import csv
 from functools import lru_cache
 from importlib.resources import files
 
@@ -19,6 +21,10 @@ import numpy as np
 
 N_PIXELS = 1296
 N_PATCHES = 432
+
+# The three FPGA trigger boards; each one gets a third of the patches (its own)
+# plus the patches of the neighbouring boards it needs for its patch7 clusters.
+BOARDS = ("B1X", "B2X", "B3X")
 
 # Columns of camera_config.cfg (see its header).
 _PIXEL_SW_ID, _X_PIXEL, _Y_PIXEL, _PATCH_SW_ID = 8, 9, 10, 11
@@ -98,3 +104,30 @@ def tdscan_neighbors(eps_xy):
         if (du + dv) % 2 == 0 and abs(dv) + abs(du) <= 2 * eps_xy
     ]
     return np.array([[patch_at.get((u[p] + du, v[p] + dv), -1) for du, dv in offsets] for p in range(N_PATCHES)])
+
+
+@lru_cache(maxsize=None)
+def board_patches(board):
+    """(patch_ids, is_overlap) of a trigger board, both sorted by increasing patch id.
+
+    ``is_overlap`` is True for the patches the board only receives from its neighbours;
+    the others (144 per board) are its own. Read from CTA_SST1M_board_pixels_<board>.csv
+    (generated from camera_config.cfg by camera-mapping/main.py).
+    """
+    if board not in BOARDS:
+        raise ValueError(f"unknown board {board!r}, expected one of {BOARDS}")
+    with files("triggerkit.camera").joinpath(f"CTA_SST1M_board_pixels_{board}.csv").open() as f:
+        rows = sorted((int(r["patch_sw_id"]), bool(int(r["is_overlap"]))) for r in csv.DictReader(f))
+    patch_ids = np.array([patch for patch, _ in rows], dtype=np.int64)
+    is_overlap = np.array([overlap for _, overlap in rows], dtype=bool)
+    patch_ids.flags.writeable = is_overlap.flags.writeable = False      # cached: shared by every caller
+    return patch_ids, is_overlap
+
+
+def board_own_mask():
+    """(len(BOARDS), 432) bool: True where the patch belongs to the board (not overlap)."""
+    mask = np.zeros((len(BOARDS), N_PATCHES), dtype=bool)
+    for k, board in enumerate(BOARDS):
+        patch_ids, is_overlap = board_patches(board)
+        mask[k, patch_ids[~is_overlap]] = True
+    return mask

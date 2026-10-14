@@ -23,7 +23,7 @@ Each list entry is one of:
 
 * a Keras ``Layer`` instance -- applied to the current cursor. If it
   exposes ``bind_geometry`` and is not bound yet, the camera geometry is
-  supplied first (``ScatterToGrid``, ``MaskCells``);
+  supplied first (``ScatterToGrid``, ``ScatterToBoards``, ``MaskCells``);
 * a string naming a stage -- either a :meth:`TriggerChain.add_stage` stage
   (``"global_max_pooling_2d"``, ``"threshold"``, ``"rescaling"``, ...) or an
   adapter (``"scatter_to_grid"``, ``"time_mean"``, ``"global_hex_mean"``);
@@ -39,10 +39,12 @@ Named layers (``layer.name``) and the returned handles are collected into the
 from tensorflow import keras
 
 from triggerkit.models.base import TriggerBody
-from triggerkit.models.layers import GlobalHexMean, ScatterToGrid, TimeMean
+from triggerkit.models.layers import (
+    BoardMax, GlobalHexMean, ScatterToBoards, ScatterToGrid, TimeMean, UnfoldBoards)
 
 # Adapter stage names handled here (everything else falls through to add_stage).
-_ADAPTERS = ("scatter_to_grid", "time_mean", "global_hex_mean")
+_ADAPTERS = ("scatter_to_grid", "scatter_to_boards", "time_mean", "global_hex_mean",
+             "unfold_boards", "board_max")
 
 
 class SequentialBody(TriggerBody):
@@ -61,6 +63,12 @@ class SequentialBody(TriggerBody):
     def _apply_adapter(self, chain, name, kwargs):
         if name == "scatter_to_grid":
             layer = ScatterToGrid.from_geometry(chain.geom, **kwargs)
+        elif name == "scatter_to_boards":
+            layer = ScatterToBoards.from_geometry(chain.geom, **kwargs)
+        elif name == "unfold_boards":
+            layer = UnfoldBoards(**kwargs)
+        elif name == "board_max":
+            layer = BoardMax(**kwargs)
         elif name == "time_mean":
             layer = TimeMean(**kwargs)
         elif name == "global_hex_mean":

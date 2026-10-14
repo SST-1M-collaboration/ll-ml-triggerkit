@@ -13,6 +13,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 
+from triggerkit.models.boards import CameraBoardSplitter
 from triggerkit.models.grid import GridTransform
 
 
@@ -114,6 +115,127 @@ class ScatterToGrid(keras.layers.Layer):
             "H": self.H, "W": self.W,
             "time_skip": self.time_skip, "time_window": self.time_window,
         })
+        return config
+
+
+@keras.utils.register_keras_serializable(package="triggerkit")
+class ScatterToBoards(keras.layers.Layer):
+    """Scatter a ``(B, P, S)`` waveform onto the grids of the 3 trigger boards.
+
+    Output is ``(B * n_boards, T, H, W, 1)``: the boards are folded into the batch axis
+    (row ``b * n_boards + k`` is board ``k`` of event ``b``), so one CNN with shared
+    weights reads all three boards -- all three have the same ``(H, W)`` and the same
+    occupied cells (see :class:`~triggerkit.models.boards.CameraBoardSplitter`). Each
+    board grid holds the board's own patches AND its overlap patches, exactly what the
+    FPGA board receives. Undo the folding with :class:`UnfoldBoards`.
+
+    Like :class:`ScatterToGrid`, it is built either *unbound* (``ScatterToBoards(time_window=32)``,
+    geometry bound later by ``SequentialBody`` / ``build_chain``) or *bound* up front with
+    :meth:`from_geometry`.
+    """
+
+    def __init__(self, cell_index=None, H=None, W=None, *, time_skip=0, time_window=None, **kwargs):
+        super().__init__(**kwargs)
+        self.time_skip = int(time_skip)
+        self.time_window = None if time_window is None else int(time_window)
+        self.H = None if H is None else int(H)
+        self.W = None if W is None else int(W)
+        self.cell_index = None
+        self._M = None
+        if cell_index is not None:
+            self._set_cells(cell_index)
+
+    def _set_cells(self, cell_index):
+        cell_index = np.asarray(cell_index, dtype=np.int64)        # (K, P), -1 = not on the board
+        n_boards, n_patches = cell_index.shape
+        matrix = np.zeros((n_boards, n_patches, self.H * self.W), dtype=np.float32)
+        board, patch = np.nonzero(cell_index >= 0)
+        matrix[board, patch, cell_index[board, patch]] = 1.0
+        self.cell_index = cell_index
+        self.n_boards = int(n_boards)
+        self._M = tf.constant(matrix)                               # (K, P, H*W)
+
+    @property
+    def bound(self):
+        return self._M is not None
+
+    def bind_geometry(self, geometry):
+        """Split the camera in boards from a 432-patch geometry. No-op if already bound."""
+        if self.bound:
+            return self
+        splitter = CameraBoardSplitter(geometry)
+        self.H, self.W = splitter.H, splitter.W
+        self._set_cells(splitter.cell_index())
+        return self
+
+    @classmethod
+    def from_geometry(cls, geometry, *, time_skip=0, time_window=None, **kwargs):
+        return cls(time_skip=time_skip, time_window=time_window, **kwargs).bind_geometry(geometry)
+
+    def call(self, x):
+        if self._M is None:
+            raise RuntimeError(
+                "ScatterToBoards is unbound: no camera geometry. Put it in a SequentialBody / "
+                "build_chain (which calls bind_geometry with chain.geom), or construct it via "
+                "ScatterToBoards.from_geometry().")
+        x = tf.cast(x, tf.float32)                                  # (B, P, S)
+        t1 = None if self.time_window is None else self.time_skip + self.time_window
+        x = tf.transpose(x[:, :, self.time_skip:t1], [0, 2, 1])     # (B, T, P)
+        g = tf.einsum("btp,kpc->bktc", x, self._M)                  # (B, K, T, H*W)
+        return tf.reshape(g, [-1, tf.shape(g)[2], self.H, self.W, 1])
+
+    def compute_output_shape(self, input_shape):
+        T = self.time_window
+        if T is None and input_shape[-1] is not None:
+            T = input_shape[-1] - self.time_skip
+        batch = None if input_shape[0] is None else input_shape[0] * self.n_boards
+        return (batch, T, self.H, self.W, 1)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "cell_index": None if self.cell_index is None else self.cell_index.tolist(),
+            "H": self.H, "W": self.W,
+            "time_skip": self.time_skip, "time_window": self.time_window,
+        })
+        return config
+
+
+@keras.utils.register_keras_serializable(package="triggerkit")
+class UnfoldBoards(keras.layers.Layer):
+    """Undo the batch folding of :class:`ScatterToBoards`: ``(B * K, ...)`` -> ``(B, K, ...)``."""
+
+    def __init__(self, n_boards=3, **kwargs):
+        super().__init__(**kwargs)
+        self.n_boards = int(n_boards)
+
+    def call(self, x):
+        return tf.reshape(x, [-1, self.n_boards] + list(x.shape[1:]))
+
+    def compute_output_shape(self, input_shape):
+        batch = None if input_shape[0] is None else input_shape[0] // self.n_boards
+        return (batch, self.n_boards) + tuple(input_shape[1:])
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"n_boards": self.n_boards})
+        return config
+
+
+@keras.utils.register_keras_serializable(package="triggerkit")
+class BoardMax(keras.layers.Layer):
+    """Max over the board axis of a ``(B, K, ...)`` score: the event fires if ANY board fires."""
+
+    def __init__(self, axis=1, **kwargs):
+        super().__init__(**kwargs)
+        self.axis = axis
+
+    def call(self, x):
+        return keras.ops.max(x, axis=self.axis, keepdims=False)
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"axis": self.axis})
         return config
 
 

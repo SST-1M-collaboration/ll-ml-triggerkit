@@ -21,6 +21,12 @@ Design points agreed for the package refactor:
   upstream chains fire on, so a downstream stage learns on what reaches it. The
   gates see the whole datacube (two streaming TDSCAN filters on the same data);
   a gate that would need a shorter, trigger-aligned window (CNN) is refused.
+* ``split="board"``: the trigger runs on 3 FPGA boards (B1X, B2X, B3X), so the label
+  becomes one 0/1 per board, shape ``(B, 3)``: a board is positive when the event is a
+  gamma AND the true p.e. summed over the board's OWN patches (not its overlap, which
+  belongs to a neighbour) reaches ``board_n_pe_min``. NSB is negative on every board.
+  Needs ``true_image`` (added to ``targets``); pair with
+  :class:`~triggerkit.models.layers.ScatterToBoards` on the model side.
 * ``gamma_rotations``: reserved for hexagonal rotation augmentation. Rotation
   differs by representation (TDSCAN = pixel-index permutation; CNN = grid H x W
   after remapping), so it needs a real algorithm; for now anything other than
@@ -32,6 +38,7 @@ import warnings
 import numpy as np
 import tensorflow as tf
 
+from triggerkit.camera import sst1m
 from triggerkit.FileIO.paths import normalize_files
 from triggerkit.FileIO.FileOpenerCTAO import (
     AsyncFileOpenerProcess,
@@ -85,6 +92,11 @@ class TriggerDataset:
         same NSB as the trained chain). Each gate must be compiled and see the whole
         datacube. The per-split caps (``max_*_samples_*``) count events READ, before
         the gate; the gate runs again at every epoch (the NSB rolls change).
+    split : {None, "board"}
+        ``"board"``: per-board labels ``(B, 3)`` instead of one label per event (see above).
+    board_n_pe_min : float
+        With ``split="board"``: minimum true p.e. on a board's own patches for a gamma to
+        count as a positive for that board.
     gamma_rotations : tuple of int
         Reserved for hex rotation augmentation. Non-``(0,)`` warns and is ignored.
     seed : int
@@ -112,6 +124,8 @@ class TriggerDataset:
         fold=0,
         targets=("class",),
         gated_by=None,
+        split=None,
+        board_n_pe_min=10.0,
         gamma_rotations=(0,),
         event_feature_keys=DEFAULT_EVENT_FEATURE_KEYS,
         opener_cls=AsyncFileOpenerProcess,
@@ -144,7 +158,14 @@ class TriggerDataset:
         self.n_folds = n_folds
         self.fold = fold
 
+        if split not in (None, "board"):
+            raise ValueError(f"split must be None or 'board', got {split!r}")
+        self.split = split
+        self.board_n_pe_min = float(board_n_pe_min)
+
         self.targets = tuple(targets)
+        if split == "board" and "true_image" not in self.targets:
+            self.targets += ("true_image",)       # the per-board p.e. sums come from it
         self._validate_targets()
 
         if gated_by is None:
@@ -286,7 +307,23 @@ class TriggerDataset:
             opener_cls=self.opener_cls,
             config=self._config(training=training),
         ).dataset()
-        return self._gate(ds) if self.gated_by else ds
+        if self.gated_by:
+            ds = self._gate(ds)
+        return self._board_labels(ds) if self.split == "board" else ds
+
+    def board_n_pe(self, true_image):
+        """``(B, 3)`` true p.e. on each board's own patches, from a ``(B, 432)`` true image."""
+        own = tf.constant(sst1m.board_own_mask().T.astype(np.float32))        # (432, 3)
+        return tf.matmul(tf.cast(true_image, tf.float32), own)
+
+    def _board_labels(self, ds):
+        """Replace the event label by the per-board one, ``(B, 3)`` (see the module docstring)."""
+        def to_board_labels(features, label):
+            n_pe = self.board_n_pe(features["true_image"])
+            positive = tf.logical_and(tf.equal(label, 1)[:, None], n_pe >= self.board_n_pe_min)
+            return features, tf.cast(positive, label.dtype)
+
+        return ds.map(to_board_labels, num_parallel_calls=tf.data.AUTOTUNE)
 
     # ------------------------------------------------------------------ #
     def gate_mask(self, wf, ped):

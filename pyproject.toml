@@ -33,7 +33,7 @@ dev = ["pytest"]
 where = ["src"]
 
 [tool.setuptools.package-data]
-triggerkit = ["**/*.json", "camera/*.cfg"]
+triggerkit = ["**/*.json", "camera/*.cfg", "camera/*.csv"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

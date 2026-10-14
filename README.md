@@ -20,6 +20,7 @@ from triggerkit.TriggerChain import TriggerChain
   - `TriggerChain.py` — core chain (`train_chain`, `compute_statistics`, `show_trigger_chain`, ...).
   - `Stages/ Loss/ Metric/ Callback/ Statistics/ FileIO/` — building blocks.
   - `data/ models/ training/` — dataset, pluggable bodies, training utilities (added incrementally).
+  - Per-board trigger (B1X/B2X/B3X): `models/boards.py` (`CameraBoardSplitter`), the `ScatterToBoards` / `UnfoldBoards` / `BoardMax` layers and `TriggerDataset(split="board")`; see `examples/train_hexcnn_boards.py`.
 - `examples/` — train / evaluate / show scripts.
 - `tests/`
 
