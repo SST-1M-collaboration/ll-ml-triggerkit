@@ -398,6 +398,8 @@ class TriggerChain:
         if history is not None:
             self.model.history = tf.keras.callbacks.History()
             self.model.history.history = history
+        # a reloaded model decides whether the pedestal is an input, not the stages added before
+        self._baseline_connected = len(self.model.inputs) == 2
         self.model.summary()
         return
     # input_baseline is a real Keras input only when the "fadc" stage wired it

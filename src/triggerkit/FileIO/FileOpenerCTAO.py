@@ -459,7 +459,10 @@ class SimTelTFDataset:
             self._ram_cache = (feat_arrays, labels_arr)
 
         feat_arrays, labels_arr = self._ram_cache
-        ds = tf.data.Dataset.from_tensor_slices((feat_arrays, labels_arr))
+        # host memory on purpose: with a GPU visible, the default placement copies the whole
+        # cached split to the device as one constant and runs out of GPU memory on large splits
+        with tf.device("/CPU:0"):
+            ds = tf.data.Dataset.from_tensor_slices((feat_arrays, labels_arr))
 
         if self.cfg.repeat:
             ds = ds.repeat()

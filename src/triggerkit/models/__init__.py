@@ -21,10 +21,13 @@ from triggerkit.models.base import TriggerBody, build_chain
 from triggerkit.models.grid import GridTransform
 from triggerkit.models.hexcnn import hex3d_hybrid_body, hex3d_hybrid_layers
 from triggerkit.models.layers import (
+    BoardGridToPatches,
     BoardMax,
     GlobalHexMean,
+    GridToPatches,
     ScatterToBoards,
     ScatterToGrid,
+    SubtractPedestal,
     TimeMean,
     UnfoldBoards,
 )
@@ -50,6 +53,9 @@ __all__ = [
     "ScatterToBoards",
     "UnfoldBoards",
     "BoardMax",
+    "GridToPatches",
+    "BoardGridToPatches",
+    "SubtractPedestal",
 ]
 
 
