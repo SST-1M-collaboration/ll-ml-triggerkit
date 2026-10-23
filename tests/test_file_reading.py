@@ -124,3 +124,34 @@ def test_async_opener_reports_a_crashing_worker():
         with pytest.raises(FileReadError):
             with AsyncFileOpenerProcess("/definitely/not/here.simtel.gz") as fo:
                 list(fo)
+
+
+class Sized(FakeOpener):
+    """Many small gamma files and ONE big NSB file, like the real training set."""
+    def __iter__(self):
+        for i in range(160 if self.path == "n" else 10):
+            yield _event(i)
+
+
+def _gamma_fraction_by_fifth(**kw):
+    ds = SimTelTFDataset([f"g{i}" for i in range(16)], ["n"], Sized, cfg(
+        load_ram=True, shuffle_samples=True, sample_shuffle_buffer=16, **kw)).dataset()
+    labels = np.array([l for _, lab in ds for l in lab.numpy().tolist()])
+    return [part.mean() for part in np.array_split(labels, 5)]
+
+
+def test_load_ram_mixes_the_classes_through_the_whole_epoch():
+    """interleave_files only mixes the files of an 8-file window, so with one NSB file among many
+    gamma files the stored order is ~87% gamma first, then pure NSB. A shuffle buffer smaller than
+    the dataset cannot undo that, so the cached split has to be permuted when it is loaded."""
+    fractions = _gamma_fraction_by_fifth()
+    assert all(0.3 < f < 0.7 for f in fractions), fractions
+
+
+def test_load_ram_keeps_every_event_and_the_stream_order_without_shuffle():
+    kw = dict(shuffle_samples=False)
+    ds = SimTelTFDataset([f"g{i}" for i in range(16)], ["n"], Sized, cfg(load_ram=True, **kw)).dataset()
+    labels = [l for _, lab in ds for l in lab.numpy().tolist()]
+    assert labels.count(1) == 160 and labels.count(0) == 160
+    first, last = labels[:100], labels[-100:]
+    assert sum(first) > 80 and sum(last) < 20                    # unshuffled: the class blocks are still there
