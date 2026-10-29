@@ -62,8 +62,11 @@ class SimTelTFDatasetConfig:
     load_ram: bool = False  # If True, load all data into RAM at start (may use lots of memory) but faster training.
 
     # If True, read from all files in a round-robin/random fashion instead of
-    # consuming one file completely before moving to the next. Keep true
-    # to have a better mixing of gamma/nsb samples within each batch.
+    # consuming one file completely before moving to the next. This mixes the files of
+    # a window (see interleave_max_concurrent_files), NOT the classes: a file is picked,
+    # not a label, so one NSB file among many gamma files is only ~1 draw in 8. With
+    # load_ram the cached split is therefore permuted once after loading (see
+    # _permute_cached_split); the streaming path (load_ram=False) is not.
     interleave_files: bool = True
 
     # Cap on how many files (each an AsyncFileOpenerProcess subprocess + Queue)
@@ -435,6 +438,27 @@ class SimTelTFDataset:
         labels_arr = np.array(labels, dtype=np.int32)
         return feat_arrays, labels_arr
 
+    def _permute_cached_split(
+        self,
+        feat_arrays: Dict[str, np.ndarray],
+        labels_arr: np.ndarray,
+    ) -> Tuple[Dict[str, np.ndarray], np.ndarray]:
+        """Put the cached events in a random order, once, right after loading.
+
+        ``interleave_files`` only mixes the files of a window of ``interleave_max_concurrent_files``
+        open files, one event at a time, and a file is picked, not a class. With a single NSB file
+        among many gamma files the NSB is 1 draw out of 8 while the gamma files last (about 87%
+        gamma), then the rest of the epoch is pure NSB. The cache is stored in that order, and the
+        ``sample_shuffle_buffer`` shuffle below only mixes neighbours inside its window, so it cannot
+        undo it: a model sees blocks of one class and drifts with the block instead of learning.
+        Permuting the cached arrays here is cheap in memory (one array copy at a time, no giant
+        shuffle buffer) and the buffer shuffle then keeps reshuffling locally at every epoch.
+        """
+        perm = np.random.default_rng(self.cfg.seed + 1).permutation(len(labels_arr))
+        for k in list(feat_arrays):
+            feat_arrays[k] = feat_arrays[k][perm]
+        return feat_arrays, labels_arr[perm]
+
     def _dataset_from_ram(
         self,
         file_label_pairs: List[Tuple[str, int]],
@@ -456,6 +480,8 @@ class SimTelTFDataset:
                 raise ValueError(
                     "No samples loaded into RAM; check input files, filters, or disable load_ram."
                 )
+            if self.cfg.shuffle_samples:
+                feat_arrays, labels_arr = self._permute_cached_split(feat_arrays, labels_arr)
             self._ram_cache = (feat_arrays, labels_arr)
 
         feat_arrays, labels_arr = self._ram_cache
