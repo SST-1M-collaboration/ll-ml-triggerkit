@@ -34,6 +34,12 @@ from triggerkit.training.selection import (
     select_best_filter,
     select_best_joint_column,
 )
+from triggerkit.training.npe_weighting import (
+    NpeWeighting,
+    bce_target_and_weight,
+    eval_targets,
+    zone_labels,
+)
 from triggerkit.training.weights import make_decreasing_ring_init, remap_weights
 
 __all__ = [
@@ -62,6 +68,11 @@ __all__ = [
     "_selection_config",
     "_efficiency_at_rate",
     "_paired_efficiency_at_rate",
+    # n_pe weighting
+    "NpeWeighting",
+    "bce_target_and_weight",
+    "eval_targets",
+    "zone_labels",
     # weights
     "make_decreasing_ring_init",
     "remap_weights",

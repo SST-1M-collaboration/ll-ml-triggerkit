@@ -660,6 +660,9 @@ class TriggerChain:
         wf  = self._reshape_waveform(wf)  # -> (B,1296,50)
         ped = tf.reshape(ped, (-1, self.num_pixels))                   # -> (B,1296)
 
+        # with TriggerDataset(npe_weighting=...) the label is the (B, 4) npe_channels (label, weights, zone flag), read by a weighted loss/metric
+        if "npe_channels" in features:
+            label = features["npe_channels"]
         if expects_baseline:
             return (wf, ped), label
         return wf, label
@@ -681,7 +684,10 @@ class TriggerChain:
         nsb_count = 0
         for _, label in ds:
             # labels come batched; flatten to handle vector shapes safely
-            lbl = np.asarray(label.numpy()).ravel()
+            lbl = np.asarray(label.numpy())
+            if getattr(dataset, "npe_weighting", None) is not None:
+                lbl = lbl[..., 0]                      # npe_channels: the label is channel 0
+            lbl = lbl.ravel()
             total += lbl.size
             gamma_count += np.count_nonzero(lbl == 1)
             nsb_count += np.count_nonzero(lbl == 0)

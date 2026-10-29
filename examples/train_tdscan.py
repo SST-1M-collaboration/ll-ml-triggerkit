@@ -41,6 +41,7 @@ from triggerkit.Helper.history import save_history
 from triggerkit.TriggerChain import TriggerChain
 from triggerkit.data import TriggerDataset
 from triggerkit.models import TDSCANBody, generate_lin_space_edges
+from triggerkit.training import NpeWeighting
 
 # --- Config (mirrors the sandbox script) -------------------------------------
 PERCENT_VALIDATION = 0.2
@@ -49,6 +50,12 @@ BATCH_SIZE = 32
 EPOCHS = 400
 TARGET_RATE_HZ = 50_000   # operating point the held-out filter selection uses
 SEED = 1337
+
+# Care about a n_pe range only (see triggerkit.training.npe_weighting). None = every gamma counts the same (the default recipe).
+# NpeWeighting(n_low, n_high, shape, below, n_cut): a gamma weighs 0 below n_low and 1 above n_high (shape "ramp" / "hard" / a function),
+# below="ignore" leaves the gammas under the range free, below="negative" trains the filter to reject them; the early stopping and the
+# choice of the best filter then use the gammas with n_pe >= n_cut only (default: the middle of the ramp). The NSB is untouched.
+NPE_WEIGHTING = None     # e.g. NpeWeighting(30, 50, shape="ramp", below="negative")
 
 # Score-quantizer front-end (as in tdscan_chain.py): bucket each pixel's input
 # into 2**EDGES_NUM_BIT - 1 integer levels spaced over EDGES_RANGE=(lo, hi) before
@@ -171,8 +178,8 @@ def main():
     chain.model = tf.keras.Model(inputs=_train_inputs(chain), outputs=score_tensor)
     chain.model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-        loss=training.make_pairwise_auc_loss_multi(sharpness=auc_sharpness),
-        metrics=training.make_per_filter_auc_metrics(N_FILTERS),
+        loss=training.make_pairwise_auc_loss_multi(sharpness=auc_sharpness, weighted=NPE_WEIGHTING is not None),
+        metrics=training.make_per_filter_auc_metrics(N_FILTERS, zone=NPE_WEIGHTING is not None),
     )
     chain.model.summary()
 
@@ -200,6 +207,7 @@ def main():
         max_nsb_samples_train=50_000,
         max_nsb_samples_val=15_000,
         load_ram=True,
+        npe_weighting=NPE_WEIGHTING,
         seed=SEED,
     )
     history = chain.train_chain(
@@ -216,7 +224,8 @@ def main():
     print(f"Selecting best filter on {len(select_files)} held-out gamma files "
           f"at target NSB rate {TARGET_RATE_HZ} Hz.")
     best_f, sel_info = training.select_best_filter(
-        chain, score_tensor, select_files, target_rate_hz=TARGET_RATE_HZ)
+        chain, score_tensor, select_files, target_rate_hz=TARGET_RATE_HZ,
+        n_pe_min=None if NPE_WEIGHTING is None else NPE_WEIGHTING.n_cut)
     eff = sel_info["efficiency"]
     print(f"Held-out gamma efficiency @ {TARGET_RATE_HZ} Hz "
           f"(n_gamma={sel_info['n_gamma']}, n_nsb={sel_info['n_nsb']}): "

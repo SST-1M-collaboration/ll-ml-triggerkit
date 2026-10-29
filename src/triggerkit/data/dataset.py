@@ -27,6 +27,10 @@ Design points agreed for the package refactor:
   belongs to a neighbour) reaches ``board_n_pe_min``. NSB is negative on every board.
   Needs ``true_image`` (added to ``targets``); pair with
   :class:`~triggerkit.models.layers.ScatterToBoards` on the model side.
+* ``npe_weighting``: a :class:`~triggerkit.training.npe_weighting.NpeWeighting`. Every batch gets ``features["npe_channels"]``,
+  shape ``(B, 4)`` (``(B, 3, 4)`` with ``split="board"``) = ``[label, positive weight, negative weight, in zone]``, computed from the n_pe
+  the model sees: the event's ``n_pe`` feature, or the true p.e. on each board's own patches with ``split="board"``. The labels are not
+  changed; the loss and the metrics read the channels (see ``triggerkit.training.npe_weighting``).
 * ``gamma_rotations``: reserved for hexagonal rotation augmentation. Rotation
   differs by representation (TDSCAN = pixel-index permutation; CNN = grid H x W
   after remapping), so it needs a real algorithm; for now anything other than
@@ -97,6 +101,8 @@ class TriggerDataset:
     board_n_pe_min : float
         With ``split="board"``: minimum true p.e. on a board's own patches for a gamma to
         count as a positive for that board.
+    npe_weighting : NpeWeighting or None
+        Adds ``features["npe_channels"]`` (see above). ``None``: nothing is added.
     gamma_rotations : tuple of int
         Reserved for hex rotation augmentation. Non-``(0,)`` warns and is ignored.
     seed : int
@@ -126,6 +132,7 @@ class TriggerDataset:
         gated_by=None,
         split=None,
         board_n_pe_min=10.0,
+        npe_weighting=None,
         gamma_rotations=(0,),
         event_feature_keys=DEFAULT_EVENT_FEATURE_KEYS,
         opener_cls=AsyncFileOpenerProcess,
@@ -162,6 +169,9 @@ class TriggerDataset:
             raise ValueError(f"split must be None or 'board', got {split!r}")
         self.split = split
         self.board_n_pe_min = float(board_n_pe_min)
+        self.npe_weighting = npe_weighting
+        if npe_weighting is not None and split != "board" and "n_pe" not in event_feature_keys:
+            raise ValueError("npe_weighting needs the 'n_pe' event feature (or split='board', which uses the true image)")
 
         self.targets = tuple(targets)
         if split == "board" and "true_image" not in self.targets:
@@ -309,6 +319,8 @@ class TriggerDataset:
         ).dataset()
         if self.gated_by:
             ds = self._gate(ds)
+        if self.npe_weighting is not None:         # before the board labels replace the event label: the channels come from the gamma flag
+            ds = self._npe_channels(ds)
         return self._board_labels(ds) if self.split == "board" else ds
 
     def board_n_pe(self, true_image):
@@ -324,6 +336,22 @@ class TriggerDataset:
             return features, tf.cast(positive, label.dtype)
 
         return ds.map(to_board_labels, num_parallel_calls=tf.data.AUTOTUNE)
+
+    def _npe_channels(self, ds):
+        """Add ``features["npe_channels"]`` (see the module docstring): the n_pe of what the model sees (a board, or the event).
+
+        The label of the channels is the EVENT's (1 = gamma), also with ``split="board"``: there the weighting replaces the ``board_n_pe_min``
+        cut, which still sets the (B, 3) labels but is not read by a weighted loss.
+        """
+        def add_channels(features, label):
+            if self.split == "board":
+                n_pe = self.board_n_pe(features["true_image"])
+                channels = self.npe_weighting.channels(tf.tile(tf.reshape(label, (-1, 1)), (1, n_pe.shape[1])), n_pe)
+            else:
+                channels = self.npe_weighting.channels(label, features["n_pe"])
+            return {**features, "npe_channels": channels}, label
+
+        return ds.map(add_channels, num_parallel_calls=tf.data.AUTOTUNE)
 
     # ------------------------------------------------------------------ #
     def gate_mask(self, wf, ped):
