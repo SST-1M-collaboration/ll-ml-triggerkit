@@ -9,6 +9,33 @@ import tensorflow as tf
 from tensorflow import keras
 
 
+def _weighted_pairwise(y_true, y_pred, sharpness):
+    """Pairwise-AUC loss with a weight per (positive, negative) pair, ``y_true`` = the ``(..., 4)`` ``npe_channels``.
+
+    ``sum_ij w_pos_i * w_neg_j * softplus(-s * (score_i - score_j)) / (n_gamma * sum_j w_neg_j)``, per score column; the columns are summed
+    (as in the unweighted multi-filter loss). The denominator does NOT depend on the weights of the gammas: it is the number of gammas
+    times the (weighted) number of negatives of the batch, so a batch that holds few gammas of the n_pe range, or only weak ones, gives a
+    small loss, as in the average over the whole data set (normalising by the weights themselves would give every batch the same scale and
+    make the few weak gammas of a batch dominate the gradient). With weight 1 (gammas) / 1 (NSB) it is exactly the unweighted loss.
+    A sample is never paired with itself (a gamma of the ramp is both a positive, weight w, and a negative, weight 1 - w). 0 when the batch
+    has no gamma or no negative.
+    """
+    from triggerkit.training.npe_weighting import LABEL, N_CHANNELS, NEG_WEIGHT, POS_WEIGHT
+
+    y_pred = tf.cast(y_pred, tf.float32)
+    if y_pred.shape.rank == 1:
+        y_pred = y_pred[:, None]
+    elif y_pred.shape.rank == 3:
+        y_pred = tf.reshape(y_pred, [-1, y_pred.shape[-1]])
+    channels = tf.reshape(tf.cast(y_true, tf.float32), [-1, N_CHANNELS])
+    pos, neg = channels[:, POS_WEIGHT], channels[:, NEG_WEIGHT]
+    n_pairs = tf.reduce_sum(channels[:, LABEL]) * tf.reduce_sum(neg)
+    pair_weight = pos[:, None] * neg[None, :] * (1.0 - tf.eye(tf.shape(pos)[0]))  # (B, B), no sample against itself
+    diff = y_pred[:, None, :] - y_pred[None, :, :]                                # (B, B, F)
+    per_col = tf.reduce_sum(pair_weight[:, :, None] * tf.nn.softplus(-sharpness * diff), axis=[0, 1])
+    return tf.where(n_pairs > 0.0, tf.reduce_sum(per_col) / tf.maximum(n_pairs, 1e-12), 0.0)
+
+
 @keras.utils.register_keras_serializable(package="triggerkit")
 class PairwiseAUCLoss(tf.keras.losses.Loss):
     """Serializable form of the pairwise-AUC loss.
@@ -20,14 +47,22 @@ class PairwiseAUCLoss(tf.keras.losses.Loss):
 
     ``reduction="sum"`` is a no-op on the scalar ``call`` returns; it is set so
     no reduction can rescale the value away from the closure's.
+
+    ``weighted=True``: ``y_true`` is the ``(..., 4)`` ``npe_channels`` of ``TriggerDataset(npe_weighting=...)`` and every
+    (positive, negative) pair counts with ``positive weight x negative weight``, divided by the number of gammas times the (weighted)
+    number of negatives of the batch (see ``_weighted_pairwise`` and ``triggerkit.training.npe_weighting``).
+    With weights 1 (gammas) / 1 (NSB) it is exactly the unweighted loss.
     """
 
-    def __init__(self, sharpness=1.0, name="pairwise_auc", reduction="sum", **kwargs):
+    def __init__(self, sharpness=1.0, name="pairwise_auc", reduction="sum", weighted=False, **kwargs):
         super().__init__(name=name, reduction=reduction, **kwargs)
         self.sharpness = float(sharpness)
+        self.weighted = bool(weighted)
 
     def call(self, y_true, y_pred):
         s = self.sharpness
+        if self.weighted:
+            return _weighted_pairwise(y_true, y_pred, s)
         y_true = tf.cast(tf.reshape(y_true, [-1]), tf.float32)
         y_pred = tf.cast(tf.reshape(y_pred, [-1]), tf.float32)
         pos = tf.boolean_mask(y_pred, y_true > 0.5)
@@ -47,17 +82,18 @@ class PairwiseAUCLoss(tf.keras.losses.Loss):
 
     def get_config(self):
         cfg = super().get_config()
-        cfg.update(sharpness=self.sharpness)
+        cfg.update(sharpness=self.sharpness, weighted=self.weighted)
         return cfg
 
 
 @keras.utils.register_keras_serializable(package="triggerkit")
 class PairwiseAUCLossMulti(tf.keras.losses.Loss):
-    """Serializable multi-filter pairwise-AUC loss. See ``PairwiseAUCLoss``."""
+    """Serializable multi-filter pairwise-AUC loss. See ``PairwiseAUCLoss`` (``weighted`` included)."""
 
-    def __init__(self, sharpness=1.0, name="pairwise_auc_multi", reduction="sum", **kwargs):
+    def __init__(self, sharpness=1.0, name="pairwise_auc_multi", reduction="sum", weighted=False, **kwargs):
         super().__init__(name=name, reduction=reduction, **kwargs)
         self.sharpness = float(sharpness)
+        self.weighted = bool(weighted)
 
     def call(self, y_true, y_pred):
         s = self.sharpness
@@ -66,6 +102,8 @@ class PairwiseAUCLossMulti(tf.keras.losses.Loss):
             y_pred = y_pred[:, None]
         elif y_pred.shape.rank == 3:      # (B, boards, F) with (B, boards) labels: one sample per board
             y_pred = tf.reshape(y_pred, [-1, y_pred.shape[-1]])
+        if self.weighted:
+            return _weighted_pairwise(y_true, y_pred, s)
         y_true = tf.cast(tf.reshape(y_true, [-1]), tf.float32)
         pos = tf.boolean_mask(y_pred, y_true > 0.5)
         neg = tf.boolean_mask(y_pred, y_true < 0.5)
@@ -85,7 +123,7 @@ class PairwiseAUCLossMulti(tf.keras.losses.Loss):
 
     def get_config(self):
         cfg = super().get_config()
-        cfg.update(sharpness=self.sharpness)
+        cfg.update(sharpness=self.sharpness, weighted=self.weighted)
         return cfg
 
 
@@ -121,7 +159,7 @@ class SoftOr(tf.keras.layers.Layer):
 
 
 
-def make_pairwise_auc_loss(sharpness=1.0):
+def make_pairwise_auc_loss(sharpness=1.0, weighted=False):
     """Wilcoxon-Mann-Whitney soft AUC loss (= 1 - soft_AUC).
 
     For every (gamma, NSB) pair in a batch, penalize when score_NSB >= score_gamma.
@@ -130,11 +168,14 @@ def make_pairwise_auc_loss(sharpness=1.0):
 
     ``sharpness`` controls how steeply the softplus saturates. Set so
     ``sharpness * typical_gamma_minus_NSB_gap`` is O(1).
+
+    ``weighted=True``: the labels are the ``npe_channels`` of ``TriggerDataset(npe_weighting=...)`` and the pairs are weighted (see
+    ``triggerkit.training.npe_weighting``).
     """
-    return PairwiseAUCLoss(sharpness=sharpness)
+    return PairwiseAUCLoss(sharpness=sharpness, weighted=weighted)
 
 
-def make_pairwise_auc_loss_multi(sharpness=1.0):
+def make_pairwise_auc_loss_multi(sharpness=1.0, weighted=False):
     """Multi-filter version of ``make_pairwise_auc_loss``.
 
     ``y_pred`` is the pooled score with one column per TDSCAN filter, shape
@@ -143,8 +184,10 @@ def make_pairwise_auc_loss_multi(sharpness=1.0):
     sum keeps the filters' gradients independent (column ``f``'s loss only depends
     on column ``f``'s weights), so the F filters train as F parallel restarts in a
     single forward/backward pass. Pick the best one after training.
+
+    ``weighted=True``: see ``make_pairwise_auc_loss``.
     """
-    return PairwiseAUCLossMulti(sharpness=sharpness)
+    return PairwiseAUCLossMulti(sharpness=sharpness, weighted=weighted)
 
 
 def soft_or_scores(branch_scores, taus, temps, name="soft_or"):

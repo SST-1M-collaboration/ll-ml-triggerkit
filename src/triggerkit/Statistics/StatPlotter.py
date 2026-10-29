@@ -2242,9 +2242,8 @@ class StatPlotter:
             al.axis("off")
             # anchored just below the top of the row, so the last line stays on the page and clear of the x axis label
             al.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.94), ncol=1, fontsize=8.5, borderaxespad=0.0)
-            gate_text = f"gate: {gates_drawn[0]}; " if len(gates_drawn) == 1 else ""
-            ax.set_title(f"Triggered gammas that pass the gate vs {self._metric_xlabel(metric)}\n"
-                         f"{gate_text}bins with < {int(min_triggered)} triggered gammas not drawn", fontsize=14)
+            gate_text = f"\ngate: {gates_drawn[0]}" if len(gates_drawn) == 1 else ""
+            ax.set_title(f"Triggered gammas that pass the gate vs {self._metric_xlabel(metric)}{gate_text}", fontsize=14)
             ad.axhline(0.0, color="gray", linestyle="--")
             ad.set_xlabel(self._metric_xlabel(metric))
             ad.set_ylabel("Share \u2212 base share\n(% points)", fontsize=11)

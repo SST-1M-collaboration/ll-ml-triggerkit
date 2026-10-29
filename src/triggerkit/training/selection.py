@@ -85,7 +85,7 @@ def _selection_config(max_gamma=25_000, max_nsb=25_000, batch_size=128):
     )
 
 
-def collect_multi_filter_scores(chain, score_outputs, gamma_files, config=None):
+def collect_multi_filter_scores(chain, score_outputs, gamma_files, config=None, n_pe_min=None):
     """Per-filter event scores on a held-out gamma+NSB set, split by class.
 
     ``score_outputs`` is the multi-filter pre-threshold score tensor ``(B, F)``
@@ -96,6 +96,8 @@ def collect_multi_filter_scores(chain, score_outputs, gamma_files, config=None):
     Returns ``(scores_g, scores_n)`` for a single output, or a list of such pairs
     (output order preserved) when ``score_outputs`` is a list. Pass gamma files the
     training/early-stopping split never used so the selection is unbiased.
+
+    ``n_pe_min``: keep only the gammas with at least this many true p.e. (the metric zone of ``NpeWeighting``); the NSB is untouched.
     """
     config = config or _selection_config()
     gamma_files = normalize_files(gamma_files, name="gamma_files", require_nonempty=True)
@@ -123,6 +125,8 @@ def collect_multi_filter_scores(chain, score_outputs, gamma_files, config=None):
             preds = [preds]
         l = lbl.numpy().reshape(-1)
         is_g, is_n = l == 1, l == 0
+        if n_pe_min is not None:
+            is_g = is_g & (feat["n_pe"].numpy().reshape(-1) >= float(n_pe_min))
         for i, p in enumerate(preds):
             arr = np.asarray(p).reshape(l.shape[0], -1)  # (B, F)
             g_chunks[i].append(arr[is_g])
@@ -157,7 +161,7 @@ def _efficiency_at_rate(scores_g, scores_n, target_fraction):
 
 def select_best_filter(chain, score_tensor, selection_gamma_files,
                        target_rate_hz, config=None,
-                       n_bootstrap=200, tie_margin=0.005, seed=1337):
+                       n_bootstrap=200, tie_margin=0.005, seed=1337, n_pe_min=None):
     """Pick the filter that generalizes best, on held-out data, at the target rate.
 
     Scores all F filters once on ``selection_gamma_files`` (use files the training
@@ -168,12 +172,15 @@ def select_best_filter(chain, score_tensor, selection_gamma_files,
     most *stable* filter (highest mean efficiency across resamples), guarding
     against a single lucky draw winning.
 
+    ``n_pe_min``: rank the filters by the efficiency of the gammas with at least this many true p.e. only (the zone of an ``NpeWeighting``,
+    its ``n_cut``); the threshold still gives the target NSB rate.
+
     Returns ``(best_filter, info)`` where ``info`` has per-filter ``efficiency``,
     ``tau``, ``achieved_fraction`` and the bootstrap ``mean``/``std`` for tiebreak
     candidates. Does not modify the chain.
     """
     scores_g, scores_n = collect_multi_filter_scores(
-        chain, score_tensor, selection_gamma_files, config=config
+        chain, score_tensor, selection_gamma_files, config=config, n_pe_min=n_pe_min
     )
     if scores_g.size == 0 or scores_n.size == 0:
         raise RuntimeError(
