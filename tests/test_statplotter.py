@@ -213,3 +213,80 @@ def test_report_lists_unplottable_sections_instead_of_blank_figures(tmp_path):
     md = (out / "report.md").read_text()
     assert "Skipped Items" in md and "not drawn" in md
     assert not (out / "absolute_efficiency_npe.png").exists()
+
+
+# --- gate share: share of the triggered gammas that also pass a per-event pass/fail file ---------------------------------
+GATE_CHAIN = [("hillas_gate", {"min_pixels": 3}), ("threshold", {"threshold": 0.5, "binary": True, "comparison": "gt"})]
+
+
+def write_gate_pair(folder, n=400, shift_ids=False):
+    """a trigger file (score > 2) and a gate file (score 1 when n_pe > 100) holding the same gamma + NSB events."""
+    rng = np.random.default_rng(3)
+    n_pe = np.r_[rng.uniform(20, 300, n), np.zeros(n)].astype(np.float32)
+    label = np.r_[np.ones(n), np.zeros(n)].astype(np.uint8)
+    score = np.r_[rng.integers(0, 8, n), rng.integers(0, 4, n)].astype(np.float32)
+    gate = np.r_[(n_pe[:n] > 100), np.zeros(n)].astype(np.float32)
+    for name, chain, sc, thr, ids in (("trigger.h5", CHAIN, score, 2.0, np.arange(2 * n)),
+                                      ("gate.h5", GATE_CHAIN, gate, 0.5, np.arange(2 * n) + (1 if shift_ids else 0))):
+        w = H5StatsWriter(str(folder / name), trigger_chain=chain, camera_name="DigiCam")
+        w.f.attrs["has_pre_threshold_score"] = True
+        w.f.attrs["pre_threshold_reference_threshold"] = thr
+        w.f.attrs["pre_threshold_comparison"] = "gt"
+        idx = w.begin_fold("all")
+        w.append({"label": label, "n_pe": n_pe, "energy": n_pe, "event_id": ids.astype(np.int64),
+                  "pre_threshold_score": sc, "triggered": (sc > thr).astype(np.uint8)}, fold_idx=idx)
+        w.close(window_sec=2e-7)
+    return n_pe[:n], score[:n]
+
+
+def test_gate_share_counts_match_a_direct_count(tmp_path):
+    n_pe, score = write_gate_pair(tmp_path)
+    sp = plotter(tmp_path)
+    bins = np.linspace(20, 300, 8)
+    trig_h, both_h = sp._gate_share_counts(sp.get_results(CHAIN), sp.get_results(GATE_CHAIN), 2.0, 0.5, bins)
+    trig = score > 2
+    assert np.array_equal(trig_h, np.histogram(n_pe[trig], bins=bins)[0])
+    assert np.array_equal(both_h, np.histogram(n_pe[trig & (n_pe > 100)], bins=bins)[0])
+
+
+def test_gate_share_refuses_files_with_different_events(tmp_path):
+    write_gate_pair(tmp_path, shift_ids=True)
+    sp = plotter(tmp_path)
+    with pytest.raises(ValueError, match="same gamma events"):
+        sp._gate_share_counts(sp.get_results(CHAIN), sp.get_results(GATE_CHAIN), 2.0, 0.5, np.linspace(20, 300, 8))
+
+
+def _report(sp, out, **kw):
+    sp.generateReport(configs=[CHAIN], output_dir=str(out), target_rate_hz=1e5, effective_area_expected_N=400,
+                      generate_pdf=False, generate_html=False, save_svg=False, vector_plots=False,
+                      cross_validation=False, **kw)
+    return (out / "report.md").read_text()
+
+
+def test_report_without_gate_configs_is_unchanged(tmp_path):
+    write_gate_pair(tmp_path)
+    md = _report(plotter(tmp_path), tmp_path / "plain")
+    assert "Passing the Gate" not in md and not (tmp_path / "plain" / "gate_share_npe.png").exists()
+
+
+def test_report_with_a_gate_draws_the_share_section(tmp_path):
+    write_gate_pair(tmp_path)
+    md = _report(plotter(tmp_path), tmp_path / "gated", gate_configs=[(GATE_CHAIN, "valid Hillas")], gate_min_triggered=1)
+    assert "Share of Triggered Gammas Passing the Gate vs Npe" in md
+    assert (tmp_path / "gated" / "gate_share_npe.png").stat().st_size > 0
+    assert "Share of Triggered Gammas Passing the Gate vs Energy" in md
+    assert (tmp_path / "gated" / "gate_share_energy.png").stat().st_size > 0
+
+
+def test_report_survives_a_gate_that_is_missing_or_incompatible(tmp_path):
+    write_gate_pair(tmp_path, shift_ids=True)
+    other = [("hillas_gate", {"min_pixels": 99}), ("threshold", {"threshold": 0.5, "binary": True, "comparison": "gt"})]
+    md = _report(plotter(tmp_path), tmp_path / "bad", gate_configs=[(other, "absent"), (GATE_CHAIN, "shifted")])
+    assert "Skipped Items" in md and "absent: configuration not found" in md and "same gamma events" in md
+    assert not (tmp_path / "bad" / "gate_share_npe.png").exists()
+
+
+def test_gate_configs_must_be_config_label_pairs(tmp_path):
+    write_gate_pair(tmp_path)
+    with pytest.raises(ValueError, match="list of \\(config, label\\) pairs"):
+        _report(plotter(tmp_path), tmp_path / "bad_gate", gate_configs=[GATE_CHAIN])

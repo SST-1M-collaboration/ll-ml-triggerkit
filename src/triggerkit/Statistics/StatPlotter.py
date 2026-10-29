@@ -2121,6 +2121,142 @@ class StatPlotter:
             plt.close("all")
         return os.path.exists(full_path)
 
+    def _gate_share_counts(self, result, gate_result, tau, gate_tau, bins, metric="n_pe"):
+        """Per-bin counts of the gammas ``result`` triggers, and of those a second file (the gate) also passes.
+
+        The gate is a stats file whose score is a per-event pass/fail, e.g. 1 when the image has valid Hillas
+        parameters and 0 otherwise. Both files are read row by row on the active fold; they must hold the same
+        events in the same order (``event_id`` and ``metric`` are compared), otherwise a ValueError is raised.
+        Returns (triggered_hist, triggered_and_gate_hist).
+        """
+        score = PRE_THRESHOLD_SCORE_DATASET
+        names = (metric, "event_id", score)
+        a = self._collect_event_columns(result, names, kind="gamma")
+        b = self._collect_event_columns(gate_result, names, kind="gamma")
+        if (a[metric].shape != b[metric].shape or not np.array_equal(a["event_id"], b["event_id"])
+                or not np.allclose(a[metric], b[metric], rtol=1e-6, equal_nan=True)):
+            raise ValueError(
+                f"{os.path.basename(gate_result['_path'])} does not hold the same gamma events, in the same order, as "
+                f"{os.path.basename(result['_path'])}: cannot be crossed by row.")
+        trig = self._score_trigger_mask(a[score], float(tau), comparison=result.get("threshold_comparison", "gt"))
+        gate = self._score_trigger_mask(b[score], float(gate_tau), comparison=gate_result.get("threshold_comparison", "gt"))
+        x = a[metric]
+        inside = np.isfinite(x) & (x >= bins[0]) & (x <= bins[-1])
+        return np.histogram(x[inside & trig], bins=bins)[0], np.histogram(x[inside & trig & gate], bins=bins)[0]
+
+    def _render_gate_share(self, plot_items, gate_configs, target_rate_hz, x_range, nbins, min_triggered,
+                           full_path, show, notes, metric="n_pe"):
+        """Share of the triggered gammas that also pass each gate, against ``metric`` ("n_pe" or "energy") (top) and its difference with the base config (bottom).
+
+        ``gate_configs`` is a list of ``(config, label)``; each config is found in the stat folders like any
+        other and read through ``_gate_share_counts``. Colour is the config of the report, line style the gate.
+        Bins with fewer than ``min_triggered`` triggered gammas are not drawn. Whatever cannot be drawn
+        (gate not found, fold missing in the gate file, events that differ) is described in ``notes``.
+        """
+        bins = self._make_log_bins(x_range[0], x_range[1], nbins)
+        centers = np.sqrt(bins[:-1] * bins[1:])
+        gate_styles = ["-", "--", ":", "-."]
+        base_cfg = self.base_reference_config
+        base_cache: Dict[Any, Any] = {}
+
+        def share_of(cfg, gate_result, gate_tau):
+            result = self.get_results(cfg)
+            if result is None or not result.get("has_pre_threshold_score", False):
+                return None
+            strategy = self._resolve_trigger_strategy(result, target_rate_hz=target_rate_hz)
+            tau = strategy.get("score_threshold")
+            if tau is None:
+                return None
+            trig_h, both_h = self._gate_share_counts(result, gate_result, tau, gate_tau, bins, metric=metric)
+            eff, eff_err = self._efficiency_from_counts(trig_h, both_h)
+            low = trig_h < int(min_triggered)
+            eff[low] = np.nan
+            eff_err[:, low] = np.nan
+            return eff, eff_err, strategy
+
+        curves = []
+        reported = set()
+        for g, (gate_cfg, gate_label) in enumerate(gate_configs):
+            gate_result = self.get_results(gate_cfg)
+            if gate_result is None:
+                notes.append(f"Gate share: {gate_label}: configuration not found in stat folder")
+                continue
+            if not gate_result.get("has_pre_threshold_score", False):
+                notes.append(f"Gate share: {gate_label}: no '{PRE_THRESHOLD_SCORE_DATASET}' dataset")
+                continue
+            gate_tau = self._resolve_trigger_strategy(gate_result).get("score_threshold")
+            if gate_tau is None:
+                notes.append(f"Gate share: {gate_label}: no threshold stored in the file")
+                continue
+            linestyle = gate_styles[g % len(gate_styles)]
+            for cfg, label, fold in plot_items:
+                self._apply_fold_override(fold)
+                try:
+                    out = share_of(cfg, gate_result, gate_tau)
+                    key = (g, self._fold_filter)
+                    if key not in base_cache:
+                        base_cache[key] = share_of(base_cfg, gate_result, gate_tau)
+                except (KeyError, ValueError) as exc:
+                    reason = str(exc.args[0]) if isinstance(exc, KeyError) and exc.args else str(exc)
+                    if (g, reason) not in reported:
+                        reported.add((g, reason))
+                        notes.append(f"Gate share: {gate_label}: {label}: {reason}")
+                    continue
+                if out is None:
+                    continue
+                eff, eff_err, strategy = out
+                base = base_cache.get((g, self._fold_filter))
+                curves.append({
+                    "eff": eff, "err": eff_err, "linestyle": linestyle, "color": self._get_config_plot_color(cfg),
+                    "label": f"{label}; {self._rate_suffix(strategy.get('trigger_rate_hz', 0.0))}", "gate": gate_label,
+                    "delta": None if base is None or cfg == base_cfg else eff - base[0],
+                })
+        if not curves:
+            return False
+
+        # the legend gets its own row of the figure (sized by its number of lines), so it can never cover an axis label
+        # whichever way the figure is later placed (png, pdf page, svg)
+        n_lines = len(curves)
+        gates_drawn = list(dict.fromkeys(c["gate"] for c in curves))
+        if len(gates_drawn) > 1:       # several gates: the line style tells them apart, so name the gate on each line
+            for c in curves:
+                c["label"] = f"{c['label']} \u2014 {c['gate']}"
+        top_in, delta_in, legend_in = 5.0, 2.3, 0.27 * n_lines + 0.3
+        with self._report_style_context():
+            plt.close("all")
+            fig, (ax, ad, al) = plt.subplots(
+                3, 1, figsize=self._figsize((12, top_in + delta_in + legend_in + 1.8)),
+                gridspec_kw={"height_ratios": [top_in, delta_in, legend_in]}, constrained_layout=True)
+            ad.sharex(ax)
+            for c in curves:
+                ax.errorbar(centers, 100 * c["eff"], yerr=100 * c["err"], fmt="o", markersize=3, capsize=2,
+                            linestyle=c["linestyle"], color=c["color"], label=c["label"])
+                if c["delta"] is not None:
+                    ad.plot(centers, 100 * c["delta"], marker="o", markersize=3, linestyle=c["linestyle"], color=c["color"])
+            ax.set_xscale("log")
+            ax.set_xlim(x_range[0], x_range[1])
+            ax.set_ylim(0.0, 100.0)
+            ax.set_ylabel("Triggered gammas\npassing the gate (%)", fontsize=11)
+            ax.tick_params(labelbottom=False)
+            handles, labels = ax.get_legend_handles_labels()
+            al.axis("off")
+            # anchored just below the top of the row, so the last line stays on the page and clear of the x axis label
+            al.legend(handles, labels, loc="upper center", bbox_to_anchor=(0.5, 0.94), ncol=1, fontsize=8.5, borderaxespad=0.0)
+            gate_text = f"gate: {gates_drawn[0]}; " if len(gates_drawn) == 1 else ""
+            ax.set_title(f"Triggered gammas that pass the gate vs {self._metric_xlabel(metric)}\n"
+                         f"{gate_text}bins with < {int(min_triggered)} triggered gammas not drawn", fontsize=14)
+            ad.axhline(0.0, color="gray", linestyle="--")
+            ad.set_xlabel(self._metric_xlabel(metric))
+            ad.set_ylabel("Share \u2212 base share\n(% points)", fontsize=11)
+            self._report_style_current_figure()
+            self._report_stash_vector_figure(full_path)
+            self._apply_title_policy()
+            fig.savefig(full_path, bbox_inches="tight", dpi=320)
+            if show:
+                plt.show()
+            plt.close("all")
+        return os.path.exists(full_path)
+
     def _render_efficiency_map_energy_impact(self, cfg, label, target_rate_hz, energy_range, r_range,
                                              full_path, show, e_bins=25, r_bins=20):
         result = self.get_results(cfg)
@@ -2959,6 +3095,8 @@ class StatPlotter:
         cross_validation_n_sigma: float = 3.0,
         cross_validation_condition: Optional[str] = None,
         common_folds_only: bool = True,
+        gate_configs: Optional[List[Tuple[ConfigType, str]]] = None,
+        gate_min_triggered: int = 20,
     ) -> str:
         """
         Generate a markdown report plus the main plots commonly used in the
@@ -2968,6 +3106,13 @@ class StatPlotter:
         one config's file or ran a different sample there (see
         ``check_common_folds``); the dropped folds are printed and listed with
         the skipped configs in the report.
+
+        ``gate_configs``: optional list of ``(config, label)``. Each config is a stats file whose
+        score is a per-event pass/fail (e.g. valid Hillas parameters), holding the same events in the
+        same order as the plotted configs. When given, a section shows, against n_pe, the share of
+        the triggered gammas that also pass each gate (``gate_min_triggered``: bins with fewer
+        triggered gammas are not drawn), once against n_pe and once against energy. Without it the report
+        is unchanged.
 
         The report contains:
         - combined plots for the provided configurations
@@ -3325,6 +3470,26 @@ class StatPlotter:
                 impact_path, show,
             ):
                 combined_sections.append(("Gamma Efficiency vs Impact Distance", "efficiency_vs_impact_distance.png"))
+
+            # Share of the triggered gammas that also pass each gate (optional).
+            if gate_configs:
+                for entry in gate_configs:
+                    if not (isinstance(entry, (tuple, list)) and len(entry) == 2 and isinstance(entry[0], list) and isinstance(entry[1], str)):
+                        raise ValueError("gate_configs must be a list of (config, label) pairs, e.g. [(CONFIG_VALID, 'valid Hillas')].")
+                gate_notes: List[str] = []
+                for metric, suffix, title_suffix, x_range, nbins in (
+                    ("n_pe", "npe", "Npe", n_pe_x_range, n_pe_bins),
+                    ("energy", "energy", "Energy", energy_x_range, energy_bins),
+                ):
+                    gate_file = f"gate_share_{suffix}.png"
+                    if self._render_gate_share(
+                        report_plot_items, list(gate_configs), target_rate_hz, x_range, nbins,
+                        gate_min_triggered, os.path.join(output_dir, gate_file), show, gate_notes, metric=metric,
+                    ):
+                        combined_sections.append((f"Share of Triggered Gammas Passing the Gate vs {title_suffix}", gate_file))
+                    else:
+                        gate_notes.append(f"Gate share vs {title_suffix}: not drawn (no gate could be read, see above)")
+                skipped_configs.extend(n for n in dict.fromkeys(gate_notes) if n not in skipped_configs)
 
             # Per-config: pre-threshold score distribution (gamma vs NSB) + 2D efficiency map.
             for _idx, (cfg, _label, slug, short_name, fold_override) in enumerate(config_descriptions):
