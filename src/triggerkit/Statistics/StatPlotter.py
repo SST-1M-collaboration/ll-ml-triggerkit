@@ -38,6 +38,7 @@ from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
+import matplotlib.ticker
 import matplotlib.pyplot as plt
 from matplotlib import colors
 from scipy.stats import norm
@@ -299,7 +300,7 @@ class StatPlotter:
             "#862A16",
         ]
 
-        self._roc_auc_cache: Dict[str, float] = {}
+        self._roc_auc_cache: Dict[Any, float] = {}
         self._score_threshold_cache: Dict[Tuple[str, float, str], Dict[str, Any]] = {}
         self._score_rate_cache: Dict[Tuple[str, float, str], float] = {}
         # (path, fold) -> stored NSB rate; the file is immutable once written
@@ -316,6 +317,8 @@ class StatPlotter:
         # "all conditions overlaid" plot alongside the per-condition pages.
         self._shade_by_fold_active: bool = False
         self._active_plot_shade_idx: Dict[str, int] = {}
+        # the event type the efficiency-vs-n_pe / energy plots are about (set per section by generateReport)
+        self._report_kind: str = "gamma"
 
         # base trigger-rate cache
         if isinstance(self.base_config_result.get("trigger_rate"), tuple):
@@ -462,10 +465,11 @@ class StatPlotter:
         # What describes the first fold (the reference one): its event counts and the n_pe range of its gammas
         first = sf.fold_names[0] if sf.fold_names else None
         meta["window_sec"] = sf.nsb_window_sec(first) if first is not None else sf.window_sec
-        meta.update(num_events_gamma=0, num_events_nsb=0, nsb_trig=-1, trigger_rate=None)
+        meta.update(num_events_gamma=0, num_events_nsb=0, num_events_proton=0, num_events_muon=0, nsb_trig=-1, trigger_rate=None)
         if first is not None:
             read = sf.read_counts(first)
             meta["num_events_gamma"], meta["num_events_nsb"] = read.get("gamma", 0), read.get("nsb", 0)
+            meta["num_events_proton"], meta["num_events_muon"] = read.get("proton", 0), read.get("muon", 0)
             if not sf.has_score:                   # a decision, not a score: what fired is all there is
                 meta["nsb_trig"] = sf.counts(first).get("nsb", {}).get("triggered", -1)
             view = sf.fold(first, columns=["particle", "n_pe"], decide=False)
@@ -660,9 +664,9 @@ class StatPlotter:
                 except Exception:
                     return str(v)
 
-        g = self.base_config_result.get("num_events_gamma")
+        g = self.base_config_result.get(f"num_events_{self._report_kind}")
         n = self.base_config_result.get("num_events_nsb")
-        return f"Gamma events: {_fmt(g)} | NSB events: {_fmt(n)}"
+        return f"{self._report_kind.capitalize()} events: {_fmt(g)} | NSB events: {_fmt(n)}"
 
     def _as_mapping(self, value: Any) -> Optional[Dict[str, Any]]:
         if value is None:
@@ -1071,7 +1075,7 @@ class StatPlotter:
     ) -> Dict[str, np.ndarray]:
         # streaming path (HDF5)
         if self.x_range is None:
-            lo, hi = self._get_default_range(self.base_config_result, self.metrics, kind="gamma")
+            lo, hi = self._get_default_range(self.base_config_result, self.metrics, kind=self._report_kind)
         else:
             lo, hi = self.x_range
         bins = self._make_log_bins(lo, hi, self.nbins)
@@ -1119,7 +1123,7 @@ class StatPlotter:
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         if binning is None:
             if self.x_range is None:
-                lo, hi = self._get_default_range(to_compare_result, self.metrics, kind="gamma")
+                lo, hi = self._get_default_range(to_compare_result, self.metrics, kind=self._report_kind)
             else:
                 lo, hi = self.x_range
             binning = self._make_log_bins(lo, hi, self.nbins)
@@ -1127,7 +1131,7 @@ class StatPlotter:
         all_h, trig_h = self._histogram_stream(
             to_compare_result,
             self.metrics,
-            kind="gamma",
+            kind=self._report_kind,
             bins=binning,
             score_threshold=score_threshold,
         )
@@ -2670,28 +2674,333 @@ class StatPlotter:
         fig.tight_layout(h_pad=4.0)
         return fig
 
-    def _render_cross_validation(
-        self,
-        configs: Optional[List[ConfigType]],
-        legend_overrides: Optional[List[Optional[str]]],
-        full_path: str,
-        show: bool,
-        n_sigma: float = 3.0,
-        condition: Optional[str] = None,
-    ) -> bool:
-        """Report-integrated CV render: PNG into ``full_path`` + stash for the PDF.
+    def _draw_cross_validation_all(self, rows: List[Tuple[str, List[Dict[str, Any]]]], n_sigma: float = 3.0) -> "plt.Figure":
+        """Every run on ONE pair of panels: the deviation of each fold from the run's own fold 0, in sigma.
 
-        Mirrors the other ``_render_*`` helpers so the cross-validation graph
-        becomes one section INSIDE the report (report.md image + a vector PDF
-        page), rather than a standalone file. Returns False (drawing nothing)
-        when no config has a ``/folds`` group.
+        The per-run figure shows the raw values (each run has its own scale: an AUC of 0.68 here, 0.70 there; a rate of 50 kHz). Divided by
+        the combined error of the fold and of fold 0, every run lives on the same axis, so one flat band of ``+-n_sigma`` serves all of
+        them and the runs can be compared at a glance. Runs are shifted a little along the fold axis so their points do not hide each other.
         """
-        rows = self._resolve_cv_rows(configs, legend_overrides, condition=condition)
-        if not rows:
-            return False
+        names: List[str] = []
+        for _label, folds in rows:
+            for d in folds:
+                if d["fold"] not in names:
+                    names.append(d["fold"])
+        xs = np.arange(len(names))
+        fig, axes = plt.subplots(1, 2, figsize=(max(11.5, 0.62 * len(names) * 2), 5.2), squeeze=False)
+        n = len(rows)
+        for c, (key, err, ylab, sub) in enumerate([
+            ("auc", "auc_err", "(AUC - AUC fold 0) / sigma", "Separation power (AUC)"),
+            ("rate_hz", "rate_err", "(rate - rate fold 0) / sigma", "NSB rate (frozen threshold)"),
+        ]):
+            ax = axes[0][c]
+            ax.axhspan(-n_sigma, n_sigma, color="gray", alpha=0.10, label=f"±{n_sigma:g}σ")
+            ax.axhline(0.0, ls="--", c="gray", alpha=0.6)
+            for r, (label, folds) in enumerate(rows):
+                k, e = (key, err)
+                if key == "auc" and not np.isfinite([d.get("auc", np.nan) for d in folds]).any():
+                    k, e = "eff", "eff_err"          # a file stored without per-event scores
+                ref = folds[0]
+                x = [names.index(d["fold"]) + (r - (n - 1) / 2) * 0.12 for d in folds]
+                z = [(d[k] - ref[k]) / max(float(np.hypot(ref[e], d[e])), 1e-12) if d is not ref else 0.0 for d in folds]
+                ax.plot(x, z, "o-", ms=4, lw=1, color=self._color_for_palette_index(r), label=label)
+            ax.set_xticks(xs)
+            ax.set_xticklabels(names, rotation=35, ha="right", fontsize=8)
+            ax.set_ylabel(ylab)
+            ax.set_title(sub, fontsize=10)
+            ax.grid(alpha=0.3)
+            ax.legend(loc="best", fontsize=8)
+        fig.tight_layout()
+        return fig
+
+    def _render_cv_rows(self, rows, full_path: str, show: bool, n_sigma: float = 3.0, overlay: bool = False) -> bool:
+        """PNG into ``full_path`` + stash for the PDF of the cross-validation of ``rows`` (one grid row per run, or all runs overlaid)."""
         with self._report_style_context():
             plt.close("all")
-            self._draw_cross_validation(rows, n_sigma=n_sigma)
+            if overlay:
+                self._draw_cross_validation_all(rows, n_sigma=n_sigma)
+            else:
+                self._draw_cross_validation(rows, n_sigma=n_sigma)
+            self._report_style_current_figure()
+            self._report_stash_vector_figure(full_path)
+            self._apply_title_policy()
+            plt.gcf().savefig(full_path, bbox_inches="tight", dpi=320)
+            if show:
+                plt.show()
+            plt.close("all")
+        return os.path.exists(full_path)
+
+    # ---- efficiency of the other particle types -------------------------------------------------------------------------------
+    @staticmethod
+    def _range_for(values: np.ndarray, x_range) -> Tuple[float, float]:
+        """``x_range`` (the one given to ``generateReport``), unless the events sit far below it (the muons are 30 times under the gamma
+        energy range, its page would be empty): then the 0.5 to 99.5 percentile of the events."""
+        values = values[np.isfinite(values) & (values > 0)]
+        if x_range is not None and (values.size < 2 or np.percentile(values, 99.5) >= x_range[1] / 30.0):
+            return float(x_range[0]), float(x_range[1])
+        if values.size < 2:
+            return 1.0, 10.0
+        lo, hi = np.percentile(values, [0.5, 99.5])
+        return float(lo), float(hi)
+
+    def _kind_range(self, kind: str, metric: str, x_range: Tuple[float, float]) -> Tuple[float, float]:
+        return self._range_for(self._collect_metric_values(self.base_config_result, metric, kind=kind), x_range)
+
+    _PARTICLE_LINESTYLE = {"gamma": "-", "proton": "--", "muon": ":"}
+    _PARTICLE_METRIC_LABEL = {"energy": ("Energy (TeV)", "energy"), "n_pe": ("n_pe (photo-electrons)", "n_pe")}
+    _MIN_EVENTS_PER_ENERGY_BIN = 20      # a bin with fewer events than that is noise, not an efficiency
+
+    def _particle_total(self, result: Dict[str, Any], particle: str, n_read: int) -> Tuple[float, bool]:
+        """What an efficiency of ``particle`` is divided by: the showers SIMULATED in the selected fold (all folds if none), and whether it is that."""
+        sf = self._stats(result["_path"])
+        folds = [self._fold_filter] if self._fold_filter is not None else list(sf.fold_names)
+        try:
+            return float(sum(sf.simulated(f, particle) for f in folds)), True
+        except KeyError:
+            return float(n_read), False          # no total in the file: the events it holds
+
+    def _particle_efficiency_at(self, result: Dict[str, Any], particle: str, thresholds: np.ndarray):
+        """Triggered / simulated showers of ``particle`` at each threshold (None if the fold has none of them)."""
+        scores = self._collect_metric_values(result, PRE_THRESHOLD_SCORE_DATASET, kind=particle)
+        if scores.size == 0:
+            return None
+        total, _ = self._particle_total(result, particle, scores.size)
+        scores = np.sort(scores)
+        side = "left" if result.get("threshold_comparison", "gt") == "ge" else "right"
+        return (scores.size - np.searchsorted(scores, np.asarray(thresholds, dtype=np.float32), side=side)) / max(total, 1.0)
+
+    def _render_particle_efficiency_vs_rate(self, plot_items, target_rate_hz, full_path, show) -> bool:
+        """Efficiency of every event type against the NSB rate, all on ONE axes: the colour is the trigger, the line style the particle."""
+        from matplotlib.lines import Line2D
+        drew, particles_seen, config_handles = False, [], []
+        with self._report_style_context():
+            plt.close("all")
+            fig, ax = plt.subplots()
+            for cfg, label, fold in plot_items:
+                self._apply_fold_override(fold)
+                result = self.get_results(cfg)
+                if result is None or not result.get("has_pre_threshold_score", False):
+                    continue
+                thresholds, rates = self._get_result_trigger_rate_curve(result)
+                keep = (rates >= 1e3) & (rates <= 2e6)    # below ~1 kHz the NSB sample holds a handful of triggers: flat noise
+                color = self._get_config_plot_color(cfg)
+                tau = None
+                if target_rate_hz is not None:
+                    tau = self._resolve_trigger_strategy(result, target_rate_hz=target_rate_hz).get("score_threshold")
+                for particle, linestyle in self._PARTICLE_LINESTYLE.items():
+                    eff = self._particle_efficiency_at(result, particle, thresholds)
+                    if eff is None:
+                        continue
+                    ax.plot(rates[keep], eff[keep], linestyle=linestyle, color=color, lw=1.6)
+                    if tau is not None:
+                        rate_tau = float(np.interp(tau, thresholds, rates))
+                        ax.plot([rate_tau], [self._particle_efficiency_at(result, particle, np.array([tau]))[0]], "o", color=color, ms=5)
+                    if particle not in particles_seen:
+                        particles_seen.append(particle)
+                    drew = True
+                config_handles.append(Line2D([0], [0], color=color, lw=2, label=label))
+            if not drew:
+                plt.close("all")
+                return False
+            if target_rate_hz is not None:
+                ax.axvline(float(target_rate_hz), color="gray", ls="-.", lw=0.8)
+            ax.set_xscale("log")
+            ax.set_ylim(bottom=0.0)
+            ax.set_xlabel("NSB trigger rate (Hz)")
+            ax.set_ylabel("triggered / simulated showers")
+            ax.grid(True, alpha=0.3)
+            ax.set_title("Trigger efficiency vs NSB rate -- gammas, protons, muons")
+            first = ax.legend(handles=config_handles, loc="upper left", fontsize=9, title="trigger")
+            ax.add_artist(first)
+            ax.legend(handles=[Line2D([0], [0], color="black", lw=1.6, linestyle=self._PARTICLE_LINESTYLE[p], label=p) for p in particles_seen],
+                      loc="lower right", fontsize=9, title="particle (dots: target rate)" if target_rate_hz is not None else "particle")
+            self._report_style_current_figure()
+            self._report_stash_vector_figure(full_path)
+            self._apply_title_policy()
+            plt.gcf().savefig(full_path, bbox_inches="tight", dpi=320)
+            if show:
+                plt.show()
+            plt.close("all")
+        return os.path.exists(full_path)
+
+    def _particle_energy_stats(self, result: Dict[str, Any], particle: str, target_rate_hz, n_bins: int = 30, metric: str = "energy", x_range=None):
+        """Efficiency (triggered / events in the files) of ``particle`` in log bins of ``metric`` (energy or n_pe) at the target rate, or None without events.
+
+        ``x_range``: the bins span it (the range given to ``generateReport``), unless the events sit far below it (see ``_range_for``).
+        """
+        energy = self._collect_metric_values(result, metric, kind=particle)
+        energy = energy[energy > 0]
+        if energy.size < 2:
+            return None
+        lo, hi = self._range_for(energy, x_range) if x_range is not None else (float(energy.min()), float(energy.max()))
+        bins = np.geomspace(lo, hi, n_bins + 1)
+        tau = self._resolve_trigger_strategy(result, target_rate_hz=target_rate_hz).get("score_threshold")
+        all_h, trig_h = self._histogram_stream(result, metric, particle, bins, score_threshold=tau)
+        eff, err = self._efficiency_from_counts(all_h, trig_h)
+        return {"bin_centers": np.sqrt(bins[:-1] * bins[1:]), "binning": bins, "efficiency": eff, "err_low": err[0], "err_high": err[1],
+                "all_h": all_h}
+
+    def _base_plot_item(self, plot_items):
+        """The (config, label, fold) of the plotted items that is the base reference config, or None."""
+        for item in plot_items:
+            if self._is_base_config(chain=item[0]):
+                return item
+        return None
+
+    def _render_particle_ratio_vs_energy(self, plot_items, target_rate_hz, full_path, show, metric: str = "energy", x_range=None) -> bool:
+        """Efficiency of every trigger over the base trigger's, against the energy (or n_pe), one panel per event type."""
+        xlabel, name = self._PARTICLE_METRIC_LABEL[metric]
+        base = self._base_plot_item(plot_items)
+        others = [item for item in plot_items if item is not base]
+        if base is None or not others:
+            return False
+        panels = list(self._PARTICLE_LINESTYLE)
+        drew = False
+        with self._report_style_context():
+            plt.close("all")
+            fig, axes = plt.subplots(1, len(panels), figsize=(5.2 * len(panels), 4.6), squeeze=False)
+            for ax, particle in zip(axes[0], panels):
+                self._apply_fold_override(base[2])
+                base_result = self.get_results(base[0])
+                base_stats = None if base_result is None or not base_result.get("has_pre_threshold_score", False) else \
+                    self._particle_energy_stats(base_result, particle, target_rate_hz, metric=metric, x_range=x_range)
+                if base_stats is not None:
+                    ax.axhline(1.0, color=self._get_config_plot_color(base[0]), lw=1.2, label=f"{base[1]} (reference)")
+                    for cfg, label, fold in others:
+                        self._apply_fold_override(fold)
+                        result = self.get_results(cfg)
+                        if result is None or not result.get("has_pre_threshold_score", False):
+                            continue
+                        stats = self._particle_energy_stats(result, particle, target_rate_hz, metric=metric, x_range=x_range)
+                        if stats is None:
+                            continue
+                        ratio = compute_ratio_with_errors(base_stats, stats)
+                        ok = (base_stats["all_h"] >= self._MIN_EVENTS_PER_ENERGY_BIN) & np.isfinite(ratio["efficiency"])
+                        ax.errorbar(ratio["bin_centers"][ok], ratio["efficiency"][ok],
+                                    yerr=np.vstack([ratio["err_low"][ok], ratio["err_high"][ok]]), fmt="o-", ms=3, capsize=2, lw=1.2,
+                                    color=self._get_config_plot_color(cfg), label=label)
+                        drew = True
+                ax.set_xscale("log")
+                ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())
+                ax.set_xlabel(xlabel)
+                ax.set_title(particle)
+                ax.grid(True, alpha=0.3)
+                if particle == panels[0]:
+                    ax.set_ylabel(f"efficiency / efficiency of {base[1]}")
+                    ax.legend(loc="best", fontsize=8)
+            if not drew:
+                plt.close("all")
+                return False
+            rate_txt = f" at {float(target_rate_hz):.0f} Hz of NSB" if target_rate_hz is not None else ""
+            fig.suptitle(f"Efficiency ratio to {base[1]} vs {name}{rate_txt}")
+            fig.tight_layout()
+            self._report_style_current_figure()
+            self._report_stash_vector_figure(full_path)
+            self._apply_title_policy()
+            plt.gcf().savefig(full_path, bbox_inches="tight", dpi=320)
+            if show:
+                plt.show()
+            plt.close("all")
+        return os.path.exists(full_path)
+
+    def _render_particle_ratio_vs_rate(self, plot_items, target_rate_hz, full_path, show) -> bool:
+        """Efficiency of every trigger over the base trigger's AT THE SAME NSB rate, all event types on one axes (colour: trigger, style: particle)."""
+        from matplotlib.lines import Line2D
+        base = self._base_plot_item(plot_items)
+        others = [item for item in plot_items if item is not base]
+        if base is None or not others:
+            return False
+        grid = np.geomspace(1e3, 2e6, 80)
+
+        def curve(item, particle):
+            self._apply_fold_override(item[2])
+            result = self.get_results(item[0])
+            if result is None or not result.get("has_pre_threshold_score", False):
+                return None
+            thresholds, rates = self._get_result_trigger_rate_curve(result)
+            eff = self._particle_efficiency_at(result, particle, thresholds)
+            if eff is None:
+                return None
+            order = np.argsort(rates, kind="stable")
+            return np.interp(grid, rates[order], eff[order])
+
+        particles_seen, config_handles, drew = [], [], False
+        with self._report_style_context():
+            plt.close("all")
+            fig, ax = plt.subplots()
+            ax.axhline(1.0, color="gray", lw=0.8)
+            for item in others:
+                color = self._get_config_plot_color(item[0])
+                for particle, linestyle in self._PARTICLE_LINESTYLE.items():
+                    base_eff, eff = curve(base, particle), curve(item, particle)
+                    if base_eff is None or eff is None:
+                        continue
+                    with np.errstate(divide="ignore", invalid="ignore"):
+                        ax.plot(grid, np.where(base_eff > 0, eff / base_eff, np.nan), linestyle=linestyle, color=color, lw=1.6)
+                    if particle not in particles_seen:
+                        particles_seen.append(particle)
+                    drew = True
+                config_handles.append(Line2D([0], [0], color=color, lw=2, label=item[1]))
+            if not drew:
+                plt.close("all")
+                return False
+            if target_rate_hz is not None:
+                ax.axvline(float(target_rate_hz), color="gray", ls="-.", lw=0.8)
+            ax.set_xscale("log")
+            ax.set_xlabel("NSB trigger rate (Hz)")
+            ax.set_ylabel(f"efficiency / efficiency of {base[1]}")
+            ax.grid(True, alpha=0.3)
+            ax.set_title(f"Efficiency ratio to {base[1]} at equal NSB rate -- gammas, protons, muons")
+            first = ax.legend(handles=config_handles, loc="upper left", fontsize=9, title="trigger")
+            ax.add_artist(first)
+            ax.legend(handles=[Line2D([0], [0], color="black", lw=1.6, linestyle=self._PARTICLE_LINESTYLE[p], label=p) for p in particles_seen],
+                      loc="lower right", fontsize=9, title="particle")
+            self._report_style_current_figure()
+            self._report_stash_vector_figure(full_path)
+            self._apply_title_policy()
+            plt.gcf().savefig(full_path, bbox_inches="tight", dpi=320)
+            if show:
+                plt.show()
+            plt.close("all")
+        return os.path.exists(full_path)
+
+    def _render_particle_efficiency_vs_energy(self, plot_items, target_rate_hz, full_path, show, n_bins: int = 30, metric: str = "energy", x_range=None) -> bool:
+        """One panel per event type: efficiency (triggered / events in the files) against the energy (or n_pe), every trigger on each panel."""
+        xlabel, name = self._PARTICLE_METRIC_LABEL[metric]
+        panels = list(self._PARTICLE_LINESTYLE)
+        drew = False
+        with self._report_style_context():
+            plt.close("all")
+            fig, axes = plt.subplots(1, len(panels), figsize=(5.2 * len(panels), 4.6), squeeze=False)
+            for ax, particle in zip(axes[0], panels):
+                panel_drew = False
+                for cfg, label, fold in plot_items:
+                    self._apply_fold_override(fold)
+                    result = self.get_results(cfg)
+                    if result is None or not result.get("has_pre_threshold_score", False):
+                        continue
+                    stats = self._particle_energy_stats(result, particle, target_rate_hz, n_bins=n_bins, metric=metric, x_range=x_range)
+                    if stats is None:
+                        continue
+                    ok = stats["all_h"] >= self._MIN_EVENTS_PER_ENERGY_BIN
+                    ax.errorbar(stats["bin_centers"][ok], stats["efficiency"][ok], yerr=np.vstack([stats["err_low"], stats["err_high"]])[:, ok],
+                                fmt="o-", ms=3, capsize=2, lw=1.2, color=self._get_config_plot_color(cfg), label=label)
+                    panel_drew = drew = True
+                ax.set_xscale("log")
+                ax.xaxis.set_minor_formatter(matplotlib.ticker.NullFormatter())      # overlapping minor labels on a narrow range
+                ax.set_ylim(0.0, 1.05)
+                ax.set_xlabel(xlabel)
+                ax.set_title(particle)
+                ax.grid(True, alpha=0.3)
+                if panel_drew and particle == panels[0]:
+                    ax.set_ylabel("triggered / events in the files")
+                    ax.legend(loc="best", fontsize=8)
+            if not drew:
+                plt.close("all")
+                return False
+            rate_txt = f" at {float(target_rate_hz):.0f} Hz of NSB" if target_rate_hz is not None else ""
+            fig.suptitle(f"Trigger efficiency vs {name}{rate_txt}")
+            fig.tight_layout()
             self._report_style_current_figure()
             self._report_stash_vector_figure(full_path)
             self._apply_title_policy()
@@ -3102,6 +3411,30 @@ class StatPlotter:
                 target_rate_hz=target_rate_hz,
             )
 
+            # The same four pages (absolute / ratio, against n_pe / energy) for the other showers: protons, muons.
+            read_counts = self.base_config_result
+            for kind in ("proton", "muon"):
+                if not read_counts.get(f"num_events_{kind}", 0):
+                    continue
+                self._report_kind = kind
+                try:
+                    ranges = {"n_pe": self._kind_range(kind, "n_pe", n_pe_x_range), "energy": self._kind_range(kind, "energy", energy_x_range)}
+                    for what, plot_type, y_npe, y_energy in (("Absolute Efficiency", "absolute", n_pe_absolute_y_range, energy_absolute_y_range),
+                                                              ("Efficiency Ratio", "ratio", n_pe_ratio_y_range, energy_ratio_y_range)):
+                        for metric, label, y_range, nbins in (("n_pe", "Npe", y_npe, n_pe_bins), ("energy", "Energy", y_energy, energy_bins)):
+                            add_combined_plot(
+                                f"{kind.capitalize()}: {what} vs {label}",
+                                f"{plot_type}_efficiency_{'npe' if metric == 'n_pe' else 'energy'}_{kind}.png",
+                                plot_type,
+                                metrics=metric,
+                                x_range=ranges[metric],
+                                y_range=y_range,
+                                bins=nbins,
+                                target_rate_hz=target_rate_hz,
+                            )
+                finally:
+                    self._report_kind = "gamma"
+
             # Distributions of the whole dataset (all gamma events, trigger-independent).
             def add_distribution(section_title: str, filename: str, metric: str, x_range, bins) -> None:
                 full_path = os.path.join(output_dir, filename)
@@ -3139,20 +3472,24 @@ class StatPlotter:
                 seen_cv_keys: set = set()
                 cv_configs: List[ConfigType] = []
                 cv_labels: List[Optional[str]] = []
-                for cfg, label, _slug, _short_name, _fold in config_descriptions:
+                for cfg, _label, _slug, short_name, _fold in config_descriptions:
                     key = self._config_color_key(cfg)
                     if key in seen_cv_keys:
                         continue
                     seen_cv_keys.add(key)
                     cv_configs.append(cfg)
-                    cv_labels.append(label)
-                cv_path = os.path.join(output_dir, "cross_validation.png")
-                if self._render_cross_validation(
-                    cv_configs, cv_labels, cv_path, show, n_sigma=cross_validation_n_sigma,
-                    condition=cross_validation_condition,
-                ):
-                    combined_sections.append(
-                        ("Cross-Validation (per-fold AUC & NSB rate)", "cross_validation.png"))
+                    cv_labels.append(short_name)
+                cv_rows = self._resolve_cv_rows(cv_configs, cv_labels, condition=cross_validation_condition)
+                # one page per run (every fold, raw values) ...
+                for i, row in enumerate(cv_rows):
+                    cv_file = f"cross_validation_{i + 1}.png" if len(cv_rows) > 1 else "cross_validation.png"
+                    if self._render_cv_rows([row], os.path.join(output_dir, cv_file), show, n_sigma=cross_validation_n_sigma):
+                        combined_sections.append((f"Cross-Validation -- {row[0]}", cv_file))
+                # ... and one page with every run, in sigma
+                if len(cv_rows) > 1 and self._render_cv_rows(
+                        cv_rows, os.path.join(output_dir, "cross_validation_all.png"), show,
+                        n_sigma=cross_validation_n_sigma, overlay=True):
+                    combined_sections.append(("Cross-Validation -- all runs (deviation from fold 0, in sigma)", "cross_validation_all.png"))
 
             # n_pe vs energy correlation (whole gamma sample).
             npe_energy_path = os.path.join(output_dir, "npe_vs_energy.png")
@@ -3168,6 +3505,22 @@ class StatPlotter:
                 impact_path, show,
             ):
                 combined_sections.append(("Gamma Efficiency vs Impact Distance", "efficiency_vs_impact_distance.png"))
+
+            # Protons and muons next to the gammas: efficiency against the NSB rate (all on one axes) and against the energy.
+            for _fn, _title, _render in (
+                ("particle_efficiency_vs_rate.png", "Efficiency of Gammas, Protons and Muons vs NSB Rate", self._render_particle_efficiency_vs_rate),
+                ("particle_efficiency_vs_energy.png", "Efficiency of Gammas, Protons and Muons vs Energy",
+                 lambda *a: self._render_particle_efficiency_vs_energy(*a, metric="energy", x_range=energy_x_range)),
+                ("particle_efficiency_vs_npe.png", "Efficiency of Gammas, Protons and Muons vs n_pe",
+                 lambda *a: self._render_particle_efficiency_vs_energy(*a, metric="n_pe", x_range=n_pe_x_range)),
+                ("particle_ratio_vs_rate.png", "Efficiency Ratio to the Base Trigger vs NSB Rate (Gammas, Protons, Muons)", self._render_particle_ratio_vs_rate),
+                ("particle_ratio_vs_energy.png", "Efficiency Ratio to the Base Trigger vs Energy (Gammas, Protons, Muons)",
+                 lambda *a: self._render_particle_ratio_vs_energy(*a, metric="energy", x_range=energy_x_range)),
+                ("particle_ratio_vs_npe.png", "Efficiency Ratio to the Base Trigger vs n_pe (Gammas, Protons, Muons)",
+                 lambda *a: self._render_particle_ratio_vs_energy(*a, metric="n_pe", x_range=n_pe_x_range)),
+            ):
+                if _render(report_plot_items, target_rate_hz, os.path.join(output_dir, _fn), show):
+                    combined_sections.append((_title, _fn))
 
             # Share of the triggered gammas that also pass each gate (optional).
             if gate_configs:
@@ -4008,12 +4361,13 @@ class StatPlotter:
         """
         if result is None or not result.get("has_pre_threshold_score", False):
             return float("nan")
-        key = result.get("_path")
+        path = result.get("_path")
+        key = None if path is None else (path, self._report_kind)
         if key in self._roc_auc_cache:
             return self._roc_auc_cache[key]
-        gamma = self._collect_metric_values(result, PRE_THRESHOLD_SCORE_DATASET, kind="gamma")
+        shower = self._collect_metric_values(result, PRE_THRESHOLD_SCORE_DATASET, kind=self._report_kind)
         nsb = self._collect_metric_values(result, PRE_THRESHOLD_SCORE_DATASET, kind="nsb")
-        auc = roc_auc_mann_whitney(gamma, nsb)
+        auc = roc_auc_mann_whitney(shower, nsb)
         if key is not None:
             self._roc_auc_cache[key] = auc
         return auc
@@ -4135,7 +4489,7 @@ class StatPlotter:
 
     def addPlotRatioPerfect(self, label: str = "Perfect Efficiency"):
         if self.x_range is None:
-            lo, hi = self._get_default_range(self.base_config_result, self.metrics, kind="gamma")
+            lo, hi = self._get_default_range(self.base_config_result, self.metrics, kind=self._report_kind)
         else:
             lo, hi = self.x_range
         bins = self._make_log_bins(lo, hi, self.nbins)
@@ -4145,7 +4499,7 @@ class StatPlotter:
 
     def addPlotAbsolutePerfect(self, label: str = "Perfect Efficiency"):
         if self.x_range is None:
-            lo, hi = self._get_default_range(self.base_config_result, self.metrics, kind="gamma")
+            lo, hi = self._get_default_range(self.base_config_result, self.metrics, kind=self._report_kind)
         else:
             lo, hi = self.x_range
         bins = self._make_log_bins(lo, hi, self.nbins)
@@ -4302,16 +4656,16 @@ class StatPlotter:
             raise ValueError("Reference configuration not found.")
 
         # Build common bins from reference (HDF5 streaming)
-        lo, hi = self._get_default_range(ref_result, "n_pe", kind="gamma")
+        lo, hi = self._get_default_range(ref_result, "n_pe", kind=self._report_kind)
 
         bins = np.logspace(np.log10(max(lo, 1e-3)), np.log10(hi + 1e-3), n_pe_bins)
 
         def _hist_and_count(res: Dict[str, Any]) -> Tuple[int, np.ndarray]:
             # Every plot of a report re-runs this check: the stats files are
             # immutable, so a full scan per (file, fold, binning) is enough.
-            key = (res["_path"], str(self._fold_filter), float(bins[0]), float(bins[-1]), len(bins))
+            key = (res["_path"], str(self._fold_filter), self._report_kind, float(bins[0]), float(bins[-1]), len(bins))
             if key not in self._npe_hist_cache:
-                all_h, _ = self._histogram_stream(res, "n_pe", kind="gamma", bins=bins)
+                all_h, _ = self._histogram_stream(res, "n_pe", kind=self._report_kind, bins=bins)
                 self._npe_hist_cache[key] = all_h.astype(np.float64)
             hist = self._npe_hist_cache[key]
             return int(hist.sum()), hist

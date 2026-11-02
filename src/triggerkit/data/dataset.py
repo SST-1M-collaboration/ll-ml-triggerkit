@@ -31,10 +31,9 @@ Design points agreed for the package refactor:
   shape ``(B, 4)`` (``(B, 3, 4)`` with ``split="board"``) = ``[label, positive weight, negative weight, in zone]``, computed from the n_pe
   the model sees: the event's ``n_pe`` feature, or the true p.e. on each board's own patches with ``split="board"``. The labels are not
   changed; the loss and the metrics read the channels (see ``triggerkit.training.npe_weighting``).
-* ``gamma_rotations``: reserved for hexagonal rotation augmentation. Rotation
-  differs by representation (TDSCAN = pixel-index permutation; CNN = grid H x W
-  after remapping), so it needs a real algorithm; for now anything other than
-  ``(0,)`` warns and is ignored.
+* ``gamma_rotations``: camera rotations (degrees, multiples of 120: this camera is 3-fold symmetric) the TRAINING gammas are randomly given, one per
+  gamma and per pass: ``(0, 120, 240)`` triples what the model sees over the epochs. It is a pixel permutation of the waveform, the pedestal and the true
+  image (so the board labels, computed afterwards, follow the rotated camera). The NSB and the other showers are not rotated; the validation is not.
 """
 
 import warnings
@@ -134,7 +133,7 @@ class TriggerDataset:
         ``Fixed(16, 50)``), and how its trigger time is read. The events it does not fire on are dropped, in both splits, at every epoch
         (like ``gated_by``); a NSB that says it was made by a trigger (``made_by``) is checked against it.
     gamma_rotations : tuple of int
-        Reserved for hex rotation augmentation. Non-``(0,)`` warns and is ignored.
+        Rotations in degrees (multiples of 120) drawn at random for each training gamma, e.g. ``(0, 120, 240)``; ``(0,)``: none.
     seed : int
     """
 
@@ -288,15 +287,17 @@ class TriggerDataset:
             if gate.num_pixels != self.gated_by[0].num_pixels:
                 raise ValueError("all gated_by chains must take the same number of pixels.")
 
-        self.gamma_rotations = tuple(gamma_rotations)
+        self.gamma_rotations = tuple(int(r) % 360 for r in gamma_rotations)
+        if not self.gamma_rotations or len(set(self.gamma_rotations)) != len(self.gamma_rotations):
+            raise ValueError(f"gamma_rotations={tuple(gamma_rotations)!r}: give each rotation once, e.g. (0, 120, 240).")
+        self._rotation_index = None
         if self.gamma_rotations != (0,):
-            warnings.warn(
-                "gamma_rotations augmentation is not implemented yet and will be "
-                "ignored. Hex rotation needs a representation-specific algorithm "
-                "(TDSCAN = pixel-index permutation; CNN = grid H x W after "
-                "remapping); coming later.",
-                stacklevel=2,
-            )
+            from triggerkit.augment import rotation_index
+            from triggerkit.models.boards import patch_geometry
+
+            geometry = patch_geometry()          # raises for an angle that is not an exact symmetry of the camera
+            self._rotation_index = np.stack([np.arange(len(geometry.pix_x)) if r == 0 else rotation_index(geometry, r)
+                                             for r in self.gamma_rotations]).astype(np.int64)         # (R, P)
 
     # ------------------------------------------------------------------ #
     #: Targets the streaming reader can emit today.
@@ -429,6 +430,8 @@ class TriggerDataset:
             ds = self._binary_label(ds)
         else:
             ds = self._particle_codes(ds)
+        if training and self._rotation_index is not None:
+            ds = self._rotate_gammas(ds)               # before the board labels: they are computed from the rotated true image
         if self.npe_weighting is not None:         # before the board labels replace the event label: the channels come from the gamma flag
             ds = self._npe_channels(ds)
         return self._board_labels(ds) if self.split == "board" else ds
@@ -466,6 +469,23 @@ class TriggerDataset:
             return out, tf.gather(label, keep)
 
         return (ds.map(align).unbatch().batch(self.batch_size, drop_remainder=True).prefetch(tf.data.AUTOTUNE))
+
+    def _rotate_gammas(self, ds):
+        """Give each gamma of the batch a random one of the ``gamma_rotations``: the same pixel permutation of its waveform, pedestal and maps."""
+        table = tf.constant(self._rotation_index)                                  # (R, P)
+
+        def rotate(features, label):
+            gamma = tf.equal(features["particle"], PARTICLES["gamma"])
+            choice = tf.where(gamma, tf.random.uniform(tf.shape(features["particle"]), 0, table.shape[0], dtype=tf.int32), 0)
+            perm = tf.gather(table, choice)                                        # (B, P): out[p] = in[perm[p]], the fold plumbing's convention
+            out = dict(features)
+            out["waveform"] = tf.gather(features["waveform"], perm, axis=2, batch_dims=1)          # (B, 1, P, T)
+            for key in ("pedestal", "true_image", "peak_time"):
+                if key in features:
+                    out[key] = tf.gather(features[key], perm, axis=1, batch_dims=1)                # (B, P)
+            return out, label
+
+        return ds.map(rotate, num_parallel_calls=tf.data.AUTOTUNE)
 
     def _binary_label(self, ds):
         """gamma = 1 against everything else = 0, and ``features["particle_weight"]`` (the negative weight of the extra types)."""

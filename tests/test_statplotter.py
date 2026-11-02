@@ -181,7 +181,7 @@ def test_generate_report_end_to_end(tmp_path):
         assert section in md
     assert "Skipped Items" not in md
     assert (out / "report.html").stat().st_size > 0
-    for png in ("roc_curves.png", "cross_validation.png", "effective_area.png"):
+    for png in ("roc_curves.png", "cross_validation_1.png", "cross_validation_2.png", "cross_validation_all.png", "effective_area.png"):
         assert (out / png).stat().st_size > 0
     assert sp._fold_filter == folds[0]                  # constructor's fold restored
 
@@ -289,3 +289,62 @@ def test_gated_out_events_count_in_the_rates_but_not_in_the_score_histogram(tmp_
     assert sp._collect_metric_values(r, "score", kind="gamma").size == n                                  # the rates see them
     assert sp._collect_metric_values(r, "score", kind="gamma", drop_gated_out=True).size == n - 20          # the histogram does not
     assert sp._get_result_trigger_rate_hz(r) == pytest.approx(0.5 / 1e-6)                                  # 50 of 100 NSB events above 2.0
+
+
+def write_particles(path, n=300, seed=0, chain=CHAIN, score_seed=None):
+    """Gammas (1), protons (2), muons (3) and NSB (0) with their simulated totals, one fold; ``score_seed`` changes the scores, not the events."""
+    rng = np.random.default_rng(seed)
+    w = H5StatsWriter(str(path), trigger_chain=chain, camera_name="DigiCam")
+    particle = np.r_[np.full(n, 1), np.full(n, 2), np.full(n // 3, 3), np.full(n, 0)].astype(np.uint8)
+    rows = w.append_events({"particle": particle, "event_id": np.arange(particle.size),
+                            "n_pe": rng.uniform(20, 300, particle.size).astype(np.float32),
+                            "energy": rng.uniform(0.05, 50, particle.size).astype(np.float32)})
+    for name, count in (("gamma", n), ("proton", n), ("muon", n // 3), ("nsb", n)):
+        w.add_source("m", name, written=count, simulated=10 * count, simulated_given=True)
+    idx = w.begin_fold("rot0_original_m", condition="m")
+    scores = (rng if score_seed is None else np.random.default_rng(score_seed)).integers(0, 8, particle.size)
+    w.append_scores(idx, rows, score=scores.astype(np.float32))
+    w.close(window_sec=2e-7)
+
+
+def test_particle_efficiency_is_triggered_over_simulated(tmp_path):
+    write_particles(tmp_path / "p.h5")
+    sp = plotter(tmp_path, fold="rot0_original_m")
+    result = sp.base_config_result
+    for particle, written in (("gamma", 300), ("proton", 300), ("muon", 100)):
+        scores = sp._collect_metric_values(result, "score", kind=particle)
+        eff = sp._particle_efficiency_at(result, particle, np.array([2.0]))[0]
+        assert eff == pytest.approx(np.count_nonzero(scores > 2.0) / (10 * written))      # over the SIMULATED showers, not over the 300 read
+
+
+def test_report_draws_the_particle_efficiency_plots(tmp_path):
+    write_particles(tmp_path / "p.h5")
+    sp = plotter(tmp_path, fold="rot0_original_m")
+    out = tmp_path / "report"
+    sp.generateReport(configs=[CHAIN], output_dir=str(out), target_rate_hz=1e5, effective_area_expected_N=300,
+                      generate_pdf=False, generate_html=False, save_svg=False)
+    md = (out / "report.md").read_text()
+    assert "Efficiency of Gammas, Protons and Muons vs NSB Rate" in md and "vs Energy" in md
+    for png in ("particle_efficiency_vs_rate.png", "particle_efficiency_vs_energy.png", "particle_efficiency_vs_npe.png"):
+        assert (out / png).stat().st_size > 0
+    # a full page per shower type, like the gammas': absolute and ratio, against n_pe and energy
+    for kind in ("proton", "muon"):
+        for png in (f"absolute_efficiency_npe_{kind}.png", f"absolute_efficiency_energy_{kind}.png"):
+            assert (out / png).stat().st_size > 0
+        assert f"{kind.capitalize()}: Absolute Efficiency vs Npe" in md
+    assert sp._report_kind == "gamma"                     # restored after the sections
+
+
+def test_report_draws_the_particle_ratio_plots(tmp_path):
+    write_particles(tmp_path / "a.h5")
+    out = tmp_path / "report"
+    chain_b = [("threshold", {"threshold": 2.0, "binary": True, "comparison": "gt", "extra": 1})]
+    write_particles(tmp_path / "b.h5", chain=chain_b, score_seed=7)
+    sp = plotter(tmp_path, fold="rot0_original_m")
+    sp.generateReport(configs=[CHAIN, chain_b], output_dir=str(out), target_rate_hz=1e5, effective_area_expected_N=300,
+                      legend_overrides=["base", "other"], generate_pdf=False, generate_html=False, save_svg=False)
+    md = (out / "report.md").read_text()
+    assert "Efficiency Ratio to the Base Trigger vs NSB Rate" in md and "Ratio to the Base Trigger vs Energy" in md
+    for png in ("particle_ratio_vs_rate.png", "particle_ratio_vs_energy.png", "particle_ratio_vs_npe.png",
+                "ratio_efficiency_npe_proton.png", "ratio_efficiency_energy_muon.png"):
+        assert (out / png).stat().st_size > 0

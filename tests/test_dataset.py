@@ -64,6 +64,35 @@ def test_supported_aux_targets_and_single_nsb_string():
     assert d._config(training=False).nsb_roll_seed != cfg.nsb_roll_seed   # independent rotations
 
 
-def test_gamma_rotations_warns():
-    with pytest.warns(UserWarning, match="not implemented"):
-        ds(3, gamma_rotations=(0, 120))
+def test_gamma_rotations_are_validated():
+    assert ds(3, gamma_rotations=(0, 120, 240)).gamma_rotations == (0, 120, 240) and ds(3, gamma_rotations=(0, 120))._rotation_index.shape == (2, 432)
+    assert ds(3)._rotation_index is None
+    with pytest.raises(ValueError, match="once"):
+        ds(3, gamma_rotations=(0, 120, 120))
+    with pytest.raises(ValueError, match="symmetry"):
+        ds(3, gamma_rotations=(0, 60))                 # not an exact symmetry of a 3-fold camera
+
+
+def test_rotated_gammas_are_a_pixel_permutation_of_every_map_and_the_nsb_is_untouched():
+    import numpy as np
+    import tensorflow as tf
+
+    d = ds(3, gamma_rotations=(0, 120, 240))
+    rng = np.random.default_rng(0)
+    B, P, T = 64, 432, 4
+    wf = rng.integers(0, 200, (B, 1, P, T)).astype(np.float32)
+    true_image = rng.random((B, P)).astype(np.float32)
+    particle = np.r_[np.ones(B // 2), np.zeros(B // 2)].astype(np.int32)
+    feats = {"waveform": wf, "pedestal": rng.random((B, P)).astype(np.float32), "true_image": true_image, "particle": particle}
+    out, _ = next(iter(d._rotate_gammas(tf.data.Dataset.from_tensors((feats, particle)))))
+    table = d._rotation_index
+    used = set()
+    for b in range(B):
+        w, t = out["waveform"].numpy()[b, 0], out["true_image"].numpy()[b]
+        if particle[b] == 0:
+            assert np.array_equal(w, wf[b, 0]) and np.array_equal(t, true_image[b])         # the NSB is not rotated
+            continue
+        which = [r for r in range(3) if np.array_equal(w, wf[b, 0][table[r]])]
+        assert len(which) == 1 and np.array_equal(t, true_image[b][table[which[0]]])         # waveform and true image follow the same permutation
+        used.add(which[0])
+    assert used == {0, 1, 2}                                                                 # the three rotations are drawn
