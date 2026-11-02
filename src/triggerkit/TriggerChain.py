@@ -1220,6 +1220,15 @@ class TriggerChain:
                              f"TriggerChain(..., num_samples={want}).")
     elif align_with is not None:
         raise ValueError("align_with needs a window: window=Window(length, offset)")
+    if window is not None and hasattr(window, "start"):
+        # the time shifts of the folds move the waveform of the WHOLE datacube, the window is cut afterwards: a shift only pulls samples the
+        # files do not have (the repeated edge sample) into the window when it is larger than the margin the window leaves on that side
+        left, right = window.start, self.file_num_samples - (window.start + window.length)
+        for f in fold_plan:
+            for what, shift in (("shower", f[0].shower_time_shift), ("nsb", f[0].nsb_time_shift)):
+                if (shift > 0 and shift > left) or (shift < 0 and -shift > right):
+                    raise ValueError(f"fold {f[0].name!r}: a {what} time shift of {shift} samples would put repeated edge samples in the window "
+                                     f"{window} (it leaves {left} real samples before and {right} after it).")
     stats_window_sec = align_with.window_size if align_with is not None else self.window_size
 
     # Shared SimTelTFDatasetConfig kwargs -- everything EXCEPT the per-type event caps, filled in per group below.

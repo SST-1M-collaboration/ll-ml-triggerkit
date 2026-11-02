@@ -252,3 +252,42 @@ def test_the_run_is_identified_and_described(setup, tmp_path):
     assert s.created_utc and "threshold" not in s.attrs and s.reference_threshold == 750.0          # the chain's description holds it
     again = chain.compute_statistics(base_name="u", folder=str(tmp_path), batch_size=8, tel_id_only=1, overwrite=True, sim=sim)
     assert again["uuid"] != res["uuid"]                                                               # one identifier per run
+
+
+# --------------------------------------------------------------------- time shifts and the window
+def test_a_time_shift_moves_real_samples_into_the_window_not_padding(aligned_setup, tmp_path):
+    """With the 82-sample cube the shift is applied to the whole cube and the window is cut afterwards: the samples that come in at the edge are
+    real ones, not the repeated boundary sample the 50-sample files had to pad with."""
+    from triggerkit.cascade import Fixed
+    sim, _, upstream, _, _, _ = aligned_setup
+    plain_sim = Simulation(gamma=sim.files("gamma"), nsb=sim.files("nsb"))
+    folds = make_rotation_folds(upstream.geom, [
+        {"events": {"gamma": 20, "nsb": 30}, "conditions": ["m"]},
+        {"events": {"gamma": 20, "nsb": 30}, "conditions": ["m"], "shower_time_shift": 5, "nsb_time_shift": 5},
+    ], {"m": plain_sim})
+    real_model = upstream.model
+    upstream.model = recorder = Recorder(real_model)
+    try:
+        upstream.compute_statistics(base_name="t", folder=str(tmp_path), batch_size=16, tel_id_only=1, overwrite=True, folds=folds, window=Fixed(16, 50))
+    finally:
+        upstream.model = real_model
+    checked = 0
+    for plain, shifted in zip(recorder.calls[0::2], recorder.calls[1::2]):
+        assert plain.shape[2] == shifted.shape[2] == 50
+        np.testing.assert_array_equal(shifted[:, :, 5:], plain[:, :, :-5])           # the window moved by 5 samples of the cube
+        assert (np.ptp(shifted[:, :, :5].astype(np.int64), axis=2) > 0).any()         # the 5 new samples are different readout values, not one repeated
+        checked += len(plain)
+    assert checked == 50
+
+
+def test_a_shift_larger_than_the_margin_of_the_window_is_refused(aligned_setup, tmp_path):
+    from triggerkit.cascade import Fixed
+    sim, _, upstream, _, _, _ = aligned_setup
+    plain_sim = Simulation(gamma=sim.files("gamma"), nsb=sim.files("nsb"))
+    spec = {"events": {"gamma": 5, "nsb": 5}, "conditions": ["m"]}
+    for key, shift, message in (("shower_time_shift", 17, "17 samples .* 16 real samples before"), ("nsb_time_shift", -17, "-17 samples .* 16 after")):
+        folds = make_rotation_folds(upstream.geom, [dict(spec, **{key: shift})], {"m": plain_sim})
+        with pytest.raises(ValueError, match=message):
+            upstream.compute_statistics(base_name="t", folder=str(tmp_path), overwrite=True, folds=folds, window=Fixed(16, 50))
+    ok = make_rotation_folds(upstream.geom, [dict(spec, shower_time_shift=16, nsb_time_shift=-16)], {"m": plain_sim})
+    upstream.compute_statistics(base_name="t", folder=str(tmp_path), batch_size=16, tel_id_only=1, overwrite=True, folds=ok, window=Fixed(16, 50))
