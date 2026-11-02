@@ -14,12 +14,12 @@ N_PIX, N_SAMPLES = 432, 50
 
 def write_ctapipe_h5(path, *, n_events=20, tels=(1,), kind="gamma", seed=0,
                      tel_present=None, fill_with_tel_id=False, with_calibration=True,
-                     layout_tels=None, n_samples=N_SAMPLES, pulse_samples=(20, 25)):
+                     layout_tels=None, n_samples=N_SAMPLES, pulse_samples=(20, 25), run=None):
     """Write one file. ``tel_present(event_index) -> iterable of tel ids`` controls which
     telescopes saw each event (default: all of ``tels``). ``fill_with_tel_id`` makes every
     waveform sample equal to its telescope id, to check tel_id <-> waveform alignment.
     ``n_samples`` is the datacube length; gamma pulses sit on samples ``pulse_samples``
-    (start, stop)."""
+    (start, stop). ``run=(n_showers, shower_reuse)`` writes the ``configuration/simulation/run`` table."""
     rng = np.random.default_rng(seed)
     pos = sst1m.patch_positions()
     tel_present = tel_present or (lambda i: tels)
@@ -36,6 +36,11 @@ def write_ctapipe_h5(path, *, n_events=20, tels=(1,), kind="gamma", seed=0,
         for k, t in enumerate(layout_tels):
             layout[k] = (b"DigiCam_R0Alpha", t, 100.0 * t, -50.0 * t, 5.0)
         f.create_group("configuration/instrument/subarray")["layout"] = layout
+
+        if run is not None:
+            table = np.zeros(1, dtype=[("n_showers", "i8"), ("shower_reuse", "i8")])
+            table[0] = run
+            f.create_group("configuration/simulation")["run"] = table
 
         shower = np.zeros(n_events, dtype=[("event_id", "i8"), ("true_energy", "f4"), ("true_alt", "f4"),
                                            ("true_az", "f4"), ("true_h_first_int", "f4"),

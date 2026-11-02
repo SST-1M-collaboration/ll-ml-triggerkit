@@ -17,6 +17,7 @@ import os
 
 from triggerkit.TriggerChain import TriggerChain
 from triggerkit.augment import make_rotation_folds
+from triggerkit.data import Simulation
 
 # --- 1. SIMULATIONS: name -> (gamma files, NSB files) -------------------------
 # The name is what the folds below refer to, and what ends their names
@@ -30,22 +31,22 @@ SIMULATIONS = {
 REFERENCE = "medium"   # the chain and tau are built on this simulation
 
 # --- 2. FOLDS ------------------------------------------------------------------
-# One dict per fold. Required: gamma_events, nsb_events (how many events of each
-# kind) and conditions (the SIMULATIONS it runs on -- one fold is created per name).
+# One dict per fold. Required: events ({"gamma": n, "nsb": n, ...}, how many events of each
+# type, None = all) and conditions (the SIMULATIONS it runs on -- one fold is created per name).
 # Optional, to transform the events:
-#   gamma_deg (120/240), gamma_time_shift, nsb_kind ("rolled"/"shuffle") + nsb_param,
+#   shower_deg (120/240), shower_time_shift, nsb_kind ("rolled"/"shuffle") + nsb_param,
 #   nsb_time_shift.
 # patch7 learns nothing, so nothing should move between folds.
 FOLDS = [
     # the untouched events, on both simulations -> rot0_original_low, rot0_original_medium
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["low", "medium"]},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["low", "medium"]},
     # the other folds only on the medium simulation
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "gamma_deg": 120},
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "gamma_deg": 240},
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "nsb_kind": "rolled", "nsb_param": 1},
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "nsb_kind": "shuffle", "nsb_param": 2024},
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "gamma_time_shift": 5},
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "gamma_time_shift": 5, "nsb_time_shift": 5},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "shower_deg": 120},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "shower_deg": 240},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "nsb_kind": "rolled", "nsb_param": 1},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "nsb_kind": "shuffle", "nsb_param": 2024},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "shower_time_shift": 5},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "shower_time_shift": 5, "nsb_time_shift": 5},
 ]
 
 # --- 3. Settings ---------------------------------------------------------------
@@ -78,7 +79,7 @@ def main():
 
     # --- Statistics for every fold -------------------------------------------
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
-    folds = make_rotation_folds(chain.geom, FOLDS, SIMULATIONS)
+    folds = make_rotation_folds(chain.geom, FOLDS, {n: Simulation(gamma=g, nsb=b) for n, (g, b) in SIMULATIONS.items()})
     chain.compute_statistics(
         base_name=BASE_NAME, folder=OUTPUT_FOLDER, batch_size=512, tel_id_only=1,
         nsb_roll_copies=0, nsb_skip_original_events=False,   # each NSB event read once, untouched

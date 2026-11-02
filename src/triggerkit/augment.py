@@ -12,7 +12,7 @@ we did *not* intend -- a fixed camera orientation, specific "hot" pixels, an NSB
 pedestal artefact, etc. A physically-honest trigger is invariant under a camera
 rotation symmetry and under reshuffling spatially-iid NSB, so its efficiency and
 rate stay flat across such transforms. If they *shift* across folds, the model
-is leaking. Each :class:`Fold` pairs a gamma transform with an NSB transform;
+is leaking. Each :class:`Fold` pairs a transform of the SHOWERS (gammas, and protons and muons when they are read) with an NSB transform;
 the report compares metrics across folds and the spread is the leakage signal.
 
 Transforms
@@ -34,7 +34,7 @@ together (the baseline rotates with the camera).
 
 Temporal roll (a second fold axis)
 ----------------------------------
-A :class:`Fold` may ALSO carry a ``gamma_time_shift`` and an ``nsb_time_shift``
+A :class:`Fold` may ALSO carry a ``shower_time_shift`` and an ``nsb_time_shift``
 -- integer EDGE-HOLD shifts of the waveform along the time-sample axis ``S``
 (the vacated samples repeat the trace's own boundary sample; NOT a circular
 wrap, which fakes an edge TDSCAN fires on), applied per class
@@ -58,7 +58,6 @@ rate even though NSB values are perfectly stationary in time.)
 
 import numpy as np
 
-from triggerkit.FileIO.paths import normalize_files
 
 
 def _pixel_pitch(x, y):
@@ -134,241 +133,170 @@ def shuffle_index(num_pixels, seed):
 
 
 class Fold:
-    """One cross-validation fold: a gamma reindexing paired with an NSB one.
+    """One cross-validation fold: a transform of the showers paired with one of the NSB, over the events of one condition.
 
-    ``gamma_index`` / ``nsb_index`` are int ``(P,)`` vectors (see the transform
-    builders above). ``name`` labels the fold in the statistics output. ``config``
-    is a small human-readable dict describing how the fold was built (gamma
-    degrees, NSB kind + param, seed); it is stored per fold in the statistics
-    HDF5 so the file is self-describing and reproducible.
+    ``shower_index`` / ``nsb_index`` are int ``(P,)`` vectors (see the transform builders above). The shower transform is applied to
+    EVERY shower type that is read (gammas, protons, muons): turning a shower is physical, and a leakage seen on a gamma must be
+    looked for on the others too. ``name`` labels the fold in the statistics output. ``config`` is a small human-readable dict
+    describing how the fold was built (shower degrees, NSB kind + param, seed); it is stored per fold in the statistics HDF5.
 
-    ``gamma_files`` / ``nsb_files`` optionally override the SOURCE files this
-    fold reads from (default ``None`` = the chain's own files). This is what
-    makes a fold able to express a real dataset swap -- e.g. a different NSB
-    condition (low/medium/... simulated separately, not a permutation of the
-    same data) -- rather than only a pixel reindex of one fixed dataset. See
-    :func:`make_condition_folds`.
-
-    ``max_gamma_events`` / ``max_nsb_events`` are this fold's OWN event budget
-    (``None`` = no fold-specific cap; falls back to whatever the caller passes
-    ``compute_statistics`` directly). ``make_rotation_folds`` and
-    ``make_condition_folds`` both REQUIRE every spec to set these explicitly --
-    see their docstrings -- so a script can give one fold (e.g. the one it
-    cares about most) a bigger budget than its siblings without that being
-    hidden behind an implicit "total / n_folds" split. Folds that share a read
-    pass in ``compute_statistics`` (same source files) still stream together;
-    the shared read runs as long as the LARGEST budget among them requires,
-    and each fold simply stops accumulating once its own smaller budget is
-    met -- no separate pass needed just because budgets differ.
+    ``sources`` is the :class:`~triggerkit.data.simulation.Simulation` the fold reads (default ``None`` = the chain's own files) and
+    ``events`` is ``{type: events asked for}`` (``None`` = all of them): only the types listed are read. A fold with a budget reads the
+    first events of its files; folds that share a source (same files per type) are streamed once together, the shared read running as
+    long as the LARGEST budget needs and each fold stopping when its own budget is met.
     """
 
-    def __init__(self, name, gamma_index, nsb_index, config=None,
-                 gamma_time_shift=0, nsb_time_shift=0,
-                 gamma_files=None, nsb_files=None,
-                 max_gamma_events=None, max_nsb_events=None):
+    def __init__(self, name, shower_index, nsb_index, config=None,
+                 shower_time_shift=0, nsb_time_shift=0, sources=None, events=None, condition=None):
         self.name = str(name)
-        self.gamma_index = np.asarray(gamma_index, dtype=np.int64)
+        self.shower_index = np.asarray(shower_index, dtype=np.int64)
         self.nsb_index = np.asarray(nsb_index, dtype=np.int64)
         self.config = dict(config or {})
-        # Circular roll of the waveform along the time-sample axis (samples).
-        # Applied waveform-only, per class; 0 = no temporal shift.
-        self.gamma_time_shift = int(gamma_time_shift)
+        # Edge-hold shift of the waveform along the time-sample axis (samples), waveform only; 0 = none.
+        self.shower_time_shift = int(shower_time_shift)
         self.nsb_time_shift = int(nsb_time_shift)
-        # Per-fold data-source override (None = use the chain's own files).
-        self.gamma_files = gamma_files
-        self.nsb_files = nsb_files
-        # Per-fold event budget (None = no fold-specific cap).
-        self.max_gamma_events = None if max_gamma_events is None else int(max_gamma_events)
-        self.max_nsb_events = None if max_nsb_events is None else int(max_nsb_events)
-        if self.gamma_index.shape != self.nsb_index.shape:
+        self.sources = sources
+        self.events = None if events is None else _normalize_events(events, self.name)
+        self.condition = condition if condition is not None else self.config.get("condition")
+        if self.shower_index.shape != self.nsb_index.shape:
             raise ValueError(
-                f"fold {name!r}: gamma_index {self.gamma_index.shape} and "
+                f"fold {name!r}: shower_index {self.shower_index.shape} and "
                 f"nsb_index {self.nsb_index.shape} must have the same length.")
 
     def __repr__(self):
-        return (f"Fold(name={self.name!r}, P={self.gamma_index.size}, "
-                f"gamma_time_shift={self.gamma_time_shift}, "
-                f"nsb_time_shift={self.nsb_time_shift}, "
-                f"gamma_files={'override' if self.gamma_files else 'chain'}, "
-                f"nsb_files={'override' if self.nsb_files else 'chain'}, "
-                f"max_gamma_events={self.max_gamma_events}, "
-                f"max_nsb_events={self.max_nsb_events})")
+        return (f"Fold(name={self.name!r}, P={self.shower_index.size}, shower_time_shift={self.shower_time_shift}, "
+                f"nsb_time_shift={self.nsb_time_shift}, sources={'override' if self.sources is not None else 'chain'}, "
+                f"events={self.events})")
+
+
+def _normalize_events(events, where):
+    """``{type: cap or None}`` with the types checked against the known event types and the caps against 1."""
+    from triggerkit.data.simulation import PARTICLES
+
+    if not isinstance(events, dict) or not events:
+        raise ValueError(f"{where}: events must be a non-empty {{type: events asked for}} dict, got {events!r}")
+    out = {}
+    for particle, cap in events.items():
+        if particle not in PARTICLES:
+            raise ValueError(f"{where}: unknown event type {particle!r} in events (one of {tuple(PARTICLES)})")
+        if cap is not None and int(cap) < 1:
+            raise ValueError(f"{where}: events[{particle!r}] must be >= 1 or None (all), got {cap}")
+        out[particle] = None if cap is None else int(cap)
+    return out
+
+
+def _check_sources(sources, events, where):
+    """A fold reads only what its Simulation has: every type of ``events`` must be a source."""
+    from triggerkit.data.simulation import Simulation
+
+    if not isinstance(sources, Simulation):
+        raise TypeError(f"{where}: the files of a condition are a triggerkit.data.Simulation(gamma=..., nsb=..., ...), not "
+                        f"{type(sources).__name__} (the (gamma_files, nsb_files) pair of the old API).")
+    missing = [p for p in events if p not in sources]
+    if missing:
+        raise ValueError(f"{where}: events asks for {missing} but the Simulation of this condition has no such source "
+                         f"(it has {sorted(sources.sources)}).")
 
 
 def make_condition_folds(geometry, conditions):
-    """Build one no-reindex :class:`Fold` per named data-source condition.
+    """Build one no-reindex :class:`Fold` per named condition (a REAL, independently simulated dataset).
 
-    Unlike :func:`make_rotation_folds` (a synthetic pixel permutation of ONE
-    fixed dataset, used to detect leakage), each fold here swaps in a REAL,
-    independently-simulated dataset -- e.g. a different NSB brightness level
-    (low/medium/high) that was simulated separately, with its OWN gamma files
-    too (a lower/higher NSB regime is re-simulated for gammas as well, not just
-    for the bias-curve file). ``gamma_index``/``nsb_index`` stay identity (no
-    pixel reindex); only the source files change.
+    Unlike :func:`make_rotation_folds` (a synthetic pixel permutation of ONE fixed dataset, used to detect leakage), each fold here
+    swaps in a different set of files -- e.g. another NSB brightness (low/medium/high) simulated separately, with its own gamma files
+    too. ``conditions`` is ``{name: (Simulation, events)}`` with ``events = {type: events asked for}`` (``None`` = all), every
+    condition setting its OWN budget explicitly::
 
-    ``conditions`` is a ``{name: (gamma_files, nsb_files, gamma_events,
-    nsb_events)}`` mapping -- every condition sets its OWN event budget
-    explicitly (no implicit "total / n_conditions" split), e.g.::
+        {"medium": (Simulation(gamma=..., nsb=...), {"gamma": 1_000_000, "nsb": 400_000}),
+         "low":    (Simulation(gamma=..., nsb=...), {"gamma": 1_000_000, "nsb": 400_000, "proton": None})}
 
-        {n: (*dataset_config.get_condition(n), 1_000_000, 400_000)
-         for n in dataset_config.CONDITIONS}
-
-    Add a condition to ``dataset_config.CONDITIONS`` (e.g. "high",
-    "real_data") and it flows through here unchanged.
-
-    Every resulting fold lands in the SAME statistics HDF5 as any other fold
-    (rotation or condition) passed to ``compute_statistics(folds=...)`` -- one
-    file, one ``fold`` column, one ``/folds`` summary group -- so
-    ``StatPlotter(fold=<condition name>)`` (or a per-plot ``fold=`` override)
-    selects a condition exactly like it selects a rotation fold.
+    Every fold lands in the SAME statistics file as any other fold passed to ``compute_statistics(folds=...)``.
     """
     P = int(geometry.n_pixels)
     identity = identity_index(P)
     folds = []
-    for name, spec in conditions.items():
-        gamma_files, nsb_files, gamma_events, nsb_events = spec
-        if not normalize_files(gamma_files) or not normalize_files(nsb_files):
-            raise ValueError(
-                f"condition {name!r} has no gamma or no NSB file (check the paths / glob that build it).")
-        folds.append(Fold(
-            name, gamma_index=identity, nsb_index=identity,
-            config={"condition": name},
-            gamma_files=normalize_files(gamma_files, name=f"condition {name!r} gamma files"),
-            nsb_files=normalize_files(nsb_files, name=f"condition {name!r} nsb files"),
-            max_gamma_events=gamma_events, max_nsb_events=nsb_events,
-        ))
+    for name, (sources, events) in conditions.items():
+        events = _normalize_events(events, f"condition {name!r}")
+        _check_sources(sources, events, f"condition {name!r}")
+        folds.append(Fold(name, shower_index=identity, nsb_index=identity, config={"condition": name}, sources=sources, events=events))
     return folds
 
 
 #: Keys accepted by a dict-form fold spec, with their defaults.
 FOLD_SPEC_KEYS = {
     "name": None,                # optional explicit fold name (auto-derived if None)
-    "gamma_deg": 0,              # camera rotation applied to gamma rows (degrees)
-    "gamma_time_shift": 0,       # edge-hold time shift of the gamma waveform, in samples
+    "shower_deg": 0,             # camera rotation applied to the showers (gammas, protons, muons), in degrees
+    "shower_time_shift": 0,      # edge-hold time shift of the shower waveforms, in samples
     "nsb_kind": "original",      # pixel transform for NSB: original / rolled / shuffle
     "nsb_param": None,           # roll shift or shuffle seed (kind-dependent)
     "nsb_time_shift": 0,         # edge-hold time shift of the NSB waveform, in samples
 }
 
 #: Keys every dict-form fold spec MUST set itself -- no default, deliberately.
-#: - gamma_events/nsb_events: this fold's own event budget, e.g. give
-#:   "rot0_original" a bigger budget than its siblings for more precise stats
-#:   on the fold you care about most, instead of an implicit total-events /
-#:   n_folds split.
-#: - conditions: a non-empty list of condition names (keys of the
-#:   condition_files mapping passed to make_rotation_folds) this fold should
-#:   be instantiated under -- ONE Fold per listed condition, each reading
-#:   that condition's own gamma/NSB files, each paying this row's
-#:   gamma_events/nsb_events budget separately (list 2 conditions for one row
-#:   and its budget is paid twice, not split). Most rows list just the
-#:   reference condition; give a specific row more conditions to test it
-#:   across NSB levels without doing that for every fold.
-_REQUIRED_SPEC_KEYS = ("gamma_events", "nsb_events", "conditions")
+#: - events: this fold's own budget, ``{type: events asked for}`` (``None`` = all); only these types are read.
+#:   E.g. give "rot0_original" a bigger budget than its siblings for more precise stats on the fold you care about most.
+#: - conditions: a non-empty list of condition names (keys of the ``conditions`` mapping passed to make_rotation_folds) this fold
+#:   is instantiated under -- ONE Fold per listed condition, each reading that condition's own files and paying this row's budget
+#:   separately.
+_REQUIRED_SPEC_KEYS = ("events", "conditions")
 
 
 def _normalize_spec(spec, i):
-    """Return ``(gamma_deg, gamma_time_shift, kind, param, nsb_time_shift,
-    name, gamma_events, nsb_events, conditions)``.
-
-    Dict form only (self-documenting; see make_rotation_folds). The legacy
-    positional ``(gamma_aug, nsb_aug)`` tuple form predates per-fold event
-    budgets and isn't extended to support them -- convert those rows to the
-    dict form instead.
-    """
+    """Return ``(shower_deg, shower_time_shift, kind, param, nsb_time_shift, name, events, conditions)`` of a dict-form spec."""
     if not isinstance(spec, dict):
-        raise ValueError(
-            f"fold spec #{i}: the legacy (gamma_aug, nsb_aug) tuple form is no "
-            "longer accepted (it predates per-fold gamma_events/nsb_events, "
-            "which every fold must now set explicitly) -- use the dict form.")
-
+        raise ValueError(f"fold spec #{i}: a spec is a dict (see make_rotation_folds), got {type(spec).__name__}.")
     missing = [k for k in _REQUIRED_SPEC_KEYS if k not in spec]
     if missing:
-        raise ValueError(
-            f"fold spec #{i}: missing required key(s) {missing} -- every fold "
-            "spec must set its own gamma_events/nsb_events/conditions "
-            "explicitly (no implicit total-events / n_folds split, no "
-            "implicit condition).")
-
+        raise ValueError(f"fold spec #{i}: missing required key(s) {missing} -- every fold spec must set its own events budget and "
+                         "its conditions explicitly (no implicit split, no implicit condition).")
     allowed = set(FOLD_SPEC_KEYS) | set(_REQUIRED_SPEC_KEYS)
     unknown = set(spec) - allowed
     if unknown:
-        raise ValueError(
-            f"fold spec #{i}: unknown key(s) {sorted(unknown)}; "
-            f"allowed keys are {sorted(allowed)}.")
+        raise ValueError(f"fold spec #{i}: unknown key(s) {sorted(unknown)}; allowed keys are {sorted(allowed)}.")
     g = dict(FOLD_SPEC_KEYS, **spec)
-    # gamma_events/nsb_events must be PRESENT (checked above) but their value
-    # may explicitly be None -- "this fold is uncapped, use every available
-    # event" is a legitimate, deliberate choice, not a forgotten budget.
-    gamma_events = None if g["gamma_events"] is None else int(g["gamma_events"])
-    nsb_events = None if g["nsb_events"] is None else int(g["nsb_events"])
+    events = _normalize_events(g["events"], f"fold spec #{i}")
     conditions = g["conditions"]
     if not isinstance(conditions, (list, tuple)) or not conditions:
-        raise ValueError(
-            f"fold spec #{i}: 'conditions' must be a non-empty list of "
-            f"condition names, got {conditions!r}.")
-    conditions = list(conditions)
-    return (g["gamma_deg"], int(g["gamma_time_shift"]), g["nsb_kind"],
-            g["nsb_param"], int(g["nsb_time_shift"]), g["name"],
-            gamma_events, nsb_events, conditions)
+        raise ValueError(f"fold spec #{i}: 'conditions' must be a non-empty list of condition names, got {conditions!r}.")
+    return (g["shower_deg"], int(g["shower_time_shift"]), g["nsb_kind"], g["nsb_param"], int(g["nsb_time_shift"]), g["name"],
+            events, list(conditions))
 
 
-def make_rotation_folds(geometry, specs, condition_files, *, seed=1337, tol_frac=0.1):
+def make_rotation_folds(geometry, specs, conditions, *, seed=1337, tol_frac=0.1):
     """Build a list of :class:`Fold` from compact fold specs.
 
-    ``condition_files`` is a REQUIRED ``{condition_name: (gamma_files,
-    nsb_files)}`` mapping, e.g. built from ``dataset_config.CONDITIONS`` via
-    ``{n: dataset_config.get_condition(n) for n in dataset_config.CONDITIONS}``.
-    It resolves the names each spec's ``conditions`` list references.
+    ``conditions`` is a REQUIRED ``{condition_name: Simulation}`` mapping: the files of every event type of each condition. It resolves
+    the names each spec's ``conditions`` list references.
 
-    Each spec row is a flat dict; every key is optional EXCEPT
-    ``gamma_events``/``nsb_events``/``conditions``, which every row must set
-    explicitly:
+    Each spec row is a flat dict; every key is optional EXCEPT ``events`` and ``conditions``:
 
-    * ``gamma_events``/``nsb_events`` -- this fold's own event budget (no
-      implicit total-events / n_folds split, so e.g. the one fold you care
-      most about can get a bigger budget than its siblings).
-    * ``conditions`` -- a non-empty list of condition names (keys of
-      ``condition_files``) this ONE spec should be instantiated under. Most
-      rows list just the reference condition (e.g. ``["medium"]``); list more
-      than one to run that specific fold against several NSB conditions --
-      each listed condition becomes its OWN :class:`Fold` (named
-      ``"<base_name>_<condition>"``, reading that condition's own files), and
-      pays this row's gamma_events/nsb_events budget separately (2 conditions
-      on one row = that row's budget paid twice, not split).
+    * ``events`` -- this fold's own budget, ``{type: events asked for}`` with ``None`` for all of them, e.g.
+      ``{"gamma": 200_000, "nsb": 100_000, "proton": 50_000}``. Only the types listed are read, and each must be a source of the
+      condition's Simulation.
+    * ``conditions`` -- a non-empty list of condition names this ONE spec is instantiated under: each becomes its OWN :class:`Fold`
+      (named ``"<base_name>_<condition>"``, reading that condition's own files) and pays this row's budget separately.
 
-    The other key names are exactly those stored in the per-fold ``config`` of
-    the statistics HDF5, so the spec and the output file read the same::
+    The other key names are exactly those stored in the per-fold ``config`` of the statistics file, so the spec and the output read
+    the same::
 
         make_rotation_folds(chain.geom, [
-            {"gamma_events": 100_000, "nsb_events": 40_000,
-             "conditions": ["low", "medium"]},                    # reference fold, both conditions
-            {"gamma_events": 100_000, "nsb_events": 40_000,
-             "conditions": ["medium"], "gamma_deg": 120},          # just the reference condition
-            {"gamma_events": 100_000, "nsb_events": 40_000,
-             "conditions": ["medium"],
-             "nsb_kind": "shuffle", "nsb_param": 2024},            # reshuffle NSB pixels
-            {"gamma_events": 500_000, "nsb_events": 40_000,
-             "conditions": ["medium"],
-             "gamma_time_shift": 5, "nsb_time_shift": 5},          # this one gets more stats
-            {"gamma_events": 100_000, "nsb_events": 40_000,
-             "conditions": ["medium"],
-             "nsb_time_shift": 5, "name": "nsb_only_troll5"},      # roll NSB only
-        ], condition_files={"low": (...), "medium": (...)})
+            {"events": {"gamma": 100_000, "nsb": 40_000}, "conditions": ["low", "medium"]},            # reference fold
+            {"events": {"gamma": 100_000, "nsb": 40_000, "proton": 20_000},
+             "conditions": ["medium"], "shower_deg": 120},                                        # camera turned by 120 deg
+            {"events": {"gamma": 100_000, "nsb": 40_000}, "conditions": ["medium"],
+             "nsb_kind": "shuffle", "nsb_param": 2024},                                           # reshuffle the NSB pixels
+            {"events": {"gamma": 500_000, "nsb": 40_000}, "conditions": ["medium"],
+             "shower_time_shift": 5, "nsb_time_shift": 5},                                        # this one gets more stats
+        ], conditions={"low": Simulation(...), "medium": Simulation(...)})
 
-    Keys and defaults: ``name`` (auto), ``gamma_deg`` (0),
-    ``gamma_time_shift`` (0), ``nsb_kind`` ("original"), ``nsb_param`` (None),
-    ``nsb_time_shift`` (0); ``gamma_events``/``nsb_events``/``conditions`` have
-    NO default and are required. An unknown or missing key raises, so typos
-    (and a forgotten budget or condition) surface immediately.
+    Keys and defaults: ``name`` (auto), ``shower_deg`` (0), ``shower_time_shift`` (0), ``nsb_kind`` ("original"), ``nsb_param`` (None),
+    ``nsb_time_shift`` (0). An unknown or missing key raises, so typos (and a forgotten budget or condition) surface immediately.
     """
     P = int(geometry.n_pixels)
     folds = []
     used_names = {}
     for i, spec in enumerate(specs):
-        (gamma_deg, gamma_time_shift, kind, param,
-         nsb_time_shift, explicit_name, gamma_events, nsb_events,
-         conditions) = _normalize_spec(spec, i)
-        gamma_idx = rotation_index(geometry, gamma_deg, tol_frac=tol_frac)
+        (shower_deg, shower_time_shift, kind, param, nsb_time_shift, explicit_name, events, spec_conditions) = _normalize_spec(spec, i)
+        shower_idx = rotation_index(geometry, shower_deg, tol_frac=tol_frac)
         if kind == "original":
             nsb_idx = identity_index(P)
             nsb_param = None
@@ -380,38 +308,24 @@ def make_rotation_folds(geometry, specs, condition_files, *, seed=1337, tol_frac
             nsb_idx = shuffle_index(P, nsb_param)
         else:
             raise ValueError(f"unknown nsb_kind {kind!r}; use original/rolled/shuffle.")
-        base_config = {
-            "gamma_deg": gamma_deg,
-            "nsb_kind": kind,
-            "nsb_param": nsb_param,
-            "gamma_time_shift": gamma_time_shift,
-            "nsb_time_shift": nsb_time_shift,
-            "seed": seed,
-        }
-        # Base name is rot<deg>_<kind>; append the param when set, a
-        # _troll<k> suffix for a temporal roll.
-        base_name = explicit_name or f"rot{gamma_deg}_{kind}"
+        base_config = {"shower_deg": shower_deg, "nsb_kind": kind, "nsb_param": nsb_param,
+                       "shower_time_shift": shower_time_shift, "nsb_time_shift": nsb_time_shift, "seed": seed}
+        # Base name is rot<deg>_<kind>; append the param when set, a _troll<k> suffix for a temporal roll.
+        base_name = explicit_name or f"rot{shower_deg}_{kind}"
         if explicit_name is None:
             if nsb_param is not None:
                 base_name = f"{base_name}{nsb_param}"
-            if gamma_time_shift:
-                base_name = f"{base_name}_troll{gamma_time_shift}"
+            if shower_time_shift:
+                base_name = f"{base_name}_troll{shower_time_shift}"
             if nsb_time_shift:
                 base_name = f"{base_name}_ntroll{nsb_time_shift}"
 
-        for cond in conditions:
-            if cond not in condition_files:
-                raise ValueError(
-                    f"fold spec #{i}: condition {cond!r} not found in "
-                    f"condition_files (available: {sorted(condition_files)}).")
-            gamma_files, nsb_files = condition_files[cond]
-            if not normalize_files(gamma_files) or not normalize_files(nsb_files):
-                raise ValueError(
-                    f"fold spec #{i}: condition {cond!r} has no gamma or no NSB file "
-                    "(check the paths / glob that build it).")
-
-            # Fold name must be unique (it keys the /folds table and
-            # StatPlotter's fold lookup); a _<n> suffix only if it still
+        for cond in spec_conditions:
+            if cond not in conditions:
+                raise ValueError(f"fold spec #{i}: condition {cond!r} not found in conditions (available: {sorted(conditions)}).")
+            sources = conditions[cond]
+            _check_sources(sources, events, f"fold spec #{i}, condition {cond!r}")
+            # Fold name must be unique (it keys the /folds table and StatPlotter's fold lookup); a _<n> suffix only if it still
             # collides (e.g. two identical rows naming the same condition).
             name = f"{base_name}_{cond}"
             if name in used_names:
@@ -419,16 +333,8 @@ def make_rotation_folds(geometry, specs, condition_files, *, seed=1337, tol_frac
                 name = f"{name}_{used_names[name]}"
             else:
                 used_names[name] = 0
-
             config = dict(base_config)
             config["condition"] = cond
-            folds.append(Fold(
-                name, gamma_idx, nsb_idx, config=config,
-                gamma_time_shift=gamma_time_shift,
-                nsb_time_shift=nsb_time_shift,
-                max_gamma_events=gamma_events,
-                max_nsb_events=nsb_events,
-                gamma_files=normalize_files(gamma_files, name=f"condition {cond!r} gamma files"),
-                nsb_files=normalize_files(nsb_files, name=f"condition {cond!r} nsb files"),
-            ))
+            folds.append(Fold(name, shower_idx, nsb_idx, config=config, shower_time_shift=shower_time_shift,
+                              nsb_time_shift=nsb_time_shift, sources=sources, events=dict(events)))
     return folds

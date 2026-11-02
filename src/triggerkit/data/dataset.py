@@ -42,7 +42,9 @@ import warnings
 import numpy as np
 import tensorflow as tf
 
+from triggerkit.alignment import plan_sources
 from triggerkit.camera import sst1m
+from triggerkit.data.simulation import PARTICLES, Simulation, Watch
 from triggerkit.FileIO.paths import normalize_files
 from triggerkit.FileIO.FileOpenerCTAO import (
     AsyncFileOpenerProcess,
@@ -70,7 +72,25 @@ class TriggerDataset:
     ----------
     gamma_files, nsb_files : sequence of str
         Input files. Gammas are label 1, NSB label 0. A single NSB file is fine
-        (it gets roll-augmented).
+        (it gets roll-augmented). ``gamma_files`` can also be a :class:`~triggerkit.data.simulation.Simulation`
+        (then ``nsb_files`` is left out): its ``gamma`` and ``nsb`` sources are the training data, its ``proton`` /
+        ``muon`` sources can be evaluated through ``watch``.
+    train_on : tuple of str
+        The sources the training reads: ``"gamma"`` and ``"nsb"`` always, plus ``"proton"`` and / or ``"muon"``. The binary label stays
+        gamma = 1 against everything else = 0; protons and muons are extra NEGATIVES, with ``features["particle"]`` (their code) and
+        ``features["particle_weight"]`` (their ``negative_weights``, 1 for gammas and NSB) so the loss can count them less, or not at all. Their
+        files are split between training and validation like the gamma files (``percent_validation`` / ``n_folds``).
+    negative_weights : dict {particle: weight} or None
+        Weight of the events of the extra types as negatives (default 1). With ``npe_weighting`` it multiplies their negative weight in
+        ``features["npe_channels"]``; without it, use ``features["particle_weight"]`` as the sample weight.
+    max_extra_samples_train, max_extra_samples_val : int or None
+        Cap on the events read per extra type.
+    watch : sequence of str or Watch, or None
+        Sources evaluated, not learned from (``"proton"``, ``"muon"``, or ``"gamma"``): :meth:`watch_datasets` gives one
+        ``tf.data`` per entry, read like the validation gammas (not shuffled, no NSB), every batch carrying ``features["particle"]``.
+    watch_max : int or None
+        Cap on the events READ per watched source (``None``: all). A capped source is only a sample of the written events: a
+        statistic that divides by the simulated total has to scale it by the same fraction (the statistics step does).
     batch_size : int
     tel_id_only : int or None
         Keep only this telescope id for gammas.
@@ -103,6 +123,16 @@ class TriggerDataset:
         count as a positive for that board.
     npe_weighting : NpeWeighting or None
         Adds ``features["npe_channels"]`` (see above). ``None``: nothing is added.
+    window : Window, Fixed, Full or None
+        The samples every event is given (see :mod:`triggerkit.alignment`): ``Fixed(start, length)`` / ``Full()`` for the same samples
+        everywhere, or ``Window(length, offset)``, ``length`` samples starting ``offset`` samples before a trigger. A ``Window`` needs
+        every source to be aligned: ``align='given'`` (``NsbSet(..., at=22)``: cut around that sample, nothing computed) or
+        ``align='on_the_fly'`` (the default of the sources with ``align_with``). The waveforms of the batches then have the window's
+        length, and ``features["t_trig"]`` / ``features["window_start"]`` say where.
+    align_with, observe, trig_time
+        The upstream chain that aligns on the fly (a compiled ``TriggerChain`` built for the samples it ``observe`` s, e.g.
+        ``Fixed(16, 50)``), and how its trigger time is read. The events it does not fire on are dropped, in both splits, at every epoch
+        (like ``gated_by``); a NSB that says it was made by a trigger (``made_by``) is checked against it.
     gamma_rotations : tuple of int
         Reserved for hex rotation augmentation. Non-``(0,)`` warns and is ignored.
     seed : int
@@ -111,8 +141,14 @@ class TriggerDataset:
     def __init__(
         self,
         gamma_files,
-        nsb_files,
+        nsb_files=None,
         *,
+        train_on=("gamma", "nsb"),
+        negative_weights=None,
+        max_extra_samples_train=None,
+        max_extra_samples_val=None,
+        watch=None,
+        watch_max=None,
         batch_size=4096,
         tel_id_only=2,
         n_pe_min_train=None,
@@ -133,13 +169,70 @@ class TriggerDataset:
         split=None,
         board_n_pe_min=10.0,
         npe_weighting=None,
+        window=None,
+        align_with=None,
+        observe=None,
+        trig_time="rising",
         gamma_rotations=(0,),
         event_feature_keys=DEFAULT_EVENT_FEATURE_KEYS,
         opener_cls=AsyncFileOpenerProcess,
         seed=1337,
     ):
+        if isinstance(gamma_files, Simulation):
+            if nsb_files is not None:
+                raise ValueError("TriggerDataset(sim): the NSB files are the Simulation's, do not pass nsb_files too.")
+            self.simulation = gamma_files
+            for particle in ("gamma", "nsb"):
+                if particle not in self.simulation:
+                    raise ValueError(f"the Simulation has no {particle!r} source: it is needed to train.")
+            gamma_files, nsb_files = self.simulation.files("gamma"), self.simulation.files("nsb")
+        else:
+            if nsb_files is None:
+                raise TypeError("TriggerDataset(gamma_files, nsb_files): nsb_files is missing (or give one Simulation).")
+            self.simulation = Simulation.from_lists(gamma_files, nsb_files)
         self.gamma_files = normalize_files(gamma_files, name="gamma_files")
         self.nsb_files = normalize_files(nsb_files, name="nsb_files")
+
+        train_on = tuple(train_on)
+        if not {"gamma", "nsb"} <= set(train_on) or set(train_on) - set(PARTICLES) or len(set(train_on)) != len(train_on):
+            raise ValueError(f"train_on={train_on!r}: it must hold 'gamma' and 'nsb' (once each), plus 'proton' and / or 'muon'.")
+        self.train_on = train_on
+        self.extra_types = [p for p in ("proton", "muon") if p in train_on]
+        for p in self.extra_types:
+            if p not in self.simulation:
+                raise ValueError(f"train_on has {p!r} but the Simulation has no such source.")
+        negative_weights = dict(negative_weights or {})
+        bad = set(negative_weights) - set(self.extra_types)
+        if bad:
+            raise ValueError(f"negative_weights for {sorted(bad)}: only the extra types of train_on {self.extra_types} have one.")
+        for p, w in negative_weights.items():
+            if not float(w) >= 0.0:
+                raise ValueError(f"negative_weights[{p!r}] must be >= 0, got {w}")
+        self.negative_weights = {p: float(negative_weights.get(p, 1.0)) for p in self.extra_types}
+        self.max_extra_samples_train, self.max_extra_samples_val = max_extra_samples_train, max_extra_samples_val
+        self.watch = [Watch(item) if isinstance(item, str) else item for item in (watch or ())]
+        for item in self.watch:
+            if not isinstance(item, Watch):
+                raise TypeError(f"watch entries are a particle name or a Watch, not {type(item).__name__}.")
+            if item.particle not in self.simulation:
+                raise ValueError(f"watch: the Simulation has no {item.particle!r} source.")
+        names = [item.label for item in self.watch]
+        if len(set(names)) != len(names):
+            raise ValueError(f"watch: duplicate names {names}; give a name= to tell them apart.")
+        if watch_max is not None and int(watch_max) <= 0:
+            raise ValueError(f"watch_max must be > 0, got {watch_max}")
+        self.watch_max = None if watch_max is None else int(watch_max)
+
+        self.window, self.align_with, self.observe, self.trig_time = window, align_with, observe, trig_time
+        # how each trained source is brought to the window (None: the batches are the whole datacube)
+        self._plans = plan_sources(self.simulation, ["gamma", "nsb", *self.extra_types], window=window, align_with=align_with,
+                                   observe=observe, trig_time=trig_time)
+        self._watch_plans = {}
+        for item in self.watch:
+            overrides = {item.particle: (item.align, item.window)} if (item.align is not None or item.window is not None) else None
+            self._watch_plans[item.label] = plan_sources(self.simulation, [item.particle], window=window, align_with=align_with,
+                                                        observe=observe, trig_time=trig_time, overrides=overrides) \
+                if (window is not None or overrides) else None
 
         self.batch_size = batch_size
         self.tel_id_only = tel_id_only
@@ -223,25 +316,18 @@ class TriggerDataset:
             )
 
     # ------------------------------------------------------------------ #
-    def split_files(self):
-        """Return ``(train_gamma_files, val_gamma_files)`` for the current fold.
-
-        ``n_folds == 1`` -> tail ``percent_validation`` split (old behaviour).
-        ``n_folds > 1``  -> gamma files chunked into ``n_folds`` contiguous folds;
-        the current ``fold`` is validation, the rest is training. NSB files are
-        shared (not split) and returned by :meth:`train_val_datasets`.
-        """
-        files = self.gamma_files
+    def _split(self, files, what="gamma"):
+        files = list(files)
         if self.n_folds == 1:
             if self.percent_validation <= 0.0:
                 return list(files), []
             n_val = int(len(files) * self.percent_validation)
             if n_val == 0:
                 warnings.warn(
-                    f"percent_validation={self.percent_validation} of {len(files)} gamma "
+                    f"percent_validation={self.percent_validation} of {len(files)} {what} "
                     "file(s) rounds to 0 validation files: there will be NO validation "
                     "split. Pass more files or a larger percent_validation.",
-                    stacklevel=2)
+                    stacklevel=3)
                 return list(files), []
             return files[:-n_val], files[-n_val:]
 
@@ -252,11 +338,23 @@ class TriggerDataset:
         lo, hi = bounds[self.fold], bounds[self.fold + 1]
         if hi <= lo:
             warnings.warn(
-                f"fold {self.fold} of {self.n_folds} is empty ({n} gamma file(s)): "
-                "no validation split.", stacklevel=2)
-        val = files[lo:hi]
-        train = files[:lo] + files[hi:]
-        return train, val
+                f"fold {self.fold} of {self.n_folds} is empty ({n} {what} file(s)): "
+                "no validation split.", stacklevel=3)
+        return files[:lo] + files[hi:], files[lo:hi]
+
+    def split_files(self):
+        """Return ``(train_gamma_files, val_gamma_files)`` for the current fold.
+
+        ``n_folds == 1`` -> tail ``percent_validation`` split (old behaviour).
+        ``n_folds > 1``  -> gamma files chunked into ``n_folds`` contiguous folds;
+        the current ``fold`` is validation, the rest is training. NSB files are
+        shared (not split) and returned by :meth:`train_val_datasets`.
+        """
+        return self._split(self.gamma_files, "gamma")
+
+    def split_extra_files(self):
+        """``{particle: (train_files, val_files)}`` of the extra training types, split like the gamma files."""
+        return {p: self._split(self.simulation.files(p), p) for p in self.extra_types}
 
     # ------------------------------------------------------------------ #
     def _config(self, *, training):
@@ -300,11 +398,14 @@ class TriggerDataset:
             nsb_roll_seed=roll_seed,
             max_gamma_samples_total=max_gamma,
             max_nsb_samples_total=max_nsb,
+            max_samples_by_label=({PARTICLES[p]: (self.max_extra_samples_train if training else self.max_extra_samples_val)
+                                   for p in self.extra_types
+                                   if (self.max_extra_samples_train if training else self.max_extra_samples_val) is not None} or None),
             repeat=False,
             ignore_errors=True,
         )
 
-    def _dataset(self, gamma_files, *, training):
+    def _dataset(self, gamma_files, *, training, extra_files=None):
         """Raw ``tf.data`` of ``(features, label)`` for a gamma-file subset.
 
         ``features`` is the dict emitted by ``SimTelTFDataset`` (waveform,
@@ -316,12 +417,74 @@ class TriggerDataset:
             nsb_files=self.nsb_files,
             opener_cls=self.opener_cls,
             config=self._config(training=training),
+            extra_files={PARTICLES[p]: files for p, files in (extra_files or {}).items() if files},
         ).dataset()
+        if self.extra_types:
+            ds = self._particle_codes(ds)                     # the codes of the reader's labels, before they become binary
         if self.gated_by:
             ds = self._gate(ds)
+        if self._plans is not None:
+            ds = self._align(ds, self._plans)
+        if self.extra_types:
+            ds = self._binary_label(ds)
+        else:
+            ds = self._particle_codes(ds)
         if self.npe_weighting is not None:         # before the board labels replace the event label: the channels come from the gamma flag
             ds = self._npe_channels(ds)
         return self._board_labels(ds) if self.split == "board" else ds
+
+    def _align(self, ds, plans, label_names=None):
+        """Bring the events to the window: cut (or align on the fly) the waveforms, drop what the upstream chain does not fire on, re-batch.
+
+        Adds ``features["t_trig"]`` (the trigger sample, -1 when the source is not aligned) and ``features["window_start"]``.
+        """
+        names = label_names or {PARTICLES[p]: p for p in PARTICLES}
+
+        def apply(wf, ped, label):
+            wf, ped, label = wf.numpy(), ped.numpy(), label.numpy().reshape(-1)
+            keep, parts_wf, parts_ped, trig, start = [], [], [], [], []
+            for code in np.unique(label):
+                rows = np.flatnonzero(label == code)
+                res = plans[names[int(code)]].apply(wf[rows, 0], ped[rows])
+                ok = res["passed"]
+                keep.append(rows[ok]); parts_wf.append(res["wf"]); parts_ped.append(res["ped"])
+                trig.append(res["t_trig"][ok]); start.append(res["start"][ok])
+            order = np.argsort(np.concatenate(keep), kind="stable") if keep else np.zeros(0, dtype=np.int64)
+            cat = lambda parts, empty: np.concatenate(parts)[order] if parts else empty
+            return (np.concatenate(keep)[order].astype(np.int64),
+                    cat(parts_wf, np.zeros((0, wf.shape[2], 0), np.uint16))[:, None],
+                    cat(parts_ped, np.zeros((0, wf.shape[2]), np.int32)),
+                    cat(trig, np.zeros(0, np.int64)).astype(np.int64), cat(start, np.zeros(0, np.int64)).astype(np.int64))
+
+        def align(features, label):
+            keep, wf, ped, trig, start = tf.py_function(apply, [features["waveform"], features["pedestal"], label],
+                                                       [tf.int64, features["waveform"].dtype, features["pedestal"].dtype, tf.int64, tf.int64])
+            keep.set_shape([None]); trig.set_shape([None]); start.set_shape([None])
+            wf.set_shape([None, 1, None, None]); ped.set_shape([None, None])
+            out = {key: tf.gather(value, keep) for key, value in features.items()}
+            out["waveform"], out["pedestal"], out["t_trig"], out["window_start"] = wf, ped, trig, start
+            return out, tf.gather(label, keep)
+
+        return (ds.map(align).unbatch().batch(self.batch_size, drop_remainder=True).prefetch(tf.data.AUTOTUNE))
+
+    def _binary_label(self, ds):
+        """gamma = 1 against everything else = 0, and ``features["particle_weight"]`` (the negative weight of the extra types)."""
+        table = tf.constant([self.negative_weights.get(name, 1.0) for name in PARTICLES], dtype=tf.float32)
+
+        def to_binary(features, label):
+            weight = tf.gather(table, features["particle"])
+            weight = tf.where(label == 1, 1.0, weight)               # a gamma is never down-weighted
+            return {**features, "particle_weight": weight}, tf.cast(tf.equal(label, 1), label.dtype)
+
+        return ds.map(to_binary, num_parallel_calls=tf.data.AUTOTUNE)
+
+    @staticmethod
+    def _particle_codes(ds):
+        """Add ``features["particle"]``, the event type code (``PARTICLES``): the label of the gamma / NSB stream (1 / 0)."""
+        def add_particle(features, label):
+            return {**features, "particle": tf.cast(tf.reshape(label, (-1,)), tf.int32)}, label
+
+        return ds.map(add_particle, num_parallel_calls=tf.data.AUTOTUNE)
 
     def board_n_pe(self, true_image):
         """``(B, 3)`` true p.e. on each board's own patches, from a ``(B, 432)`` true image."""
@@ -349,6 +512,10 @@ class TriggerDataset:
                 channels = self.npe_weighting.channels(tf.tile(tf.reshape(label, (-1, 1)), (1, n_pe.shape[1])), n_pe)
             else:
                 channels = self.npe_weighting.channels(label, features["n_pe"])
+            if "particle_weight" in features:                 # protons / muons as negatives count as much as they are told to
+                weight = features["particle_weight"]
+                weight = weight[:, None] if self.split == "board" else weight
+                channels = tf.concat([channels[..., :2], (channels[..., 2] * weight)[..., None], channels[..., 3:]], axis=-1)
             return {**features, "npe_channels": channels}, label
 
         return ds.map(add_channels, num_parallel_calls=tf.data.AUTOTUNE)
@@ -389,12 +556,60 @@ class TriggerDataset:
                 .prefetch(tf.data.AUTOTUNE))
 
     # ------------------------------------------------------------------ #
+    def watch_datasets(self):
+        """``{name: tf.data}`` of the watched sources: ``(features, label)`` batches, ``features["particle"]`` = the type code.
+
+        Read like the validation gammas (the validation n_pe window and telescope, no shuffling, no NSB, no roll); the label is the
+        reader's (1) and means nothing here, use ``particle``. Not gated, not weighted: they are not learned from.
+        """
+        out = {}
+        for item in self.watch:
+            source = self.simulation[item.particle]
+            config = self._config(training=False)
+            config.max_gamma_samples_total = self.watch_max
+            ds = SimTelTFDataset(gamma_files=source.files, nsb_files=[], opener_cls=self.opener_cls, config=config).dataset()
+            code = PARTICLES[item.particle]
+
+            def to_particle(features, label, code=code):
+                return {**features, "particle": tf.fill(tf.shape(tf.reshape(label, (-1,))), code)}, label
+
+            ds = ds.map(to_particle, num_parallel_calls=tf.data.AUTOTUNE)
+            plans = self._watch_plans.get(item.label)
+            if plans is not None:
+                ds = self._align_watch(ds, plans[item.particle])
+            out[item.label] = ds
+        return out
+
+    def _align_watch(self, ds, plan):
+        """A watched source brought to its window: cut / aligned like the training sources, the batches keep the events that pass."""
+        def apply(wf, ped):
+            res = plan.apply(wf.numpy()[:, 0], ped.numpy())
+            ok = res["passed"]
+            return (np.flatnonzero(ok).astype(np.int64), res["wf"][:, None], res["ped"], res["t_trig"][ok], res["start"][ok])
+
+        def align(features, label):
+            keep, wf, ped, trig, start = tf.py_function(apply, [features["waveform"], features["pedestal"]],
+                                                       [tf.int64, features["waveform"].dtype, features["pedestal"].dtype, tf.int64, tf.int64])
+            keep.set_shape([None]); trig.set_shape([None]); start.set_shape([None])
+            wf.set_shape([None, 1, None, None]); ped.set_shape([None, None])
+            out = {key: tf.gather(value, keep) for key, value in features.items()}
+            out["waveform"], out["pedestal"], out["t_trig"], out["window_start"] = wf, ped, trig, start
+            return out, tf.gather(label, keep)
+
+        return ds.map(align)
+
+    def n_simulated(self, particle):
+        """Showers simulated for a type of the Simulation (the denominator of "triggered / simulated")."""
+        return self.simulation.simulated(particle)
+
+    # ------------------------------------------------------------------ #
     def train_val_datasets(self):
         """Return ``(train_ds, val_ds)`` raw ``tf.data`` pipelines.
 
         ``val_ds`` is ``None`` when the split yields no validation files.
         """
         train_files, val_files = self.split_files()
-        train_ds = self._dataset(train_files, training=True)
-        val_ds = self._dataset(val_files, training=False) if val_files else None
+        extra = self.split_extra_files()
+        train_ds = self._dataset(train_files, training=True, extra_files={p: tr for p, (tr, _) in extra.items()})
+        val_ds = self._dataset(val_files, training=False, extra_files={p: va for p, (_, va) in extra.items()}) if val_files else None
         return train_ds, val_ds

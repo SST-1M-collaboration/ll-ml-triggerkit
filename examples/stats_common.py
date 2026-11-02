@@ -29,8 +29,8 @@ QUICK_THRESHOLD_EVENTS = 2_000
 
 # The folds of stats_tdscan.py and stats_patch7.py, kept identical so the two
 # runs compare fold by fold. Row 0 is the untouched reference fold. Keys:
-#   gamma_deg        camera rotation of the gamma events, multiple of 120 (exact symmetry)
-#   gamma_time_shift edge-hold time shift of the gamma waveforms, in samples (NOT circular)
+#   shower_deg        camera rotation of the gamma events, multiple of 120 (exact symmetry)
+#   shower_time_shift edge-hold time shift of the gamma waveforms, in samples (NOT circular)
 #   nsb_kind         "original" / "rolled" / "shuffle" (NSB pixel reindexing)
 #   nsb_param        roll shift or shuffle seed
 #   nsb_time_shift   edge-hold time shift of the NSB waveforms, in samples
@@ -40,23 +40,23 @@ QUICK_THRESHOLD_EVENTS = 2_000
 STANDARD_FOLDS = [
     {},                                                       # reference fold
     # --- rotation symmetry ---------------------------------------------------
-    {"gamma_deg": 120},
-    {"gamma_deg": 240},
+    {"shower_deg": 120},
+    {"shower_deg": 240},
     # --- NSB pixel transforms ------------------------------------------------
     {"nsb_kind": "rolled",  "nsb_param": 1},
     {"nsb_kind": "rolled",  "nsb_param": 42},
     {"nsb_kind": "shuffle", "nsb_param": 2024},
     # --- mixes ---------------------------------------------------------------
-    {"gamma_deg": 120, "nsb_kind": "rolled",  "nsb_param": 1},
-    {"gamma_deg": 240, "nsb_kind": "rolled",  "nsb_param": 1},
-    {"gamma_deg": 120, "nsb_kind": "shuffle", "nsb_param": 2024},
-    {"gamma_deg": 240, "nsb_kind": "shuffle", "nsb_param": 2024},
+    {"shower_deg": 120, "nsb_kind": "rolled",  "nsb_param": 1},
+    {"shower_deg": 240, "nsb_kind": "rolled",  "nsb_param": 1},
+    {"shower_deg": 120, "nsb_kind": "shuffle", "nsb_param": 2024},
+    {"shower_deg": 240, "nsb_kind": "shuffle", "nsb_param": 2024},
     # --- temporal position: gammas only (unfair: tau stays tuned on unrolled NSB)
-    {"gamma_time_shift": 2},
-    {"gamma_time_shift": 5},
+    {"shower_time_shift": 2},
+    {"shower_time_shift": 5},
     # --- temporal position: both classes rolled (the fair test) ---------------
-    {"gamma_time_shift": 2, "nsb_time_shift": 2},
-    {"gamma_time_shift": 5, "nsb_time_shift": 5},
+    {"shower_time_shift": 2, "nsb_time_shift": 2},
+    {"shower_time_shift": 5, "nsb_time_shift": 5},
     # --- temporal position: NSB only -----------------------------------------
     {"nsb_time_shift": 5, "name": "nsb_only_troll5"},
     {"nsb_time_shift": 2, "name": "nsb_only_troll2"},
@@ -107,5 +107,5 @@ def fold_specs(rows, condition_names, quick, reference_events=REFERENCE_EVENTS, 
         if quick:
             gamma_events, nsb_events = QUICK_EVENTS
         conditions = list(condition_names) if i == 0 else [condition_names[0]]
-        specs.append({"gamma_events": gamma_events, "nsb_events": nsb_events, "conditions": conditions, **row})
+        specs.append({"events": {"gamma": gamma_events, "nsb": nsb_events}, "conditions": conditions, **row})
     return specs

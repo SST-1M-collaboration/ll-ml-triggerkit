@@ -9,6 +9,7 @@ from synthetic import write_ctapipe_h5
 from triggerkit.FileIO.AsyncFileOpener import FileOpenerCTAO
 from triggerkit.TriggerChain import TriggerChain
 from triggerkit.augment import make_condition_folds, make_rotation_folds
+from triggerkit.data import Simulation
 from triggerkit.data import TriggerDataset
 from triggerkit.models import TDSCANBody
 
@@ -76,11 +77,11 @@ def test_dataset_and_folds_normalise_too(data):
     assert ds.gamma_files == [g] and ds.nsb_files == [n]
     assert TriggerDataset(pathlib.Path(g), [pathlib.Path(n)]).gamma_files == [g]
     geom = TriggerChain([g], [n]).geom
-    spec = {"gamma_events": 5, "nsb_events": 5, "conditions": ["m"]}
-    folds = make_rotation_folds(geom, [spec], {"m": (g, n)})          # bare str per condition
-    assert folds[0].gamma_files == [g] and folds[0].nsb_files == [n]
-    folds = make_condition_folds(geom, {"m": (pathlib.Path(g), [n], 5, 5)})
-    assert folds[0].gamma_files == [g]
+    spec = {"events": {"gamma": 5, "nsb": 5}, "conditions": ["m"]}
+    folds = make_rotation_folds(geom, [spec], {"m": Simulation(gamma=g, nsb=n)})          # bare str per type
+    assert folds[0].sources.files("gamma") == [g] and folds[0].sources.files("nsb") == [n]
+    folds = make_condition_folds(geom, {"m": (Simulation(gamma=pathlib.Path(g), nsb=[n]), {"gamma": 5, "nsb": 5})})
+    assert folds[0].sources.files("gamma") == [g]
 
 
 def test_calibration_accepts_a_bare_path(data):

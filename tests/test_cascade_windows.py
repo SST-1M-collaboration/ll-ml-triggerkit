@@ -183,16 +183,18 @@ def test_per_stage_stats_files_are_readable_by_statplotter(files50, tmp_path):
     import json
     import h5py
     from triggerkit.Statistics.StatPlotter import StatPlotter
+    from triggerkit.Statistics.stats_file import StatsFile
 
     casc = TriggerCascade([patch7(files50), patch7(files50, 32)],
                           names=["L1", "L2 first 32"], windows=[Full(), Fixed(0, 32)])
     stats = casc.compute_statistics(batch_size=8, folder=str(tmp_path), base_name="demo")
     assert len(stats["files"]) == 2 and all(os.path.exists(p) for p in stats["files"])
 
+    sf = StatsFile(stats["files"][1])
     with h5py.File(stats["files"][1], "r") as f:
-        ev = {k: f["events"][k][()] for k in f["events"]}
         desc = json.loads(f.attrs["cascade_json"])
-        assert f.attrs["gamma_trig"] == stats["gamma"]["stages"][1]["passed"]
+    ev = sf.fold("all")                                    # the events joined with what stage 1 did with them
+    assert ev["triggered"].sum() == stats["gamma"]["stages"][1]["passed"] + stats["nsb"]["stages"][1]["passed"]
     gam = ev["label"] == 1
     # the synthetic gamma pulse starts on sample 20 (a noise fluctuation can fire a bit earlier)
     t0 = ev["t_trig_stage0"][gam & (ev["fired_stage0"] == 1)]

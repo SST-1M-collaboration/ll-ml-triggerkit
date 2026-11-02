@@ -29,6 +29,7 @@ import os
 import stats_common
 from triggerkit.TriggerChain import TriggerChain
 from triggerkit.augment import make_rotation_folds
+from triggerkit.data import Simulation
 
 BASE_NAME = "simu"
 TARGET_RATE_HZ = 50_000
@@ -47,11 +48,11 @@ FOLD_EVENTS = (None, None)
 # Each row is a dict; every key is optional and {} is the untouched reference
 # fold (run under every --condition, the others under the reference one only).
 # Keys (defaults in brackets):
-#   gamma_deg        [0]           camera rotation on the gamma rows. Must be an
+#   shower_deg        [0]           camera rotation on the gamma rows. Must be an
 #                                  exact symmetry -- a multiple of 120 for this
 #                                  3-fold camera; other angles raise loudly
 #                                  rather than misplace pixels.
-#   gamma_time_shift [0]           edge-hold time shift of the GAMMA waveform in samples
+#   shower_time_shift [0]           edge-hold time shift of the GAMMA waveform in samples
 #   nsb_kind         ["original"]  "original" / "rolled" / "shuffle"
 #   nsb_param        [None]        roll shift or shuffle seed (kind default if None)
 #   nsb_time_shift   [0]           edge-hold time shift of the NSB waveform in samples
@@ -65,10 +66,10 @@ FOLD_EVENTS = (None, None)
 # same gamma efficiency AND the same NSB rate as the reference fold.
 FOLD_ROWS = [
     {},                                                # reference fold
-    {"gamma_deg": 120, "nsb_kind": "rolled"},
-    {"gamma_deg": 240, "nsb_kind": "shuffle"},
-    {"gamma_time_shift": 5},                           # gammas only
-    {"gamma_time_shift": 5, "nsb_time_shift": 5},      # both -> fair test
+    {"shower_deg": 120, "nsb_kind": "rolled"},
+    {"shower_deg": 240, "nsb_kind": "shuffle"},
+    {"shower_time_shift": 5},                           # gammas only
+    {"shower_time_shift": 5, "nsb_time_shift": 5},      # both -> fair test
 ]
 
 
@@ -120,7 +121,7 @@ def main():
     # per-fold counts.
     specs = stats_common.fold_specs(FOLD_ROWS, list(conditions), args.quick,
                                     reference_events=FOLD_EVENTS, fold_events=FOLD_EVENTS)
-    folds = make_rotation_folds(chain.geom, specs, conditions, seed=SEED)
+    folds = make_rotation_folds(chain.geom, specs, {n: Simulation(gamma=g, nsb=b) for n, (g, b) in conditions.items()}, seed=SEED)
     chain.compute_statistics(
         base_name=BASE_NAME, folder=output_folder, batch_size=512,
         tel_id_only=1, nsb_roll_copies=0, nsb_skip_original_events=False,

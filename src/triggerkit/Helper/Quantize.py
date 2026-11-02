@@ -107,17 +107,6 @@ def parse_qspec(spec):
     return _build_spec(int_bits=int_bits, frac_bits=frac_bits, signed=signed)
 
 
-def parse_qformat(spec):
-    """
-    Parse a qspec and return ``(word_bits, frac_bits)``.
-    This keeps the legacy API and intentionally omits the signedness bit.
-    """
-    parsed = parse_qspec(spec)
-    if parsed is None:
-        return None
-    return parsed["word_bits"], parsed["frac_bits"]
-
-
 def parse_overflow_mode(mode):
     """
     Normalize an HLS overflow mode string.
@@ -168,25 +157,6 @@ def _fixed_point_limits(word_bits, signed=True):
     min_i = 0
     max_i = (2 ** int(word_bits)) - 1
     return min_i, max_i
-
-
-def _fixed_point_max_raw(word_bits):
-    return tf.constant((2 ** int(word_bits)) - 1, dtype=tf.int64)
-
-
-def _fixed_point_to_raw_int(w_int, word_bits):
-    modulus = tf.constant(2 ** int(word_bits), dtype=tf.int64)
-    return tf.math.floormod(tf.cast(w_int, tf.int64), modulus)
-
-
-def _fixed_point_from_raw_int(raw_bits, word_bits, signed=True):
-    raw_bits = tf.cast(raw_bits, tf.int64)
-    if not signed:
-        return raw_bits
-
-    modulus = tf.constant(2 ** int(word_bits), dtype=tf.int64)
-    sign_threshold = tf.constant(2 ** (int(word_bits) - 1), dtype=tf.int64)
-    return tf.where(raw_bits >= sign_threshold, raw_bits - modulus, raw_bits)
 
 
 def _fixed_point_normalize_int(w_int, word_bits, signed=True, overflow_mode="AP_WRAP"):

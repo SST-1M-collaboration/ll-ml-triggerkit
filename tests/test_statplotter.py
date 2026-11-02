@@ -10,38 +10,29 @@ from triggerkit.Statistics.StatPlotter import StatPlotter, _FOLD_UNSET
 CHAIN = [("threshold", {"threshold": 2.0, "binary": True, "comparison": "gt"})]
 
 
-def write_stats(path, comparison="gt", folds=("a", "b"), n=400, seed=0, with_score=True, p_trig_only=False, chain=None):
+def write_stats(path, comparison="gt", folds=("a", "b"), n=400, seed=0, with_score=True, chain=None):
     rng = np.random.default_rng(seed)
-    w = H5StatsWriter(str(path), trigger_chain=chain or CHAIN, camera_name="DigiCam")
-    if with_score:
-        w.f.attrs["has_pre_threshold_score"] = True
-        w.f.attrs["pre_threshold_reference_threshold"] = 2.0
-        w.f.attrs["pre_threshold_comparison"] = comparison
+    chain = chain or [("threshold", {"threshold": 2.0, "binary": True, "comparison": comparison})]
+    w = H5StatsWriter(str(path), trigger_chain=chain, camera_name="DigiCam")
+    # the same 2n events in every fold; a fold only changes the scores (fold i has a different NSB level)
+    rows = w.append_events({"particle": np.r_[np.ones(n), np.zeros(n)].astype(np.uint8), "event_id": np.arange(2 * n),
+                            "n_pe": np.r_[rng.uniform(20, 300, n), np.zeros(n)].astype(np.float32),
+                            "energy": np.r_[rng.uniform(0.1, 50, n), np.zeros(n)].astype(np.float32)})
     for i, name in enumerate(folds):
         idx = w.begin_fold(name)
-        label = np.r_[np.ones(n), np.zeros(n)].astype(np.uint8)
-        # integer scores -> lots of ties; fold i has a different NSB level
         score = np.r_[rng.integers(0, 8, n), rng.integers(0, 4 + 2 * i, n)].astype(np.float32)
-        cols = {
-            "label": label,
-            "n_pe": np.r_[rng.uniform(20, 300, n), np.zeros(n)].astype(np.float32),
-            "energy": np.r_[rng.uniform(0.1, 50, n), np.zeros(n)].astype(np.float32),
-        }
-        if p_trig_only:
-            cols["p_trig"] = np.where(score > 3, 0.9, 0.2).astype(np.float32)
+        if with_score:
+            w.append_scores(idx, rows, score=score)
         else:
-            cols["triggered"] = (score >= 2 if comparison == "ge" else score > 2).astype(np.uint8)
-            if with_score:
-                cols["pre_threshold_score"] = score
-        w.append(cols, fold_idx=idx)
+            w.append_scores(idx, rows, decision=(score >= 2 if comparison == "ge" else score > 2).astype(np.uint8))
     w.close(window_sec=2e-7)
 
 
-def plotter(folder, **kw):
-    return StatPlotter(base_reference_config=CHAIN, stat_folder=str(folder), **kw)
+def plotter(folder, chain=None, **kw):
+    return StatPlotter(base_reference_config=chain or CHAIN, stat_folder=str(folder), **kw)
 
 
-def test_rate_of_selected_fold_is_its_own_not_fold_zero(tmp_path):
+def test_rate_of_selected_fold_is_its_own_and_with_no_fold_it_is_the_aggregate(tmp_path):
     write_stats(tmp_path / "s.h5")
     sp_all = plotter(tmp_path)
     r0 = sp_all._get_result_trigger_rate_hz(sp_all.base_config_result)
@@ -49,8 +40,9 @@ def test_rate_of_selected_fold_is_its_own_not_fold_zero(tmp_path):
     for fold in ("a", "b"):
         sp = plotter(tmp_path, fold=fold)
         rates[fold] = sp._get_result_trigger_rate_hz(sp.base_config_result)
-    assert rates["a"] == pytest.approx(r0)          # fold 0 = the file attribute
     assert rates["b"] != pytest.approx(rates["a"])  # fold b has a different NSB level
+    assert r0 == pytest.approx((rates["a"] + rates["b"]) / 2)    # no fold selected: every fold together (as for the distributions), not fold 0;
+    assert r0 != pytest.approx(rates["a"])                        # the file has no top-level rate any more
     sp = plotter(tmp_path, fold="b")
     assert sp._get_result_trigger_rate_hz(sp.base_config_result) == pytest.approx(rates["b"])  # cached path
 
@@ -66,10 +58,10 @@ def test_multiple_matching_files_are_reported(tmp_path, capsys):
 @pytest.mark.parametrize("comparison", ["gt", "ge"])
 def test_efficiency_vs_rate_is_consistent_with_the_comparison(tmp_path, comparison):
     write_stats(tmp_path / "s.h5", comparison=comparison, folds=("all",))
-    sp = plotter(tmp_path)
+    sp = plotter(tmp_path, chain=[("threshold", {"threshold": 2.0, "binary": True, "comparison": comparison})])     # the comparison is part of the chain
     curves = sp.getEfficiencyVsTriggerRateCurves()
     # recover the gamma scores to recompute the efficiency with the real rule
-    gamma = sp._collect_metric_values(sp.base_config_result, "pre_threshold_score", kind="gamma")
+    gamma = sp._collect_metric_values(sp.base_config_result, "score", kind="gamma")
     rule = (lambda t: (gamma >= t).mean()) if comparison == "ge" else (lambda t: (gamma > t).mean())
     for t, eff in zip(curves["thresholds"][::7], curves["efficiency"][::7]):
         assert eff == pytest.approx(rule(t))
@@ -81,15 +73,6 @@ def test_histogram_uses_stored_decision_column(tmp_path):
     bins = np.linspace(0, 400, 9)
     all_h, trig_h = sp._histogram_stream(sp.base_config_result, "n_pe", kind="gamma", bins=bins)
     assert all_h.sum() == 400 and 0 < trig_h.sum() < 400
-
-
-def test_p_trig_is_thresholded_at_half(tmp_path):
-    """Legacy files only have p_trig; p>0 would call (almost) everything a trigger."""
-    write_stats(tmp_path / "s.h5", folds=("all",), with_score=False, p_trig_only=True)
-    sp = plotter(tmp_path)
-    bins = np.linspace(0, 400, 9)
-    all_h, trig_h = sp._histogram_stream(sp.base_config_result, "n_pe", kind="gamma", bins=bins)
-    assert 0 < trig_h.sum() < all_h.sum()
 
 
 def test_effective_area_points_sit_at_bin_centres_and_warn_on_sample_size(tmp_path, capsys):
@@ -229,12 +212,9 @@ def write_gate_pair(folder, n=400, shift_ids=False):
     for name, chain, sc, thr, ids in (("trigger.h5", CHAIN, score, 2.0, np.arange(2 * n)),
                                       ("gate.h5", GATE_CHAIN, gate, 0.5, np.arange(2 * n) + (1 if shift_ids else 0))):
         w = H5StatsWriter(str(folder / name), trigger_chain=chain, camera_name="DigiCam")
-        w.f.attrs["has_pre_threshold_score"] = True
-        w.f.attrs["pre_threshold_reference_threshold"] = thr
-        w.f.attrs["pre_threshold_comparison"] = "gt"
         idx = w.begin_fold("all")
-        w.append({"label": label, "n_pe": n_pe, "energy": n_pe, "event_id": ids.astype(np.int64),
-                  "pre_threshold_score": sc, "triggered": (sc > thr).astype(np.uint8)}, fold_idx=idx)
+        rows = w.append_events({"particle": label, "n_pe": n_pe, "energy": n_pe, "event_id": ids.astype(np.int64)})
+        w.append_scores(idx, rows, score=sc)
         w.close(window_sec=2e-7)
     return n_pe[:n], score[:n]
 
@@ -290,3 +270,22 @@ def test_gate_configs_must_be_config_label_pairs(tmp_path):
     write_gate_pair(tmp_path)
     with pytest.raises(ValueError, match="list of \\(config, label\\) pairs"):
         _report(plotter(tmp_path), tmp_path / "bad_gate", gate_configs=[GATE_CHAIN])
+
+
+def test_gated_out_events_count_in_the_rates_but_not_in_the_score_histogram(tmp_path):
+    from triggerkit.Statistics.H5StatsWriter import GATED_OUT_SCORE
+    w = H5StatsWriter(str(tmp_path / "g.h5"), trigger_chain=CHAIN, camera_name="DigiCam")
+    n = 100
+    rows = w.append_events({"particle": np.r_[np.ones(n), np.zeros(n)].astype(np.uint8), "event_id": np.arange(2 * n),
+                            "n_pe": np.full(2 * n, 50.0, np.float32), "energy": np.full(2 * n, 1.0, np.float32)})
+    score = np.r_[np.full(n, 5.0), np.full(n, 3.0)].astype(np.float32)
+    score[n - 20:n] = GATED_OUT_SCORE            # 20 gammas the upstream trigger did not fire on
+    score[2 * n - 50:] = GATED_OUT_SCORE         # half of the NSB too
+    w.begin_fold("all")
+    w.append_scores(0, rows, score=score)
+    w.close(window_sec=1e-6)
+    sp = plotter(tmp_path)
+    r = sp.base_config_result
+    assert sp._collect_metric_values(r, "score", kind="gamma").size == n                                  # the rates see them
+    assert sp._collect_metric_values(r, "score", kind="gamma", drop_gated_out=True).size == n - 20          # the histogram does not
+    assert sp._get_result_trigger_rate_hz(r) == pytest.approx(0.5 / 1e-6)                                  # 50 of 100 NSB events above 2.0

@@ -1,15 +1,9 @@
 """Opening data files must never execute code that is stored inside them."""
-import pickle
 
-import h5py
 import numpy as np
 import pytest
 
 from triggerkit.Helper.history import load_history, load_legacy_npy_history, save_history
-from triggerkit.Statistics.StatPlotter import StatPlotter
-
-CHAIN = [("threshold", {"threshold": 2.0})]
-
 
 class Evil:
     """Unpickling this writes a marker file: proof that code ran."""
@@ -26,25 +20,6 @@ def test_history_json_roundtrip_with_numpy_values(tmp_path):
     save_history(str(tmp_path / "h.json"), hist)
     back = load_history(str(tmp_path / "h.json"))
     assert back == {"loss": [1.5, 0.5], "auc": [0.7, 0.8], "epoch": [1]}
-
-
-def test_stat_plotter_refuses_a_pickled_chain_by_default(tmp_path, capsys):
-    marker = tmp_path / "marker.txt"
-    with h5py.File(tmp_path / "evil.h5", "w") as f:
-        f.attrs["camera_name"] = "DigiCam"
-        f.attrs["trigger_chain_pickle"] = np.void(pickle.dumps(Evil(str(marker))))
-    with pytest.raises(ValueError, match="not found"):            # the only file was skipped
-        StatPlotter(base_reference_config=CHAIN, stat_folder=str(tmp_path))
-    assert not marker.exists()                                    # nothing was unpickled
-    assert "pickle" in capsys.readouterr().out
-
-
-def test_stat_plotter_legacy_pickle_needs_an_explicit_opt_in(tmp_path):
-    with h5py.File(tmp_path / "old.h5", "w") as f:
-        f.attrs["camera_name"] = "DigiCam"
-        f.attrs["trigger_chain_pickle"] = np.void(pickle.dumps(CHAIN))
-    sp = StatPlotter(base_reference_config=CHAIN, stat_folder=str(tmp_path), allow_legacy_pickle=True)
-    assert sp.base_config_result["trigger_chain"] == [("threshold", {"threshold": 2.0})]
 
 
 def test_legacy_npy_history_is_not_loaded_unless_trusted(tmp_path, capsys):
