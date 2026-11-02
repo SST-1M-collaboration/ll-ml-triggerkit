@@ -1,39 +1,47 @@
-[build-system]
-requires = ["setuptools>=64", "wheel"]
-build-backend = "setuptools.build_meta"
-
-[project]
+[tool.poetry]
 name = "ll-ml-triggerkit"
 version = "0.1.0"
 description = "Trainable low-level ML trigger chains for Cherenkov cameras (SST-1M / DigiCam)."
+authors = ["Tanguy Dietrich"]
+license = "MIT"
 readme = "README.md"
-requires-python = ">=3.10"
-license = { text = "MIT" }
-authors = [{ name = "Tanguy Dietrich" }]
-dependencies = [
-    "numpy",
-    "scipy",
-    "scikit-learn",
-    "h5py",
-    "hdf5plugin",
-    "matplotlib",
-    "astropy",
-    "setproctitle",
-    "tensorflow>=2.16",
-    "keras>=3",
-    "ctapipe",
-]
+packages = [{ include = "triggerkit", from = "src" }]
 
-[project.optional-dependencies]
+[tool.poetry.dependencies]
+# 3.12: dl1-data-handler (hexagonal mapping of the whole camera) and recent ctapipe need it.
+python = ">=3.12,<3.14"
+numpy = ">=2.1"
+scipy = "*"
+scikit-learn = "*"
+h5py = "*"
+hdf5plugin = "*"
+matplotlib = "*"
+astropy = "*"
+setproctitle = "*"
+# The versions the quantized models and their hls4ml export were validated with (qat5-qat8, qat7 ring).
+tensorflow = "~2.20.0"
+keras = "~3.12.0"
+ctapipe = ">=0.29"
+# Hexagonal mapping of the camera (HexagdlyMapper): the one source of truth, also used by CTLearn.
+# Not on PyPI beyond 0.14.6; ctlearn 0.11 needs >= 0.14.12.
+dl1-data-handler = { git = "https://github.com/cta-observatory/dl1-data-handler.git", tag = "v0.14.12" }
+# Optional, see [tool.poetry.extras]
+keras-hexagdly = { version = ">=0.7.0,<0.8", optional = true }
+hgq2 = { version = "0.1.9", optional = true }
+hls4ml = { version = "1.3.0", optional = true }
+
+[tool.poetry.extras]
 # Hex CNN bodies (models/hexcnn.py, SequentialBody hex layers).
-hexcnn = ["keras-hexagdly>=0.4"]
-dev = ["pytest"]
+hexcnn = ["keras-hexagdly"]
+# Fully quantized (HGQ2) models and their hls4ml export; needs the hex layers too.
+qat = ["keras-hexagdly", "hgq2", "hls4ml"]
 
-[tool.setuptools.packages.find]
-where = ["src"]
+[tool.poetry.group.dev.dependencies]
+pytest = "*"
 
-[tool.setuptools.package-data]
-triggerkit = ["**/*.json", "camera/*.cfg", "camera/*.csv"]
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
