@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import os
 import json
-import pickle
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -43,13 +42,12 @@ import matplotlib.pyplot as plt
 from matplotlib import colors
 from scipy.stats import norm
 
-from triggerkit.Statistics.H5StatsWriter import (
-    PRE_THRESHOLD_AVAILABLE_ATTR,
-    PRE_THRESHOLD_COMPARISON_ATTR,
-    PRE_THRESHOLD_REFERENCE_ATTR,
-    PRE_THRESHOLD_SCORE_DATASET,
-)
+from triggerkit.Statistics.H5StatsWriter import GATED_OUT_SCORE, PARTICLE_CODES
+from triggerkit.Statistics.stats_file import StatsFile
 from triggerkit.Statistics.folds import read_folds_group, auc_standard_error, fold_aucs  # noqa: F401
+
+#: name of the score column of a fold view (the "metric" the plots ask for to get the pre-threshold scores)
+PRE_THRESHOLD_SCORE_DATASET = "score"
 from triggerkit.Statistics.metrics import (  # noqa: F401  (wilson is re-exported: callers import it from here)
     normalize_comparison,
     pick_threshold_from_scores,
@@ -226,13 +224,9 @@ class StatPlotter:
         allow_h5: bool = True,
         float_atol: float = 1e-6,
         float_rtol: float = 1e-5,
-        h5_chunk_rows: int = 200_000,
         fold: Optional[str] = None,
         style: str = "report",
-        allow_legacy_pickle: bool = False,
     ):
-        # Legacy stats files may hold a pickled chain: refused unless you vouch for them.
-        self.allow_legacy_pickle = bool(allow_legacy_pickle)
         # Accept either a single folder string or a list of folders.
         folders = [stat_folder] if isinstance(stat_folder, str) else list(stat_folder)
         self.stat_folder = folders[0]  # kept for backwards-compat (e.g. report output dir)
@@ -259,7 +253,6 @@ class StatPlotter:
         self.style = style
         self.float_atol = float_atol
         self.float_rtol = float_rtol
-        self.h5_chunk_rows = int(h5_chunk_rows)
         self.wilson_level = 0.68
 
         self.all_results: List[Tuple[str, Dict[str, Any]]] = []
@@ -447,100 +440,50 @@ class StatPlotter:
     # Loading / matching configs
     # ----------------------------
 
+    def _stats(self, path: str) -> StatsFile:
+        """The ``StatsFile`` of a path, read once."""
+        cache = self.__dict__.setdefault("_stats_files", {})
+        if path not in cache:
+            cache[path] = StatsFile(path)
+        return cache[path]
+
     def _load_h5_meta(self, h5_path: str) -> Dict[str, Any]:
-        if h5py is None:
-            raise RuntimeError("h5py is not installed but allow_h5=True was requested.")
-        meta: Dict[str, Any] = {"_format": "h5", "_path": h5_path}
+        """What the plots need to know about a file. Cheap: the file stores no threshold and no rate, so nothing here depends on one."""
+        sf = self._stats(h5_path)
+        meta: Dict[str, Any] = {"_format": "h5", "_path": h5_path, "uuid": sf.uuid, "created_utc": sf.created_utc,
+                                "description": sf.description.get("text", "")}
+        meta["camera_name"] = sf.camera_name
+        meta["format"] = _as_str(sf.attrs.get("format", "stats_v2"))
+        chain = sf.trigger_chain
+        meta["trigger_chain"] = [(str(stage), dict(params)) for stage, params in chain]
+        meta["has_pre_threshold_score"] = sf.has_score
+        meta["_layout"] = "events"
 
-        with h5py.File(h5_path, "r") as f:
-            attrs = f.attrs
-
-            meta["camera_name"] = _as_str(attrs.get("camera_name", "unknown"))
-            meta["format"] = _as_str(attrs.get("format", "h5stats-v1"))
-
-            # Trigger chain: preferred JSON
-            chain = self._read_trigger_chain_from_h5(attrs)
-            meta["trigger_chain"] = chain
-
-            # rates / counters
-            if "trigger_rate_hz" in attrs:
-                meta["trigger_rate"] = float(attrs["trigger_rate_hz"])
-            elif "trigger_rate" in attrs:
-                meta["trigger_rate"] = float(attrs["trigger_rate"])
-            else:
-                meta["trigger_rate"] = None
-
-            meta["window_sec"] = self._read_window_sec(attrs)
-
-            meta["num_events_gamma"] = int(attrs.get("num_events_gamma", attrs.get("num_events", 0)))
-            meta["num_events_nsb"] = int(attrs.get("num_events_nsb", 0))
-            meta["nsb_trig"] = int(attrs.get("nsb_trig", -1))
-
-            # ranges (optional)
-            if "gamma_n_pe_min" in attrs:
-                meta["gamma_n_pe_min"] = float(attrs["gamma_n_pe_min"])
-            if "gamma_n_pe_max" in attrs:
-                meta["gamma_n_pe_max"] = float(attrs["gamma_n_pe_max"])
-
-            # quick layout hint
-            if "events" in f:
-                meta["_layout"] = "events"
-            elif "gamma" in f and "nsb" in f:
-                meta["_layout"] = "split"
-            else:
-                meta["_layout"] = "unknown"
-
-            meta["has_pre_threshold_score"] = bool(
-                attrs.get(PRE_THRESHOLD_AVAILABLE_ATTR, False)
-                or ("events" in f and PRE_THRESHOLD_SCORE_DATASET in f["events"])
-                or ("gamma" in f and PRE_THRESHOLD_SCORE_DATASET in f["gamma"])
-                or ("nsb" in f and PRE_THRESHOLD_SCORE_DATASET in f["nsb"])
-            )
-            if PRE_THRESHOLD_REFERENCE_ATTR in attrs:
-                meta["reference_threshold"] = float(attrs[PRE_THRESHOLD_REFERENCE_ATTR])
-            else:
-                meta["reference_threshold"] = self._extract_threshold_from_chain(chain)
-            if PRE_THRESHOLD_COMPARISON_ATTR in attrs:
-                meta["threshold_comparison"] = self._normalize_threshold_comparison(
-                    _as_str(attrs[PRE_THRESHOLD_COMPARISON_ATTR])
-                )
-            else:
-                meta["threshold_comparison"] = self._extract_threshold_comparison_from_chain(chain)
-
+        # What describes the first fold (the reference one): its event counts and the n_pe range of its gammas
+        first = sf.fold_names[0] if sf.fold_names else None
+        meta["window_sec"] = sf.nsb_window_sec(first) if first is not None else sf.window_sec
+        meta.update(num_events_gamma=0, num_events_nsb=0, nsb_trig=-1, trigger_rate=None)
+        if first is not None:
+            read = sf.read_counts(first)
+            meta["num_events_gamma"], meta["num_events_nsb"] = read.get("gamma", 0), read.get("nsb", 0)
+            if not sf.has_score:                   # a decision, not a score: what fired is all there is
+                meta["nsb_trig"] = sf.counts(first).get("nsb", {}).get("triggered", -1)
+            view = sf.fold(first, columns=["particle", "n_pe"], decide=False)
+            npe = view["n_pe"][(view["particle"] == PARTICLE_CODES["gamma"]) & np.isfinite(view["n_pe"])]
+            if npe.size:
+                meta["gamma_n_pe_min"], meta["gamma_n_pe_max"] = float(npe.min()), float(npe.max())
+        # the threshold the chain was DESCRIBED with: the reference of the plots, whatever threshold they then ask for
+        meta["reference_threshold"] = sf.reference_threshold if sf.reference_threshold is not None else self._extract_threshold_from_chain(chain)
+        meta["threshold_comparison"] = self._normalize_threshold_comparison(sf.comparison)
         return meta
 
-    def _read_window_sec(self, attrs) -> float:
-        if "window_sec" in attrs:
-            return float(attrs["window_sec"])
-        if "window_size_ns" in attrs:
-            return float(attrs["window_size_ns"]) * 1e-9
-        # fallback (your typical window)
-        return 75e-9
-
-    def _read_trigger_chain_from_h5(self, attrs) -> ConfigType:
-        # Preferred JSON
-        if "trigger_chain_json" in attrs:
-            raw = attrs["trigger_chain_json"]
-            raw = _as_str(raw)
-            chain_ll = json.loads(raw)  # list of [stage, params]
-            return [(str(stage), dict(params)) for stage, params in chain_ll]
-
-        # Very old files stored the chain as a pickle. Unpickling executes code
-        # contained in the file, so it is refused unless the caller vouches for the
-        # files (allow_legacy_pickle=True).
-        for k in ("trigger_chain_pickle", "trigger_chain_pkl"):
-            if k in attrs:
-                if not self.allow_legacy_pickle:
-                    raise ValueError(
-                        f"stores its trigger chain as a pickle ({k!r}); opening it can execute "
-                        "code. Re-generate the file, or pass allow_legacy_pickle=True if you "
-                        "trust it.")
-                v = attrs[k]
-                b = v.tobytes() if hasattr(v, "tobytes") else bytes(v)
-                chain = pickle.loads(b)  # noqa: S301 - explicitly opted in
-                return [(str(stage), dict(params)) for stage, params in chain]
-
-        return []
+    def _nsb_window_sec(self, result: Dict[str, Any]) -> float:
+        """The time one NSB event of the selected fold stands for (its condition's: a NSB made by a trigger is one event per 1 / rate)."""
+        if not self._is_h5(result):
+            return float(result.get("window_sec", 75e-9))
+        sf = self._stats(result["_path"])
+        fold = self._fold_filter if self._fold_filter is not None else (sf.fold_names[0] if sf.fold_names else None)
+        return sf.nsb_window_sec(fold) if fold is not None else sf.window_sec
 
     def _extract_threshold_from_chain(self, chain: ConfigType) -> Optional[float]:
         last_threshold = None
@@ -799,57 +742,6 @@ class StatPlotter:
     def _is_h5(self, result: Dict[str, Any]) -> bool:
         return result.get("_format") == "h5"
 
-    def _resolve_h5_group(self, f: "h5py.File", kind: str) -> Tuple[Optional["h5py.Group"], Optional["h5py.Dataset"]]:
-        """
-        Returns:
-          - group containing the data
-          - optional label dataset (only for /events layout)
-        """
-        if "events" in f:
-            grp = f["events"]
-            label_ds = grp["label"] if "label" in grp else None
-            return grp, label_ds
-
-        # split layout
-        if kind in f:
-            return f[kind], None
-
-        raise KeyError(f"HDF5 layout not recognized for kind='{kind}'. Expected /events or /{kind}.")
-
-    def _resolve_triggered_ds(self, grp: "h5py.Group") -> "h5py.Dataset":
-        if "triggered" in grp:
-            return grp["triggered"]
-        if "n_clusters" in grp:
-            return grp["n_clusters"]
-        if "p_trig" in grp:
-            return grp["p_trig"]
-        raise KeyError("Could not find 'triggered', 'n_clusters', or 'p_trig' dataset to determine triggered events.")
-
-    def _resolve_score_ds(self, grp: "h5py.Group") -> Optional["h5py.Dataset"]:
-        if PRE_THRESHOLD_SCORE_DATASET in grp:
-            return grp[PRE_THRESHOLD_SCORE_DATASET]
-        return None
-
-    def _fold_row_mask(self, grp: "h5py.Group", sl: slice) -> Optional[np.ndarray]:
-        """Boolean keep-mask over the sliced rows for the selected fold.
-
-        Returns None when no fold filtering applies (fold=None, or the file has no
-        `fold` column -- e.g. a legacy single-fold file). Raises if the requested
-        fold name is not present in the file's /folds table."""
-        if self._fold_filter is None or grp is None or "fold" not in grp:
-            return None
-        f = grp.file
-        names = None
-        if "folds" in f and "name" in f["folds"]:
-            names = [x.decode() if isinstance(x, bytes) else str(x)
-                     for x in f["folds"]["name"][()]]
-        if not names or self._fold_filter not in names:
-            raise KeyError(
-                f"fold {self._fold_filter!r} not found in {f.filename} "
-                f"(available: {names})")
-        idx = names.index(self._fold_filter)
-        return np.asarray(grp["fold"][sl]).reshape(-1) == idx
-
     def _apply_fold_override(self, fold: Any = _FOLD_UNSET) -> None:
         """Switch the active fold for the NEXT data read.
 
@@ -870,70 +762,60 @@ class StatPlotter:
         self._score_threshold_cache.clear()
         self._roc_auc_cache.clear()
 
-    def _label_mask(self, label_chunk: np.ndarray, kind: str) -> np.ndarray:
-        # label is typically 0/1 integers, but we handle strings too
-        if label_chunk.dtype.kind in ("S", "U", "O"):
-            s = label_chunk.astype(str)
-            if kind == "gamma":
-                return (s == "gamma") | (s == "1")
-            return (s == "nsb") | (s == "0")
-        else:
-            target = 1 if kind == "gamma" else 0
-            return label_chunk == target
+    def _kind_code(self, kind: str) -> int:
+        """Particle code of a kind name (``"gamma"``, ``"nsb"``, ``"proton"``, ``"muon"``)."""
+        name = _as_str(kind)
+        if name not in PARTICLE_CODES:
+            raise ValueError(f"kind must be one of {tuple(PARTICLE_CODES)}, got {kind!r}")
+        return PARTICLE_CODES[name]
+
+    def _view(self, result: Dict[str, Any], kind: Optional[str], columns: Optional[List[str]] = None) -> Dict[str, np.ndarray]:
+        """The rows of the selected fold (every fold if none is selected) for one event type, as aligned arrays.
+
+        Keys: the requested event columns, ``particle``, ``event`` and, per chain, ``score`` or ``decision``, ``triggered``
+        (decision at the stored threshold) and the extra per-stage columns of a cascade. ``kind=None`` keeps every type.
+        """
+        if not self._is_h5(result):
+            raise ValueError("_view called on non-h5 result.")
+        sf = self._stats(result["_path"])
+        wanted = None if columns is None else sorted(set(columns) | {"particle"})
+        wanted = None if wanted is None else [c for c in wanted if c in sf.event_columns]
+        view = sf.fold(self._fold_filter, wanted) if self._fold_filter is not None else sf.all_folds(wanted)
+        if kind is None:
+            return view
+        mask = view["particle"] == self._kind_code(kind)
+        return {k: v[mask] for k, v in view.items()}
+
+    def _score_trigger_threshold_mask(self, result: Dict[str, Any], view: Dict[str, np.ndarray], threshold: Optional[float]) -> np.ndarray:
+        """Decision of a view: its score against ``threshold`` (default the stored one), or the stored decision."""
+        if "score" in view:
+            thr = threshold if threshold is not None else result.get("reference_threshold")
+            if thr is None:
+                raise ValueError("no threshold: the file stores none, give one")
+            return self._score_trigger_mask(view["score"], float(thr), comparison=result.get("threshold_comparison", "gt"))
+        return view["decision"].astype(bool)
 
     def _collect_metric_values(
         self,
         result: Dict[str, Any],
         metric: str,
         kind: str,
-        chunk_rows: Optional[int] = None,
+        drop_gated_out: bool = False,
     ) -> np.ndarray:
-        if not self._is_h5(result):
-            raise ValueError("_collect_metric_values called on non-h5 result.")
+        """The finite values of ``metric`` (an event column, or ``"score"``) for one event type of the selected fold.
 
-        if h5py is None:
-            raise RuntimeError("h5py is not installed.")
-
-        chunk_rows = int(chunk_rows or self.h5_chunk_rows)
-        values: List[np.ndarray] = []
-
-        with h5py.File(result["_path"], "r") as f:
-            grp, label_ds = self._resolve_h5_group(f, kind if kind in ("gamma", "nsb") else kind)
-            if grp is None:
-                raise KeyError("Could not resolve HDF5 group for metric collection.")
-            if metric not in grp:
-                raise KeyError(f"Metric dataset '{metric}' not found in group '{grp.name}' in {result['_path']}.")
-
-            ds = grp[metric]
-            n = int(ds.shape[0])
-            for start in range(0, n, chunk_rows):
-                end = min(n, start + chunk_rows)
-                sl = slice(start, end)
-
-                x = np.asarray(ds[sl]).reshape(-1)
-                keep = self._fold_row_mask(grp, sl)
-                if label_ds is not None:
-                    lab = np.asarray(label_ds[sl]).reshape(-1)
-                    m = self._label_mask(lab, kind="gamma" if kind == "gamma" else "nsb")
-                    if keep is not None:
-                        m = m & keep
-                    x = x[m]
-                elif keep is not None:
-                    x = x[keep]
-
-                if x.size == 0:
-                    continue
-
-                mfinite = np.isfinite(x)
-                x = x[mfinite]
-                if x.size == 0:
-                    continue
-
-                values.append(x.astype(np.float32, copy=False))
-
-        if not values:
-            return np.empty((0,), dtype=np.float32)
-        return np.concatenate(values, axis=0)
+        The events an upstream trigger did not fire on (aligned statistics) carry the lowest score, ``GATED_OUT_SCORE``: they are part of
+        every rate, threshold and AUC, so they are kept; ``drop_gated_out=True`` leaves them out, for a histogram of the scores that
+        would otherwise be one huge bin at the left.
+        """
+        view = self._view(result, kind, None if metric == "score" else [metric])
+        if metric not in view:
+            raise KeyError(f"Metric '{metric}' not found in {result['_path']} (has {sorted(view)}).")
+        x = np.asarray(view[metric]).reshape(-1)
+        keep = np.isfinite(x)
+        if drop_gated_out and metric == PRE_THRESHOLD_SCORE_DATASET:
+            keep &= x > GATED_OUT_SCORE
+        return x[keep].astype(np.float32, copy=False)
 
     @classmethod
     def _pick_threshold_from_empirical_scores(
@@ -945,22 +827,16 @@ class StatPlotter:
         return pick_threshold_from_scores(scores, desired_fraction, comparison)
 
     def _fold_stored_rate_hz(self, result: Dict[str, Any]) -> Optional[float]:
-        """Stored NSB rate of the currently selected fold (from /folds), or None.
-
-        The top-level ``trigger_rate_hz`` attribute describes fold 0 only, so it
-        must not be reported for any other selected fold.
-        """
-        if self._fold_filter is None or not self._is_h5(result) or h5py is None:
+        """NSB rate of the currently selected fold at the stored threshold (or the stored decision), or None."""
+        if self._fold_filter is None or not self._is_h5(result):
             return None
         key = (result["_path"], str(self._fold_filter))
         if key in self._fold_rate_cache:
             return self._fold_rate_cache[key]
+        sf = self._stats(result["_path"])
         rate = None
-        with h5py.File(result["_path"], "r") as f:
-            if "folds" in f and "trigger_rate_hz" in f["folds"]:
-                names = [x.decode() if isinstance(x, bytes) else str(x) for x in f["folds"]["name"][()]]
-                if self._fold_filter in names:
-                    rate = float(f["folds"]["trigger_rate_hz"][()][names.index(self._fold_filter)])
+        if self._fold_filter in sf.fold_names and (sf.reference_threshold is not None or not sf.has_score):
+            rate = float(sf.nsb_rate_hz(self._fold_filter)[0])
         self._fold_rate_cache[key] = rate
         return rate
 
@@ -992,14 +868,14 @@ class StatPlotter:
                     )
                 )
                 / nsb_scores.size
-                / float(result.get("window_sec", 75e-9))
+                / float(self._nsb_window_sec(result))
             )
             self._score_rate_cache[cache_key] = rate
             return rate
 
         nsb_trig = result.get("nsb_trig", -1)
         n_nsb = result.get("num_events_nsb", 0)
-        ws = result.get("window_sec", 75e-9)
+        ws = self._nsb_window_sec(result)
         if nsb_trig >= 0 and n_nsb > 0 and ws > 0:
             return float(nsb_trig) / float(n_nsb) / float(ws)
         return float("nan")
@@ -1044,7 +920,7 @@ class StatPlotter:
                             )
                         )
                         / nsb_scores.size
-                        / result.get("window_sec", 75e-9)
+                        / self._nsb_window_sec(result)
                     )
                 self._score_rate_cache[cache_key] = rate_hz
             return {
@@ -1085,13 +961,13 @@ class StatPlotter:
                     "selection_mode": None,
                 }
             else:
-                desired_fraction = float(np.clip(desired_rate * result.get("window_sec", 75e-9), 0.0, 1.0))
+                desired_fraction = float(np.clip(desired_rate * self._nsb_window_sec(result), 0.0, 1.0))
                 threshold, predicted_fraction, selection_mode = self._pick_threshold_from_empirical_scores(
                     nsb_scores,
                     desired_fraction=desired_fraction,
                     comparison=comparison,
                 )
-                rate_hz = 0.0 if predicted_fraction is None else float(predicted_fraction / result.get("window_sec", 75e-9))
+                rate_hz = 0.0 if predicted_fraction is None else float(predicted_fraction / self._nsb_window_sec(result))
                 resolved = {
                     "mode": "score",
                     "score_threshold": threshold,
@@ -1146,101 +1022,18 @@ class StatPlotter:
         metric: str,
         kind: str,
         bins: np.ndarray,
-        chunk_rows: Optional[int] = None,
         score_threshold: Optional[float] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Returns:
-          hist_all, hist_triggered
-        """
-        if not self._is_h5(result):
-            raise ValueError("_histogram_stream called on non-h5 result.")
-
-        if h5py is None:
-            raise RuntimeError("h5py is not installed.")
-
-        chunk_rows = int(chunk_rows or self.h5_chunk_rows)
-        hist_all = np.zeros(len(bins) - 1, dtype=np.int64)
-        hist_trig = np.zeros(len(bins) - 1, dtype=np.int64)
-
-        path = result["_path"]
-        with h5py.File(path, "r") as f:
-            grp, label_ds = self._resolve_h5_group(f, kind if kind in ("gamma", "nsb") else kind)
-            if grp is None:
-                raise KeyError("Could not resolve HDF5 group for streaming.")
-
-            if metric not in grp:
-                raise KeyError(f"Metric dataset '{metric}' not found in group '{grp.name}' in {path}.")
-
-            x_ds = grp[metric]
-            resolved_score_threshold = score_threshold
-            score_ds = self._resolve_score_ds(grp)
-            if score_ds is not None and resolved_score_threshold is None:
-                resolved_score_threshold = result.get("reference_threshold")
-            trig_ds = None if resolved_score_threshold is not None and score_ds is not None else self._resolve_triggered_ds(grp)
-            # p_trig is a probability: the trigger is p > 0.5 (as in
-            # TriggerChain.compute_statistics), not p > 0.
-            trig_is_prob = trig_ds is not None and trig_ds.name.rsplit("/", 1)[-1] == "p_trig"
-
-            n = int(x_ds.shape[0])
-            for start in range(0, n, chunk_rows):
-                end = min(n, start + chunk_rows)
-                sl = slice(start, end)
-
-                x = np.asarray(x_ds[sl])
-                # ensure 1D
-                x = x.reshape(-1)
-                score_raw = None
-
-                keep = self._fold_row_mask(grp, sl)
-                if label_ds is not None:
-                    lab = np.asarray(label_ds[sl]).reshape(-1)
-                    m = self._label_mask(lab, kind="gamma" if kind == "gamma" else "nsb")
-                    if keep is not None:
-                        m = m & keep
-                    x = x[m]
-                    if score_ds is not None and resolved_score_threshold is not None:
-                        score_raw = np.asarray(score_ds[sl]).reshape(-1)[m]
-                    else:
-                        trig_raw = np.asarray(trig_ds[sl]).reshape(-1)[m]
-                else:
-                    if keep is not None:
-                        x = x[keep]
-                    if score_ds is not None and resolved_score_threshold is not None:
-                        score_raw = np.asarray(score_ds[sl]).reshape(-1)
-                        if keep is not None:
-                            score_raw = score_raw[keep]
-                    else:
-                        trig_raw = np.asarray(trig_ds[sl]).reshape(-1)
-                        if keep is not None:
-                            trig_raw = trig_raw[keep]
-
-                if score_raw is not None:
-                    trig = self._score_trigger_mask(
-                        score_raw,
-                        float(resolved_score_threshold),
-                        comparison=result.get("threshold_comparison", "gt"),
-                    )
-                elif trig_raw.dtype == np.bool_:
-                    trig = trig_raw
-                elif trig_is_prob:
-                    trig = trig_raw > 0.5
-                else:
-                    trig = trig_raw > 0
-
-                # filter to bin range for stability / speed
-                lo, hi = bins[0], bins[-1]
-                rmask = (x >= lo) & (x <= hi)
-                x = x[rmask]
-                trig = trig[rmask]
-
-                if x.size == 0:
-                    continue
-
-                hist_all += np.histogram(x, bins=bins)[0]
-                if np.any(trig):
-                    hist_trig += np.histogram(x[trig], bins=bins)[0]
-
+        """Returns ``(hist_all, hist_triggered)`` of ``metric`` over the events of one type of the selected fold."""
+        view = self._view(result, kind, [metric])
+        if metric not in view:
+            raise KeyError(f"Metric '{metric}' not found in {result['_path']} (has {sorted(view)}).")
+        x = np.asarray(view[metric]).reshape(-1)
+        trig = self._score_trigger_threshold_mask(result, view, score_threshold)
+        inside = (x >= bins[0]) & (x <= bins[-1])
+        x, trig = x[inside], trig[inside]
+        hist_all = np.histogram(x, bins=bins)[0].astype(np.int64)
+        hist_trig = np.histogram(x[trig], bins=bins)[0].astype(np.int64) if np.any(trig) else np.zeros(len(bins) - 1, dtype=np.int64)
         return hist_all, hist_trig
 
     def _histogram2d_stream(
@@ -1251,73 +1044,18 @@ class StatPlotter:
         kind: str,
         x_bins: np.ndarray,
         y_bins: np.ndarray,
-        chunk_rows: Optional[int] = None,
     ) -> np.ndarray:
-        """
-        Returns:
-          hist2d (shape: len(x_bins)-1, len(y_bins)-1)
-        """
-        if not self._is_h5(result):
-            raise ValueError("_histogram2d_stream called on non-h5 result.")
-
-        if h5py is None:
-            raise RuntimeError("h5py is not installed.")
-
-        chunk_rows = int(chunk_rows or self.h5_chunk_rows)
-        hist2d = np.zeros((len(x_bins) - 1, len(y_bins) - 1), dtype=np.int64)
-
-        path = result["_path"]
-        with h5py.File(path, "r") as f:
-            grp, label_ds = self._resolve_h5_group(f, kind if kind in ("gamma", "nsb") else kind)
-            if grp is None:
-                raise KeyError("Could not resolve HDF5 group for streaming.")
-
-            if x_metric not in grp:
-                raise KeyError(f"Metric dataset '{x_metric}' not found in group '{grp.name}' in {path}.")
-            if y_metric not in grp:
-                raise KeyError(f"Metric dataset '{y_metric}' not found in group '{grp.name}' in {path}.")
-
-            x_ds = grp[x_metric]
-            y_ds = grp[y_metric]
-
-            n = int(x_ds.shape[0])
-            for start in range(0, n, chunk_rows):
-                end = min(n, start + chunk_rows)
-                sl = slice(start, end)
-
-                x = np.asarray(x_ds[sl]).reshape(-1)
-                y = np.asarray(y_ds[sl]).reshape(-1)
-
-                keep = self._fold_row_mask(grp, sl)
-                if label_ds is not None:
-                    lab = np.asarray(label_ds[sl]).reshape(-1)
-                    m = self._label_mask(lab, kind="gamma" if kind == "gamma" else "nsb")
-                    if keep is not None:
-                        m = m & keep
-                    x = x[m]
-                    y = y[m]
-                elif keep is not None:
-                    x = x[keep]
-                    y = y[keep]
-
-                # drop NaNs/infs
-                mfinite = np.isfinite(x) & np.isfinite(y)
-                x = x[mfinite]
-                y = y[mfinite]
-
-                # filter to bin range for stability / speed
-                xlo, xhi = x_bins[0], x_bins[-1]
-                ylo, yhi = y_bins[0], y_bins[-1]
-                rmask = (x >= xlo) & (x <= xhi) & (y >= ylo) & (y <= yhi)
-                x = x[rmask]
-                y = y[rmask]
-
-                if x.size == 0:
-                    continue
-
-                hist2d += np.histogram2d(x, y, bins=[x_bins, y_bins])[0].astype(np.int64)
-
-        return hist2d
+        """Returns the 2D histogram (shape ``len(x_bins)-1, len(y_bins)-1``) of two event columns for one type."""
+        view = self._view(result, kind, [x_metric, y_metric])
+        for metric in (x_metric, y_metric):
+            if metric not in view:
+                raise KeyError(f"Metric '{metric}' not found in {result['_path']} (has {sorted(view)}).")
+        x = np.asarray(view[x_metric]).reshape(-1)
+        y = np.asarray(view[y_metric]).reshape(-1)
+        keep = np.isfinite(x) & np.isfinite(y) & (x >= x_bins[0]) & (x <= x_bins[-1]) & (y >= y_bins[0]) & (y <= y_bins[-1])
+        if not keep.any():
+            return np.zeros((len(x_bins) - 1, len(y_bins) - 1), dtype=np.int64)
+        return np.histogram2d(x[keep], y[keep], bins=[x_bins, y_bins])[0].astype(np.int64)
 
     # ----------------------------
     # Original computations (now H5-aware)
@@ -1923,38 +1661,19 @@ class StatPlotter:
             plt.close("all")
         return os.path.exists(full_path)
 
-    def _collect_event_columns(self, result, names, kind="gamma", chunk_rows=None):
-        """Stream several event datasets together, aligned, for one label kind.
+    def _collect_event_columns(self, result, names, kind="gamma"):
+        """Several event columns (or ``"score"``) together, row-aligned, for one event type of the selected fold.
 
-        Unlike `_collect_metric_values`, no per-field finite filtering is applied,
-        so derived quantities (e.g. impact distance from xcore/ycore/tel_pos) stay
-        row-aligned. The caller is responsible for a joint finite mask.
+        Unlike `_collect_metric_values`, no per-field finite filtering is applied, so derived quantities (e.g. impact distance from
+        xcore/ycore/tel_pos) stay row-aligned. The caller is responsible for a joint finite mask.
         """
-        if not self._is_h5(result):
-            raise ValueError("_collect_event_columns called on non-h5 result.")
-        if h5py is None:
-            raise RuntimeError("h5py is not installed.")
-        chunk_rows = int(chunk_rows or self.h5_chunk_rows)
-        out = {nm: [] for nm in names}
-        with h5py.File(result["_path"], "r") as f:
-            grp, label_ds = self._resolve_h5_group(f, kind)
-            for nm in names:
-                if nm not in grp:
-                    raise KeyError(nm)
-            n = int(grp[names[0]].shape[0])
-            for start in range(0, n, chunk_rows):
-                sl = slice(start, min(n, start + chunk_rows))
-                mask = None
-                if label_ds is not None:
-                    mask = self._label_mask(np.asarray(label_ds[sl]).reshape(-1), kind=kind)
-                keep = self._fold_row_mask(grp, sl)
-                if keep is not None:
-                    mask = keep if mask is None else (mask & keep)
-                for nm in names:
-                    a = np.asarray(grp[nm][sl]).reshape(-1)
-                    out[nm].append(a[mask] if mask is not None else a)
-        return {nm: (np.concatenate(v) if v else np.empty((0,), dtype=np.float32))
-                for nm, v in out.items()}
+        view = self._view(result, kind, [n for n in names if n != "score"])
+        out = {}
+        for nm in names:
+            if nm not in view:
+                raise KeyError(nm)
+            out[nm] = np.asarray(view[nm]).reshape(-1)
+        return out
 
     def _gamma_impact_columns(self, result, with_energy=False):
         """Return aligned (impact_distance, score[, energy]) arrays for gamma events."""
@@ -1987,8 +1706,8 @@ class StatPlotter:
         result = self.get_results(cfg)
         if result is None or not result.get("has_pre_threshold_score", False):
             return False
-        gamma = self._collect_metric_values(result, PRE_THRESHOLD_SCORE_DATASET, kind="gamma")
-        nsb = self._collect_metric_values(result, PRE_THRESHOLD_SCORE_DATASET, kind="nsb")
+        gamma = self._collect_metric_values(result, PRE_THRESHOLD_SCORE_DATASET, kind="gamma", drop_gated_out=True)
+        nsb = self._collect_metric_values(result, PRE_THRESHOLD_SCORE_DATASET, kind="nsb", drop_gated_out=True)
         if gamma.size == 0 and nsb.size == 0:
             return False
         all_scores = np.concatenate([a for a in (gamma, nsb) if a.size > 0])
@@ -2701,8 +2420,6 @@ class StatPlotter:
 
     def _read_folds_group(self, h5_path: str) -> Optional[List[Dict[str, Any]]]:
         """The ``/folds`` summary table of one stats file (see ``Statistics.folds``)."""
-        if h5py is None:
-            raise RuntimeError("h5py is not installed but a fold read was requested.")
         return read_folds_group(h5_path, wilson_level=self.wilson_level)
 
     def _fold_signature(self, h5_path: str, fold: str) -> Optional[Dict[str, Any]]:
@@ -2727,36 +2444,22 @@ class StatPlotter:
         def s(x):
             return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
 
+        sf = self._stats(h5_path)
         sig: Optional[Dict[str, Any]]
-        with h5py.File(h5_path, "r") as f:
-            grp = f["events"] if "events" in f else None
-            if grp is None or "fold" not in grp:
-                sig = {"no_folds": True}
-            else:
-                names = [s(x) for x in f["folds"]["name"][()]] if "folds" in f else []
-                if fold not in names:
-                    sig = None
-                else:
-                    idx = names.index(fold)
-                    cfg_row: Dict[str, Any] = {}
-                    if "config" in f["folds"]:
-                        for k, ds in f["folds"]["config"].items():
-                            v = ds[idx]
-                            cfg_row[k] = s(v) if isinstance(v, (bytes, bytearray, str)) else np.asarray(v).tolist()
-                    m = np.asarray(grp["fold"][()]).reshape(-1) == idx
-                    labels = np.asarray(grp["label"][()]).reshape(-1)[m]
-                    eid = np.asarray(grp["event_id"][()]).reshape(-1)[m] if "event_id" in grp else None
-                    npe = np.asarray(grp["n_pe"][()], dtype=np.float64).reshape(-1)[m] if "n_pe" in grp else None
-                    sig = {"config": cfg_row}
-                    for kind in ("gamma", "nsb"):
-                        km = self._label_mask(labels, kind)
-                        h = hashlib.sha1()
-                        e = eid[km] if eid is not None else np.zeros(int(km.sum()), dtype=np.int64)
-                        p = np.round(npe[km], 3) if npe is not None else np.zeros(len(e))
-                        order = np.lexsort((p, e))
-                        h.update(np.ascontiguousarray(e[order], dtype=np.int64).tobytes())
-                        h.update(np.ascontiguousarray(p[order], dtype=np.float64).tobytes())
-                        sig[kind] = (int(km.sum()), h.hexdigest())
+        if fold not in sf.fold_names:
+            sig = None
+        else:
+            view = sf.fold(fold, columns=["particle", "event_id", "n_pe"])
+            sig = {"config": sf.fold_config(fold)}
+            for kind in ("gamma", "nsb"):
+                km = view["particle"] == PARTICLE_CODES[kind]
+                h = hashlib.sha1()
+                e = view["event_id"][km].astype(np.int64)
+                p = np.round(view["n_pe"][km].astype(np.float64), 3)
+                order = np.lexsort((p, e))
+                h.update(np.ascontiguousarray(e[order], dtype=np.int64).tobytes())
+                h.update(np.ascontiguousarray(p[order], dtype=np.float64).tobytes())
+                sig[kind] = (int(km.sum()), h.hexdigest())
         cache[key] = sig
         return sig
 
@@ -2825,10 +2528,6 @@ class StatPlotter:
     def _auc_standard_error(auc: float, n_pos: int, n_neg: int) -> float:
         """Hanley & McNeil standard error of an AUC."""
         return auc_standard_error(auc, n_pos, n_neg)
-
-    def _fold_aucs(self, f: "h5py.File", n_folds: int) -> List[Tuple[float, float]]:
-        """Per-fold (auc, standard_error) from the per-event pre-threshold scores."""
-        return fold_aucs(f, n_folds)
 
     def _filter_cv_folds(
         self,
@@ -5003,7 +4702,7 @@ class StatPlotter:
         nsb_scores = self._collect_metric_values(result, PRE_THRESHOLD_SCORE_DATASET, kind="nsb")
         return self._build_trigger_rate_curve_from_scores(
             nsb_scores,
-            window_sec=float(result.get("window_sec", 75e-9)),
+            window_sec=float(self._nsb_window_sec(result)),
             comparison=result.get("threshold_comparison", "gt"),
         )
 
@@ -5597,8 +5296,8 @@ class StatPlotter:
             print(f"Config {title_config} has no '{PRE_THRESHOLD_SCORE_DATASET}' dataset.")
             return
 
-        gamma_scores = self._collect_metric_values(result, PRE_THRESHOLD_SCORE_DATASET, kind="gamma")
-        nsb_scores = self._collect_metric_values(result, PRE_THRESHOLD_SCORE_DATASET, kind="nsb")
+        gamma_scores = self._collect_metric_values(result, PRE_THRESHOLD_SCORE_DATASET, kind="gamma", drop_gated_out=True)
+        nsb_scores = self._collect_metric_values(result, PRE_THRESHOLD_SCORE_DATASET, kind="nsb", drop_gated_out=True)
         if gamma_scores.size == 0 and nsb_scores.size == 0:
             print("No pre-threshold scores found.")
             return

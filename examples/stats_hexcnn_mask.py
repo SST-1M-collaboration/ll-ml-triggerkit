@@ -21,6 +21,7 @@ from tensorflow import keras
 from triggerkit.Stages.TrainableThreshold import TrainableThreshold
 from triggerkit.TriggerChain import TriggerChain
 from triggerkit.augment import make_rotation_folds
+from triggerkit.data import Simulation
 from triggerkit.models import BoardMax, load_model
 from triggerkit.models.boards import patch_geometry
 
@@ -36,27 +37,27 @@ REFERENCE = "medium"
 # the unfair half, both classes rolled is the fair test). See triggerkit.augment.make_rotation_folds.
 FOLD_SPECS = [
     # --- rotation symmetry ---------------------------------------------------
-    {"gamma_events": 200_000, "nsb_events": 100_000, "conditions": ["medium"]},             # reference fold
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "gamma_deg": 120},
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "gamma_deg": 240},
+    {"events": {"gamma": 200_000, "nsb": 100_000}, "conditions": ["medium"]},             # reference fold
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "shower_deg": 120},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "shower_deg": 240},
     # --- NSB pixel transforms ------------------------------------------------
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "nsb_kind": "rolled",  "nsb_param": 1},
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "nsb_kind": "rolled",  "nsb_param": 42},
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "nsb_kind": "shuffle", "nsb_param": 2024},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "nsb_kind": "rolled",  "nsb_param": 1},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "nsb_kind": "rolled",  "nsb_param": 42},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "nsb_kind": "shuffle", "nsb_param": 2024},
     # --- mixes ---------------------------------------------------------------
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "gamma_deg": 120, "nsb_kind": "rolled",  "nsb_param": 1},
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "gamma_deg": 240, "nsb_kind": "rolled",  "nsb_param": 1},
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "gamma_deg": 120, "nsb_kind": "shuffle", "nsb_param": 2024},
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "gamma_deg": 240, "nsb_kind": "shuffle", "nsb_param": 2024},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "shower_deg": 120, "nsb_kind": "rolled",  "nsb_param": 1},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "shower_deg": 240, "nsb_kind": "rolled",  "nsb_param": 1},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "shower_deg": 120, "nsb_kind": "shuffle", "nsb_param": 2024},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "shower_deg": 240, "nsb_kind": "shuffle", "nsb_param": 2024},
     # --- temporal position: gammas only (the UNFAIR half, kept for reference) -
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "gamma_time_shift": 2},
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "gamma_time_shift": 5},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "shower_time_shift": 2},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "shower_time_shift": 5},
     # --- temporal position: BOTH classes rolled (the fair test) ---------------
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "gamma_time_shift": 2, "nsb_time_shift": 2},
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "gamma_time_shift": 5, "nsb_time_shift": 5},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "shower_time_shift": 2, "nsb_time_shift": 2},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "shower_time_shift": 5, "nsb_time_shift": 5},
     # --- temporal position: NSB only (isolates the noise side) ---------------
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "nsb_time_shift": 5, "name": "nsb_only_troll5"},
-    {"gamma_events": 10_000, "nsb_events": 10_000, "conditions": ["medium"], "nsb_time_shift": 2, "name": "nsb_only_troll2"},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "nsb_time_shift": 5, "name": "nsb_only_troll5"},
+    {"events": {"gamma": 10_000, "nsb": 10_000}, "conditions": ["medium"], "nsb_time_shift": 2, "name": "nsb_only_troll2"},
 ]
 QUICK_EVENTS = 500
 
@@ -112,9 +113,9 @@ def main():
     threshold.tau.assign(tau)
     print(f"tau={tau}  (predicted NSB rate {predicted_rate:.0f} Hz, frozen for every fold)")
 
-    specs = [dict(s, gamma_events=QUICK_EVENTS, nsb_events=QUICK_EVENTS) if args.quick else s for s in FOLD_SPECS]
+    specs = [dict(s, events={"gamma": QUICK_EVENTS, "nsb": QUICK_EVENTS}) if args.quick else s for s in FOLD_SPECS]
     os.makedirs(args.output, exist_ok=True)
-    folds = make_rotation_folds(chain.geom, specs, simulations, seed=SEED)
+    folds = make_rotation_folds(chain.geom, specs, {n: Simulation(gamma=g, nsb=b) for n, (g, b) in simulations.items()}, seed=SEED)
     chain.compute_statistics(
         base_name=BASE_NAME, folder=args.output, batch_size=512, tel_id_only=1,
         nsb_roll_copies=0, nsb_skip_original_events=False,   # each NSB event read once, untouched

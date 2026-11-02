@@ -155,3 +155,69 @@ def test_load_ram_keeps_every_event_and_the_stream_order_without_shuffle():
     assert labels.count(1) == 160 and labels.count(0) == 160
     first, last = labels[:100], labels[-100:]
     assert sum(first) > 80 and sum(last) < 20                    # unshuffled: the class blocks are still there
+
+
+def collect_features(gamma, nsb, extra=None, **kw):
+    ds = SimTelTFDataset(gamma, nsb, FakeOpener, cfg(**kw), extra_files=extra).dataset()
+    labels, files, ids = [], [], []
+    for feat, lab in ds:
+        labels += lab.numpy().tolist()
+        if "file_index" in feat:
+            files += feat["file_index"].numpy().tolist()
+        ids += feat["event_id"].numpy().tolist()
+    return labels, files, ids
+
+
+def test_other_event_types_are_read_with_their_own_label():
+    labels, _, _ = collect_features(["g1"], ["n1"], extra={2: ["p1", "p2"], 3: ["m1"]})
+    assert labels.count(1) == 3 and labels.count(0) == 3 and labels.count(2) == 6 and labels.count(3) == 3
+
+
+def test_each_event_type_has_its_own_cap():
+    labels, _, _ = collect_features(["g1", "g2"], ["n1"], extra={2: ["p1", "p2"], 3: ["m1"]},
+                                    max_gamma_samples_total=4, max_nsb_samples_total=2,
+                                    max_samples_by_label={2: 5, 3: 1})
+    assert labels.count(1) == 4 and labels.count(0) == 2 and labels.count(2) == 5 and labels.count(3) == 1
+
+
+def test_stream_stops_once_every_capped_type_is_satisfied():
+    ds = SimTelTFDataset(["g1", "g2"], [], FakeOpener, cfg(max_gamma_samples_total=2)).dataset()
+    assert sum(len(lab) for _, lab in ds) == 2
+
+
+def test_extra_labels_cannot_reuse_gamma_or_nsb():
+    for label in (0, 1):
+        with pytest.raises(ValueError, match="start at 2"):
+            SimTelTFDataset(["g1"], [], FakeOpener, cfg(), extra_files={label: ["x"]})
+
+
+def test_other_types_follow_the_shower_filters_not_the_nsb_ones():
+    class TwoTel(FakeOpener):
+        def __iter__(self):
+            for i in range(2):
+                ev = list(_event(i))
+                ev[0] = [1, 2]; ev[1] = [ev[1][0], ev[1][0]]; ev[7] = [np.zeros(P)] * 2
+                ev[8] = [{"telescope": 1, "event_id": i, "n_pe": 1.0}, {"telescope": 2, "event_id": i, "n_pe": 1.0}]
+                yield tuple(ev)
+    ds = SimTelTFDataset([], ["n"], TwoTel, cfg(gamma_tel_id_only=2), extra_files={2: ["p"]}).dataset()
+    by_label = {}
+    for feat, lab in ds:
+        for tel, label in zip(feat["tel_id"].numpy(), lab.numpy()):
+            by_label.setdefault(int(label), []).append(int(tel))
+    assert by_label[2] == [2, 2]                    # the proton read only telescope 2, like a gamma
+    assert sorted(by_label[0]) == [1, 1, 2, 2]      # the NSB keeps every telescope
+
+
+def test_file_index_points_into_file_list():
+    ds = SimTelTFDataset(["g1", "g2"], ["n1"], FakeOpener, cfg(emit_file_index=True), extra_files={2: ["p1"], 3: ["m1", "m2"]})
+    assert ds.file_list == ["g1", "g2", "n1", "p1", "m1", "m2"]
+    labels, files, _ = collect_features(["g1", "g2"], ["n1"], extra={2: ["p1"], 3: ["m1", "m2"]}, emit_file_index=True)
+    expected = {1: {0, 1}, 0: {2}, 2: {3}, 3: {4, 5}}
+    for label, index in zip(labels, files):
+        assert index in expected[label]
+    assert set(files) == {0, 1, 2, 3, 4, 5}
+
+
+def test_no_file_index_unless_asked():
+    ds = SimTelTFDataset(["g1"], [], FakeOpener, cfg()).dataset()
+    assert all("file_index" not in feat for feat, _ in ds)

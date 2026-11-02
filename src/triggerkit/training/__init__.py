@@ -34,6 +34,7 @@ from triggerkit.training.selection import (
     select_best_filter,
     select_best_joint_column,
 )
+from triggerkit.training.particle_rates import ParticleRates
 from triggerkit.training.npe_weighting import (
     NpeWeighting,
     bce_target_and_weight,
@@ -70,6 +71,7 @@ __all__ = [
     "_paired_efficiency_at_rate",
     # n_pe weighting
     "NpeWeighting",
+    "ParticleRates",
     "bce_target_and_weight",
     "eval_targets",
     "zone_labels",

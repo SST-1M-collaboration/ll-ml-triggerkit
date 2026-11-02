@@ -12,18 +12,16 @@ from triggerkit.Statistics.metrics import roc_auc_mann_whitney, wilson
 def write(path, window=2e-7):
     rng = np.random.default_rng(0)
     w = H5StatsWriter(str(path), trigger_chain=[("threshold", {"threshold": 2.0})], camera_name="DigiCam")
-    w.f.attrs["has_pre_threshold_score"] = True
     scores = {}
+    n = 300
+    rows = w.append_events({"particle": np.r_[np.ones(n), np.zeros(n)].astype(np.uint8), "event_id": np.arange(2 * n),
+                            "n_pe": np.ones(2 * n, np.float32)})        # the same events in every fold
     for i, name in enumerate(("a", "b", "c")):
         idx = w.begin_fold(name)
-        n = 300
         g = rng.normal(2 + i, 1, n).astype(np.float32)
         b = rng.normal(0, 1, n).astype(np.float32)
         scores[name] = (g, b)
-        w.append({"label": np.r_[np.ones(n), np.zeros(n)].astype(np.uint8),
-                  "triggered": (np.r_[g, b] > 2).astype(np.uint8),
-                  "pre_threshold_score": np.r_[g, b].astype(np.float32),
-                  "n_pe": np.ones(2 * n, np.float32)}, fold_idx=idx)
+        w.append_scores(idx, rows, score=np.r_[g, b].astype(np.float32))
     w.close(window_sec=window)
     return scores
 
@@ -46,12 +44,22 @@ def test_read_folds_group(tmp_path):
     assert folds[0]["auc"] < folds[1]["auc"] < folds[2]["auc"]
 
 
-def test_file_without_folds_group_returns_none(tmp_path):
-    import h5py
+def test_file_without_folds_returns_none(tmp_path):
     p = tmp_path / "plain.h5"
-    with h5py.File(p, "w") as f:
-        f.create_group("events")
+    w = H5StatsWriter(str(p), trigger_chain=[])
+    w.close(window_sec=1.0)
     assert read_folds_group(str(p)) is None
+
+
+def test_a_chain_without_a_score_gets_nan_aucs_but_counts(tmp_path):
+    p = tmp_path / "or.h5"
+    w = H5StatsWriter(str(p), trigger_chain=[("or_merge", {})])
+    f = w.begin_fold("all")
+    rows = w.append_events({"particle": np.array([1, 1, 0, 0], np.uint8), "event_id": np.arange(4)})
+    w.append_scores(f, rows, decision=[1, 0, 1, 0])
+    w.close(window_sec=1.0)
+    (fold,) = read_folds_group(str(p))
+    assert np.isnan(fold["auc"]) and (fold["gamma_trig"], fold["gamma_total"], fold["nsb_trig"], fold["nsb_total"]) == (1, 2, 1, 2)
 
 
 def test_auc_standard_error_behaviour():

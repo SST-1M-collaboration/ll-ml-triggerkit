@@ -52,6 +52,8 @@ class SimTelTFDatasetConfig:
     # Global caps across all files (None = no cap)
     max_gamma_samples_total: Optional[int] = None
     max_nsb_samples_total: Optional[int] = None
+    # Caps of the other event types, {label: cap} (label 2 = proton, 3 = muon; see SimTelTFDataset(extra_files=...))
+    max_samples_by_label: Optional[Dict[int, int]] = None
 
     # Shuffling
     shuffle_files: bool = True
@@ -105,6 +107,9 @@ class SimTelTFDatasetConfig:
     # noise) if 1-pe pixels are included. Mask it against true_image downstream.
     emit_peak_time: bool = False
     include_event_features: bool = True
+    # Emit ``file_index`` (int32), the position of the event's source file in ``SimTelTFDataset.file_list``
+    # (gamma files, then NSB files, then the extra files by label). Off by default, like the truth maps.
+    emit_file_index: bool = False
 
     # Which scalar keys to include (must exist in your stat_event dict)
     event_feature_keys: Tuple[str, ...] = (
@@ -142,6 +147,8 @@ class SimTelTFDataset:
     Streams simtel-derived waveforms into a tf.data.Dataset using:
       - gamma_files => label 1
       - nsb_file(s) => label 0
+      - extra_files => the labels of the other event types (2 = proton, 3 = muon), read like the gammas
+        (same telescope and n_pe filters), each with its own cap (``config.max_samples_by_label``)
 
     Pattern 1: one telescope = one training sample.
     """
@@ -152,16 +159,30 @@ class SimTelTFDataset:
         nsb_files: Union[str, os.PathLike, Sequence[str]],  # can be a single file path
         opener_cls: Callable[..., Any],  # e.g. AsyncFileOpenerProcess
         config: Optional[SimTelTFDatasetConfig] = None,
+        extra_files: Optional[Dict[int, Sequence[str]]] = None,
     ):
         # a path, a list/tuple of paths, or None -- always stored as a list of str
         self.gamma_files = normalize_files(gamma_files, name="gamma_files")
         self.nsb_files = normalize_files(nsb_files, name="nsb_files")
 
+        self.extra_files: Dict[int, List[str]] = {}
+        for label, files in (extra_files or {}).items():
+            if int(label) in (0, 1):
+                raise ValueError(f"extra_files labels start at 2 (0 = NSB and 1 = gamma have their own arguments), got {label}")
+            self.extra_files[int(label)] = normalize_files(files, name=f"extra_files[{label}]")
+        #: every source file, in the order ``features["file_index"]`` refers to
+        self.file_list: List[str] = list(self.gamma_files) + list(self.nsb_files) + [
+            f for label in sorted(self.extra_files) for f in self.extra_files[label]]
+        self._file_index: Dict[str, int] = {}
+        for i, f in enumerate(self.file_list):
+            self._file_index.setdefault(f, i)
+
         self.opener_cls = opener_cls
         self.cfg = config or SimTelTFDatasetConfig()
-        # global quota trackers (set/reset in dataset())
-        self._remaining_gamma: Optional[int] = None
-        self._remaining_nsb: Optional[int] = None
+        # global quota trackers {label: events still allowed or None}, set/reset in dataset()
+        self._quota: Dict[int, Optional[int]] = {}
+        self._labels_present = sorted(
+            ([1] if self.gamma_files else []) + ([0] if self.nsb_files else []) + list(self.extra_files))
 
         if self.cfg.waveform_level not in ("r0", "r1"):
             raise ValueError("config.waveform_level must be 'r0' or 'r1'")
@@ -183,14 +204,9 @@ class SimTelTFDataset:
         zero-step progress bar. Only the load_ram path was immune, because it
         caches everything in RAM.
         """
-        self._remaining_gamma = (
-            None if self.cfg.max_gamma_samples_total is None
-            else int(self.cfg.max_gamma_samples_total)
-        )
-        self._remaining_nsb = (
-            None if self.cfg.max_nsb_samples_total is None
-            else int(self.cfg.max_nsb_samples_total)
-        )
+        caps = {1: self.cfg.max_gamma_samples_total, 0: self.cfg.max_nsb_samples_total}
+        caps.update(self.cfg.max_samples_by_label or {})
+        self._quota = {int(label): (None if cap is None else int(cap)) for label, cap in caps.items()}
 
     def dataset(self) -> tf.data.Dataset:
         self._reset_quotas()
@@ -199,7 +215,8 @@ class SimTelTFDataset:
 
         file_label_pairs: List[Tuple[str, int]] = (
             [(f, 1) for f in self.gamma_files] +
-            [(f, 0) for f in self.nsb_files]
+            [(f, 0) for f in self.nsb_files] +
+            [(f, label) for label in sorted(self.extra_files) for f in self.extra_files[label]]
         )
 
         if self.cfg.load_ram:
@@ -465,10 +482,8 @@ class SimTelTFDataset:
         rng: np.random.Generator,
     ) -> tf.data.Dataset:
         # ensure quotas exist when dataset() was bypassed (defensive)
-        if self._remaining_gamma is None and self.cfg.max_gamma_samples_total is not None:
-            self._remaining_gamma = int(self.cfg.max_gamma_samples_total)
-        if self._remaining_nsb is None and self.cfg.max_nsb_samples_total is not None:
-            self._remaining_nsb = int(self.cfg.max_nsb_samples_total)
+        if not self._quota:
+            self._reset_quotas()
 
         pairs = list(file_label_pairs)
         if self.cfg.shuffle_files:
@@ -577,15 +592,15 @@ class SimTelTFDataset:
                         zip(tel_ids_list, wf_list, ped_list)):
                     tel_id_i = int(tel_id)
 
-                    # Gamma-only tel_id filter
-                    if label == 1 and self.cfg.gamma_tel_id_only is not None:
+                    # tel_id filter of the shower types (gamma, proton, muon), not of the NSB
+                    if label != 0 and self.cfg.gamma_tel_id_only is not None:
                         if tel_id_i != int(self.cfg.gamma_tel_id_only):
                             continue
 
                     sd = stats_by_tel.get(tel_id_i, ev0)
 
                     # -------- NEW: gamma filter by n_pe --------
-                    if label == 1 and not self._passes_gamma_n_pe_filter(sd):
+                    if label != 0 and not self._passes_gamma_n_pe_filter(sd):
                         continue
 
                     x = np.asarray(wf, dtype=np.uint16)
@@ -638,6 +653,8 @@ class SimTelTFDataset:
                             "n_pe": np.array(sd.get("n_pe", -1), dtype=np.float32),
                             "tel_id": np.array(tel_id_i, dtype=np.int32),
                         }
+                        if self.cfg.emit_file_index:
+                            features["file_index"] = np.array(self._file_index.get(simtel_file, -1), dtype=np.int32)
                         if self.cfg.emit_true_image:
                             features["true_image"] = (
                                 ti_arr if ti_vec is None else ti_vec)
@@ -653,7 +670,7 @@ class SimTelTFDataset:
                     y = np.array(label, dtype=np.int32)
                 
                     # Yield original
-                    if label == 1:  # gamma
+                    if label != 0:  # a shower (gamma, proton, muon)
                         if self._consume_quota(label):
                             yield make_features(x, ped_arr), y
                     else:
@@ -693,6 +710,8 @@ class SimTelTFDataset:
             "event_id": tf.TensorSpec(shape=(), dtype=tf.int64),
             "tel_id": tf.TensorSpec(shape=(), dtype=tf.int32),
         }
+        if self.cfg.emit_file_index:
+            feat["file_index"] = tf.TensorSpec(shape=(), dtype=tf.int32)
         if self.cfg.emit_true_image:
             feat["true_image"] = tf.TensorSpec(shape=(None,), dtype=tf.float32)
         if self.cfg.emit_peak_time:
@@ -711,6 +730,8 @@ class SimTelTFDataset:
             "event_id": [],
             "tel_id": [],
         }
+        if self.cfg.emit_file_index:
+            feat_shapes["file_index"] = []
         if self.cfg.emit_true_image:
             feat_shapes["true_image"] = [None]
         if self.cfg.emit_peak_time:
@@ -728,6 +749,8 @@ class SimTelTFDataset:
             "event_id": tf.constant(-1, tf.int64),
             "tel_id": tf.constant(-1, tf.int32),
         }
+        if self.cfg.emit_file_index:
+            feat_vals["file_index"] = tf.constant(-1, tf.int32)
         if self.cfg.emit_true_image:
             feat_vals["true_image"] = tf.constant(0.0, tf.float32)
         if self.cfg.emit_peak_time:
@@ -739,27 +762,18 @@ class SimTelTFDataset:
 
     # ---------- Global quota helpers ----------
     def _consume_quota(self, label: int) -> bool:
-        if label == 1:
-            if self._remaining_gamma is None:
-                return True
-            if self._remaining_gamma <= 0:
-                return False
-            self._remaining_gamma -= 1
+        remaining = self._quota.get(int(label))
+        if remaining is None:
             return True
-        else:
-            if self._remaining_nsb is None:
-                return True
-            if self._remaining_nsb <= 0:
-                return False
-            self._remaining_nsb -= 1
-            return True
+        if remaining <= 0:
+            return False
+        self._quota[int(label)] = remaining - 1
+        return True
 
     def _quota_exhausted_label(self, label: int) -> bool:
-        if label == 1:
-            return self._remaining_gamma is not None and self._remaining_gamma <= 0
-        return self._remaining_nsb is not None and self._remaining_nsb <= 0
+        remaining = self._quota.get(int(label))
+        return remaining is not None and remaining <= 0
 
     def _quotas_exhausted(self) -> bool:
-        gamma_done = self._remaining_gamma is not None and self._remaining_gamma <= 0
-        nsb_done = self._remaining_nsb is not None and self._remaining_nsb <= 0
-        return gamma_done and nsb_done
+        """Every event type that has files has a cap, and every cap is used up."""
+        return bool(self._labels_present) and all(self._quota_exhausted_label(l) for l in self._labels_present)

@@ -22,6 +22,17 @@ import triggerkit
 from triggerkit.TriggerChain import TriggerChain
 ```
 
+## Statistics files and data sources
+
+* `triggerkit.data.Simulation(gamma=..., proton=..., muon=..., nsb=NsbSet(...))` gathers the files of each event type (paths, glob patterns or lists)
+  with their totals (showers simulated). `TriggerDataset(sim, ...)`, `compute_statistics(sim=..., folds=...)` and the folds of
+  `triggerkit.augment` take it.
+* Alignment (`triggerkit.alignment`): `Window(length, offset)`, `align_with=<upstream chain>`, sources `align="none" | "given" | "on_the_fly"`.
+* `compute_statistics` writes one `stats_v2` file per run: the events once (`/events`), what each fold's chain made of them (`/scores`), the
+  denominators (`/sources`), and `/description` (a free text, the run's UUID, date and time, machine, versions). It stores **no threshold and no
+  NSB rate**: read it with `triggerkit.Statistics.stats_file.StatsFile` and choose the threshold there (`efficiency(..., threshold=)`,
+  `threshold_for_nsb_rate(fold, 50_000)`). Plan and status of the rework: `docs/refonte_82_bins.md`.
+
 ## Layout
 
 - `src/triggerkit/` — the library.

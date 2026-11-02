@@ -1,4 +1,4 @@
-"""Read the per-fold summary of a statistics HDF5 (``/folds`` + the ``fold`` column).
+"""Per-fold summary of a statistics file (``stats_v2``), computed from its events and scores.
 
 One implementation shared by ``StatPlotter`` (cross-validation plot) and
 ``examples/stats_cv_report.py``, so the two can never disagree on how an AUC,
@@ -9,14 +9,11 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
-import h5py
 import numpy as np
 
+from triggerkit.Statistics.H5StatsWriter import PARTICLE_CODES
 from triggerkit.Statistics.metrics import roc_auc_mann_whitney, wilson
-
-
-def _s(x) -> str:
-    return x.decode() if isinstance(x, (bytes, bytearray)) else str(x)
+from triggerkit.Statistics.stats_file import StatsFile
 
 
 def auc_standard_error(auc: float, n_pos: int, n_neg: int) -> float:
@@ -31,66 +28,59 @@ def auc_standard_error(auc: float, n_pos: int, n_neg: int) -> float:
     return float(np.sqrt(max(var, 0.0)))
 
 
-def fold_aucs(f: "h5py.File", n_folds: int) -> List[Tuple[float, float]]:
-    """Per-fold ``(auc, standard_error)`` from the stored per-event scores.
+def fold_aucs(stats: "StatsFile") -> List[Tuple[float, float]]:
+    """Per-fold ``(auc, standard_error)`` of the gammas against the NSB, from the stored per-event scores.
 
-    All-NaN when the file stores no per-event score (the callers then fall back
-    to gamma efficiency).
+    All-NaN when the file stores no score (a chain with only a decision: the callers then fall back to the gamma efficiency).
     """
+    n_folds = len(stats.fold_names)
     out = [(float("nan"), float("nan"))] * n_folds
-    grp = f.get("events")
-    if grp is None or "pre_threshold_score" not in grp or "fold" not in grp:
+    if not stats.has_score:
         return out
-    fold = np.asarray(grp["fold"][()]).reshape(-1)
-    label = np.asarray(grp["label"][()]).reshape(-1)
-    score = np.asarray(grp["pre_threshold_score"][()]).reshape(-1)
     for i in range(n_folds):
-        m = fold == i
-        pos = score[m & (label == 1)]
-        neg = score[m & (label == 0)]
+        view = stats.fold(i, columns=["particle"])
+        pos = view["score"][view["particle"] == PARTICLE_CODES["gamma"]]
+        neg = view["score"][view["particle"] == PARTICLE_CODES["nsb"]]
         auc = roc_auc_mann_whitney(pos, neg)
         out[i] = (auc, auc_standard_error(auc, pos.size, neg.size))
     return out
 
 
-def read_folds_group(h5_path: str, wilson_level: float = 0.68,
-                     default_window_sec: float = 75e-9) -> Optional[List[Dict[str, Any]]]:
-    """The ``/folds`` summary table of one stats file, one dict per fold.
+def read_folds_group(h5_path: str, wilson_level: float = 0.68, default_window_sec: float = 75e-9,
+                     threshold: Optional[float] = None) -> Optional[List[Dict[str, Any]]]:
+    """The per-fold summary of one stats file, one dict per fold.
 
-    Returns None when the file has no ``/folds`` group (a plain single-fold file).
-    Each dict holds the fold ``index`` and ``fold`` name, the raw counts
-    (``gamma_trig`` / ``gamma_total`` / ``nsb_trig`` / ``nsb_total``), the
-    efficiency ``eff`` and NSB ``rate_hz`` with their Wilson errors
-    (``eff_err``, ``rate_err``), the ``window_sec`` and the threshold-free
-    ``auc`` (+ ``auc_err``), which the CV plots prefer: gamma efficiency at a
-    frozen tau conflates separation power with the working point.
+    Returns None when the file holds no fold. Each dict holds the fold ``index`` and ``fold`` name, the counts of gammas and of NSB read
+    and fired on at the stored threshold (``gamma_trig`` / ``gamma_total`` / ``nsb_trig`` / ``nsb_total``), the efficiency ``eff`` and
+    NSB ``rate_hz`` with their Wilson errors (``eff_err``, ``rate_err``), the ``window_sec`` and the threshold-free ``auc`` (+
+    ``auc_err``), which the CV plots prefer: gamma efficiency at a frozen tau conflates separation power with the working point.
+    The counts are not stored in the file: they come from the events, like everything else, at ``threshold`` (default: the threshold the
+    chain was described with). A chain that has a score but no threshold to read it at still gets its AUC; the counts, efficiencies and rates
+    are then NaN.
     """
-    with h5py.File(h5_path, "r") as f:
-        if "folds" not in f:
-            return None
-        g = f["folds"]
-        if "window_sec" in f.attrs:
-            window_sec = float(f.attrs["window_sec"])
-        elif "window_size_ns" in f.attrs:
-            window_sec = float(f.attrs["window_size_ns"]) * 1e-9
+    stats = StatsFile(h5_path)
+    if not stats.fold_names:
+        return None
+    aucs = fold_aucs(stats)
+    decidable = not stats.has_score or threshold is not None or stats.reference_threshold is not None
+    folds = []
+    for i, name in enumerate(stats.fold_names):
+        window_sec = stats.nsb_window_sec(name)
+        if decidable:
+            counts = stats.counts(name, threshold)
+            gt, gtot = counts.get("gamma", {}).get("triggered", 0), counts.get("gamma", {}).get("read", 0)
+            nt, ntot = counts.get("nsb", {}).get("triggered", 0), counts.get("nsb", {}).get("read", 0)
         else:
-            window_sec = default_window_sec
-        names = [_s(x) for x in g["name"][()]]
-        gt, gtot = g["gamma_trig"][()], g["gamma_total"][()]
-        nt, ntot = g["nsb_trig"][()], g["nsb_total"][()]
-        rate = g["trigger_rate_hz"][()]
-        aucs = fold_aucs(f, len(names))
-        folds = []
-        for i, name in enumerate(names):
-            eff, elo, ehi = wilson(int(gt[i]), int(gtot[i]), wilson_level)
-            _, rlo, rhi = wilson(int(nt[i]), int(ntot[i]), wilson_level)
-            folds.append({
-                "index": i, "fold": name, "window_sec": window_sec,
-                "gamma_trig": int(gt[i]), "gamma_total": int(gtot[i]),
-                "nsb_trig": int(nt[i]), "nsb_total": int(ntot[i]),
-                "eff": eff, "eff_err": max(elo, ehi),
-                "auc": aucs[i][0], "auc_err": aucs[i][1],
-                "rate_hz": float(rate[i]),
-                "rate_err": max(rlo, rhi) / window_sec,
-            })
-        return folds
+            read = stats.read_counts(name)
+            gt, gtot, nt, ntot = 0, read.get("gamma", 0), 0, read.get("nsb", 0)
+        eff, elo, ehi = wilson(gt, gtot, wilson_level) if decidable else (float("nan"),) * 3
+        rate, rlo, rhi = wilson(nt, ntot, wilson_level) if decidable else (float("nan"),) * 3
+        folds.append({
+            "index": i, "fold": name, "window_sec": window_sec,
+            "gamma_trig": gt, "gamma_total": gtot, "nsb_trig": nt, "nsb_total": ntot,
+            "eff": eff, "eff_err": max(elo, ehi),
+            "auc": aucs[i][0], "auc_err": aucs[i][1],
+            "rate_hz": rate / window_sec,
+            "rate_err": max(rlo, rhi) / window_sec,
+        })
+    return folds

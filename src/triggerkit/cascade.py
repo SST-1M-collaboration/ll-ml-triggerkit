@@ -186,15 +186,18 @@ class TriggerCascade:
         How the trigger time of a stage is defined when a later window is aligned on
         it: ``"rising"`` (default), ``"falling"`` or ``"middle"``; one value for all
         stages or one per stage.
+    time_refs : sequence of int
+        Stages whose trigger time is read even though no later window of this cascade
+        is aligned on it (what :class:`triggerkit.alignment.Aligner` does with a single stage).
 
     All stages are assumed to share the camera geometry / waveform shape and the
     same gamma & NSB files (taken from ``stages[0]`` unless overridden per call).
     """
 
-    def __init__(self, stages, names=None, windows=None, trig_time="rising"):
+    def __init__(self, stages, names=None, windows=None, trig_time="rising", time_refs=()):
         self.stages = list(stages)
-        if len(self.stages) < 2:
-            raise ValueError("A cascade needs at least two stages.")
+        if len(self.stages) < 1 or (len(self.stages) < 2 and not time_refs):
+            raise ValueError("A cascade needs at least two stages (a single stage only to read its trigger times: time_refs=(0,)).")
         n = len(self.stages)
         self.names = list(names) if names is not None else [f"stage{i}" for i in range(n)]
         if len(self.names) != n:
@@ -234,6 +237,12 @@ class TriggerCascade:
         self.sample_ranges = []
         self._check_windows()
         self._ref_stages = {r for r in self.ref_stage if r is not None}
+        for r in time_refs:                  # stages whose trigger time is read although no later window is aligned on it
+            if not 0 <= r < n:
+                raise ValueError(f"time_refs: stage {r} does not exist (0..{n - 1}).")
+            if self._time_map_layer(r) is None:
+                raise ValueError(f"{self._label(r)} has no per-sample score in front of its global pooling, so it has no trigger time.")
+            self._ref_stages.add(r)
 
     @staticmethod
     def _file_samples(stage):
@@ -563,28 +572,31 @@ class TriggerCascade:
             passed, _, rec = self._propagate(wf, ped)
             n_pass = [a + b for a, b in zip(n_pass, passed)]
             if writers:
-                cols = {
-                    "label": np.full(n_ev, label, np.uint8),
+                # the events once, in every stage's file; what each stage did (an extra column of /scores), per stage file
+                events = {
+                    "particle": np.full(n_ev, label, np.uint8),
                     "event_id": extras.get("event_id", np.full(n_ev, -1)).astype(np.int64),
                     "n_pe": extras.get("n_pe", np.full(n_ev, np.nan)).astype(np.float32),
                     "energy": extras.get("energy", np.full(n_ev, np.nan)).astype(np.float32),
                 }
+                stage_cols = {}
                 for j in range(len(self.stages)):
-                    cols[f"reached_stage{j}"] = rec["reached"][j].astype(np.uint8)
-                    cols[f"fired_stage{j}"] = rec["fired"][j].astype(np.uint8)
-                    cols[f"score_stage{j}"] = rec["score"][j]
-                    cols[f"t_trig_stage{j}"] = rec["t_trig"][j]
-                    cols[f"window_start_stage{j}"] = rec["start"][j]
+                    stage_cols[f"reached_stage{j}"] = rec["reached"][j].astype(np.uint8)
+                    stage_cols[f"fired_stage{j}"] = rec["fired"][j].astype(np.uint8)
+                    stage_cols[f"score_stage{j}"] = rec["score"][j]
+                    stage_cols[f"t_trig_stage{j}"] = rec["t_trig"][j]
+                    stage_cols[f"window_start_stage{j}"] = rec["start"][j]
                 passed_up_to = np.logical_and.accumulate(rec["fired"], axis=0)
                 for k, writer in enumerate(writers):
-                    writer.append({**cols, "triggered": passed_up_to[k].astype(np.uint8)})
+                    rows = writer.append_events(events)
+                    writer.append_scores(0, rows, decision=passed_up_to[k].astype(np.uint8), **stage_cols)
         return n_total, n_pass
 
     def compute_statistics(self, gamma_files=None, nsb_files=None, *,
                            batch_size=4096, tel_id_only=1, nsb_roll_copies=0,
                            nsb_skip_original_events=False, ignore_errors=True,
                            max_gamma_events=None, max_nsb_events=None,
-                           folder=None, base_name="cascade", overwrite=False):
+                           folder=None, base_name="cascade", overwrite=False, description=""):
         """Per-stage NSB rates and gamma efficiencies through the cascade.
 
         Returns a dict with, per class, the number of events entering the cascade
@@ -618,8 +630,9 @@ class TriggerCascade:
             description = self._description()
             camera = getattr(self.stages[0], "camera_name", "unknown")
             for k, path in enumerate(paths):
-                writer = H5StatsWriter(path, trigger_chain=self.stats_config(k, base_name),
-                                       camera_name=camera)
+                writer = H5StatsWriter(path, trigger_chain=self.stats_config(k, base_name), camera_name=camera,
+                                       description=f"{description} [cascade stage {k}: {self.names[k]}]".strip())
+                writer.begin_fold("all")
                 writer.f.attrs["cascade_json"] = json.dumps(
                     H5StatsWriter._to_jsonable(description))
                 writer.f.attrs["cascade_stage"] = k
