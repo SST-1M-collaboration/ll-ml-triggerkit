@@ -134,6 +134,9 @@ class TriggerDataset:
         (like ``gated_by``); a NSB that says it was made by a trigger (``made_by``) is checked against it.
     gamma_rotations : tuple of int
         Rotations in degrees (multiples of 120) drawn at random for each training gamma, e.g. ``(0, 120, 240)``; ``(0,)``: none.
+    nsb_roll : bool
+        Give each NSB window a random circular rotation of its pixel index (the default, as ``train_chain`` always did): it multiplies a triggerless NSB and
+        blurs its pedestal. ``False`` for a NSB a trigger fired on, whose fluctuation sits where that trigger looked: a rotation would move it away from there.
     seed : int
     """
 
@@ -173,6 +176,7 @@ class TriggerDataset:
         observe=None,
         trig_time="rising",
         gamma_rotations=(0,),
+        nsb_roll=True,
         event_feature_keys=DEFAULT_EVENT_FEATURE_KEYS,
         opener_cls=AsyncFileOpenerProcess,
         seed=1337,
@@ -287,6 +291,7 @@ class TriggerDataset:
             if gate.num_pixels != self.gated_by[0].num_pixels:
                 raise ValueError("all gated_by chains must take the same number of pixels.")
 
+        self.nsb_roll = bool(nsb_roll)
         self.gamma_rotations = tuple(int(r) % 360 for r in gamma_rotations)
         if not self.gamma_rotations or len(set(self.gamma_rotations)) != len(self.gamma_rotations):
             raise ValueError(f"gamma_rotations={tuple(gamma_rotations)!r}: give each rotation once, e.g. (0, 120, 240).")
@@ -395,7 +400,7 @@ class TriggerDataset:
             nsb_skip_original_events=False,
             nsb_roll_copies=0,
             nsb_roll_axis=1,
-            nsb_roll_augment=True,
+            nsb_roll_augment=self.nsb_roll,
             nsb_roll_seed=roll_seed,
             max_gamma_samples_total=max_gamma,
             max_nsb_samples_total=max_nsb,

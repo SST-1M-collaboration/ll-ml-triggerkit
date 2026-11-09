@@ -29,12 +29,22 @@ dl1-data-handler = { git = "https://github.com/cta-observatory/dl1-data-handler.
 keras-hexagdly = { version = ">=0.7.0,<0.8", optional = true }
 hgq2 = { version = "0.1.9", optional = true }
 hls4ml = { version = "1.3.0", optional = true }
+pyqtgraph = { version = ">=0.13", optional = true }
+PyQt5 = { version = ">=5.15", optional = true }
+eventio = { version = "*", optional = true }
+
+[tool.poetry.scripts]
+triggerkit-convert = "triggerkit.tools.convert:main"
+triggerkit-viewer = "triggerkit.viewer.app:main"
+triggerkit-merge = "triggerkit.tools.merge:main"
 
 [tool.poetry.extras]
 # Hex CNN bodies (models/hexcnn.py, SequentialBody hex layers).
 hexcnn = ["keras-hexagdly"]
 # Fully quantized (HGQ2) models and their hls4ml export; needs the hex layers too.
 qat = ["keras-hexagdly", "hgq2", "hls4ml"]
+# sim_telarray viewer (triggerkit-viewer, triggerkit.viewer): the GUI and the reading of simtel files.
+viewer = ["pyqtgraph", "PyQt5", "eventio"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = "*"

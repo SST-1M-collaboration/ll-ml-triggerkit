@@ -49,6 +49,11 @@ def pixel_positions():
     return np.round(np.c_[-rows[:, _Y_PIXEL], -rows[:, _X_PIXEL]] / 10, 3)  # CSV precision: 0.01 mm
 
 
+def patch_of_pixel():
+    """(1296,) the patch (0..431) each pixel belongs to."""
+    return _camera_config()[:, _PATCH_SW_ID].astype(int)
+
+
 def patch_triplets():
     """(432, 3) pixel ids of each patch, in increasing order."""
     patch_of_pixel = _camera_config()[:, _PATCH_SW_ID].astype(int)

@@ -5,6 +5,8 @@ from astropy import units as u
 from ctapipe.calib import CameraCalibrator
 from ctapipe.io import EventSource, SimTelEventSource
 
+from triggerkit.camera import simtel_blocks
+
 TEL_ID = 1
 
 
@@ -76,6 +78,14 @@ class FileOpenerCTAOSimtel:
             self._iterator = iter(self._file)
             self.calibrator = CameraCalibrator(self._file.subarray)
 
+    def _pedestal_per_sample(self, event, tel_id):
+        """(n_pixels,) float32 pedestal of the camera. ctapipe <= 0.27 exposes it in ``event.mon``; ctapipe >= 0.28 removed it, so it is read from the file's own
+        camera monitoring block (the same value, see ``triggerkit.camera.simtel_blocks``)."""
+        monitoring = getattr(event, "mon", None)
+        if monitoring is not None:
+            return monitoring.tel[tel_id].calibration.pedestal_per_sample[0].astype(np.float32)
+        return simtel_blocks.pedestal_per_sample(self._file.file_.camera_monitorings[tel_id]).astype(np.float32)
+
     def _close(self):
         """Close the file."""
         if self._file is not None:
@@ -114,7 +124,6 @@ class FileOpenerCTAOSimtel:
             event_r1_tel = event.r1.tel
             event_dl0_tel = event.dl0.tel
             event_dl1_tel = event.dl1.tel
-            event_mon_tel = event.mon.tel
             event_sim_tel = event.simulation.tel
             shower = event.simulation.shower
             trigger_time_unix = event.trigger.time.to_value("unix")
@@ -149,11 +158,7 @@ class FileOpenerCTAOSimtel:
                 telescope_list.append(tel_id)
 
                 # get the pedestal data
-                pedestal_per_sample = (
-                    event_mon_tel[tel_id]
-                    .calibration.pedestal_per_sample[0]
-                    .astype(np.float32)
-                )
+                pedestal_per_sample = self._pedestal_per_sample(event, tel_id)
                 pedestal_per_sample_list.append(pedestal_per_sample)
 
                 # event stats
