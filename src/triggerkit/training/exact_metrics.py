@@ -37,7 +37,9 @@ class ExactMetrics(keras.callbacks.Callback):
     def _score(self, dataset):
         scores, labels, zone = [], [], []
         for x, y in dataset.take(self.batches):
-            scores.append(np.asarray(self.model(x, training=False)[self.output])[:, 0])
+            # a compiled call, not ``self.model(x)``: the eager call of the quantized hexagonal layers re-materializes their kernels op by op and failed at
+            # random on the GPU (InvalidArgumentError in SelectV2 for a batch that works when called again) while the data pipeline was running
+            scores.append(np.asarray(self.model.predict_on_batch(x)[self.output])[:, 0])
             labels.append(np.asarray(y[self.output])[:, 0])
             if self.zone_key in y:
                 zone.append(np.asarray(y[self.zone_key])[:, 0])

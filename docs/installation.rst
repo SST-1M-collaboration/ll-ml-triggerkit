@@ -1,0 +1,54 @@
+Installation
+============
+
+Python 3.10 to 3.13. The tests run on 3.10, 3.11 and 3.12. The environment is described by ``pyproject.toml`` (Poetry). ``poetry.lock`` pins the
+versions the quantized models and their hls4ml export were validated with (TensorFlow 2.20, Keras 3.12, HGQ2 0.1.9, hls4ml 1.3.0; ctapipe 0.32 on
+3.12 and 3.13, 0.28 on 3.10 and 3.11).
+
+.. code-block:: bash
+
+   poetry install                    # core + tests (the exact locked versions)
+   poetry install -E qat             # + keras-hexagdly, HGQ2 and hls4ml (fully quantized models and their export)
+   poetry install -E hexcnn          # + hex CNN bodies only (keras-hexagdly)
+   poetry install -E viewer          # + pyqtgraph, PyQt5, eventio: the simtel viewer (triggerkit-viewer)
+
+Then, on every Python version, install the hexagonal mapping of the camera by hand. ``dl1-data-handler`` declares Python >= 3.12, which Poetry cannot
+lock together with 3.10 and 3.11, but its code runs on them; its other requirements are already installed:
+
+.. code-block:: bash
+
+   pip install --no-deps --ignore-requires-python "git+https://github.com/cta-observatory/dl1-data-handler.git@v0.14.12"
+
+Without it ``import triggerkit.models`` fails; the converters, ``triggerkit-merge``, the viewer core and ``StatsFile`` do not need it (checked by importing them without it).
+
+``pip`` works too (it ignores the lock, so the versions may differ): ``pip install -e .`` or ``pip install -e '.[qat]'``, then the ``dl1-data-handler`` line above.
+
+The commands ``triggerkit-convert``, ``triggerkit-merge`` and ``triggerkit-viewer`` are created when the package is installed. After an update
+that adds one, install again (``pip install -e .``), or run the module: ``python -m triggerkit.tools.convert``,
+``python -m triggerkit.tools.merge``, ``python -m triggerkit.viewer``.
+
+On a GPU machine, add the CUDA libraries of TensorFlow inside the environment: ``pip install "tensorflow[and-cuda]==2.20.0"``.
+
+.. code-block:: python
+
+   import triggerkit
+   from triggerkit.TriggerChain import TriggerChain
+
+Tests
+-----
+
+.. code-block:: bash
+
+   poetry run pytest      # several hundred tests, CPU only, several minutes (some spawn reader processes)
+
+Some tests need a data file and are skipped without it: ``TRIGGERKIT_TEST_SIMTEL=FILE.simtel.gz`` (a simulation),
+``TRIGGERKIT_TEST_FITS=FILE.fits.fz`` (a real file; needs protozfits), ``TRIGGERKIT_TEST_HDF5`` (a production HDF5 made from that simtel file).
+The window tests of the viewer (``tests/test_viewer_app.py``) need PyQt5 and pyqtgraph.
+
+Building this documentation
+---------------------------
+
+.. code-block:: bash
+
+   pip install -r docs/requirements.txt
+   sphinx-build -b html docs docs/_build/html

@@ -16,7 +16,10 @@ Design points agreed for the package refactor:
   did. ``nsb_roll_copies`` (fixed +1,+2,... duplicates) is also exposed.
 * ``targets``: ``"class"`` (the binary gamma/NSB label, mandatory) plus the
   auxiliary ``"true_image"`` and ``"peak_time"`` maps, which the streaming reader
-  emits on request. Any other target raises ``NotImplementedError``.
+  emits on request, and ``"true_signal"``: the noise-free signal ``(B, 432, T)`` in ADC per patch and sample (HDF5 files
+  converted with ``triggerkit-convert --true-signal``), cut to the window like the waveform and permuted with it by the
+  rotations and the NSB roll. A gamma with fewer than 9 p.e. has zeros, the NSB too. It is a feature of the batch, no
+  model reads it yet. Any other target raises ``NotImplementedError``.
 * ``gated_by``: cascade training -- keep only the events one or more frozen
   upstream chains fire on, so a downstream stage learns on what reaches it. The
   gates see the whole datacube (two streaming TDSCAN filters on the same data);
@@ -42,6 +45,7 @@ import numpy as np
 import tensorflow as tf
 
 from triggerkit.alignment import plan_sources
+from triggerkit.cascade import Full
 from triggerkit.camera import sst1m
 from triggerkit.data.simulation import PARTICLES, Simulation, Watch
 from triggerkit.FileIO.paths import normalize_files
@@ -57,6 +61,15 @@ DEFAULT_EVENT_FEATURE_KEYS = (
     "n_pe", "ev_time", "energy", "azimuth", "altitude",
     "h_first_int", "xmax", "xcore", "ycore",
 )
+
+
+def _cut_true_signal(out):
+    """The true signal comes on the whole datacube: bring it to the window of the waveform (same samples, from ``window_start``)."""
+    if "true_signal" not in out:
+        return
+    length = tf.shape(out["waveform"])[-1]
+    samples = out["window_start"][:, None] + tf.range(length, dtype=out["window_start"].dtype)[None, :]          # (B, L)
+    out["true_signal"] = tf.gather(out["true_signal"], samples, axis=2, batch_dims=1)
 
 
 class TriggerDataset:
@@ -108,7 +121,7 @@ class TriggerDataset:
         across folds (the set is small and label-0 only).
     targets : tuple of str
         Which targets the pipeline carries: ``"class"`` (mandatory), optionally
-        ``"true_image"`` / ``"peak_time"``. Other values raise ``NotImplementedError``.
+        ``"true_image"`` / ``"peak_time"`` / ``"true_signal"``. Other values raise ``NotImplementedError``.
     gated_by : TriggerChain, sequence of TriggerChain, or None
         Frozen upstream chain(s): only the events EVERY one of them fires on are
         kept, in both splits, after the NSB roll augmentation (so the gate sees the
@@ -306,7 +319,7 @@ class TriggerDataset:
 
     # ------------------------------------------------------------------ #
     #: Targets the streaming reader can emit today.
-    SUPPORTED_TARGETS = ("class", "true_image", "peak_time")
+    SUPPORTED_TARGETS = ("class", "true_image", "peak_time", "true_signal")
 
     def _validate_targets(self):
         if "class" not in self.targets:
@@ -395,6 +408,7 @@ class TriggerDataset:
             gamma_skip_if_missing_n_pe=True,
             emit_true_image=("true_image" in self.targets),
             emit_peak_time=("peak_time" in self.targets),
+            emit_true_signal=("true_signal" in self.targets),
             include_event_features=True,
             event_feature_keys=self.event_feature_keys,
             nsb_skip_original_events=False,
@@ -411,6 +425,17 @@ class TriggerDataset:
             ignore_errors=True,
         )
 
+    @staticmethod
+    def _check_true_signal(files):
+        """The shower files must hold the true signal table: a reader error would only skip the file (``ignore_errors``), silently."""
+        import h5py
+        for path in files:
+            if not str(path).endswith((".h5", ".hdf5")):
+                raise ValueError(f"{path!r}: the true signal is read from HDF5 files converted with `triggerkit-convert --true-signal`")
+            with h5py.File(path, "r") as f:
+                if "simulation/event/telescope/true_signal" not in f:
+                    raise ValueError(f"{path!r} has no simulation/event/telescope/true_signal: convert it again with `triggerkit-convert --true-signal`")
+
     def _dataset(self, gamma_files, *, training, extra_files=None):
         """Raw ``tf.data`` of ``(features, label)`` for a gamma-file subset.
 
@@ -418,11 +443,19 @@ class TriggerDataset:
         pedestal, event_id, tel_id, and the scalar event features). Packing to
         model inputs happens downstream.
         """
+        if "true_signal" in self.targets:
+            self._check_true_signal([*gamma_files, *(f for files in (extra_files or {}).values() for f in files)])
+        config = self._config(training=training)
+        # a window that does not depend on the event (no source aligned on a trigger) is cut by the reader, before the shuffle: its buffer then holds
+        # 50 samples of an event and not 82. The gates need the whole datacube, so with them the cut stays after.
+        static = self._plans is not None and not self.gated_by and not self._drops_events(self._plans)
+        if static:
+            config.crop = {PARTICLES[particle]: plan for particle, plan in self._plans.items()}
         ds = SimTelTFDataset(
             gamma_files=gamma_files,
             nsb_files=self.nsb_files,
             opener_cls=self.opener_cls,
-            config=self._config(training=training),
+            config=config,
             extra_files={PARTICLES[p]: files for p, files in (extra_files or {}).items() if files},
         ).dataset()
         if self.extra_types:
@@ -430,7 +463,7 @@ class TriggerDataset:
         if self.gated_by:
             ds = self._gate(ds)
         if self._plans is not None:
-            ds = self._align(ds, self._plans)
+            ds = self._full_batches(ds) if static else self._align(ds, self._plans)
         if self.extra_types:
             ds = self._binary_label(ds)
         else:
@@ -447,6 +480,10 @@ class TriggerDataset:
         Adds ``features["t_trig"]`` (the trigger sample, -1 when the source is not aligned) and ``features["window_start"]``.
         """
         names = label_names or {PARTICLES[p]: p for p in PARTICLES}
+        if not self._drops_events(plans) and self._tf_cut_possible(plans.values()):
+            # nothing is refused and the cut is the same arithmetic for every event: tensor operations, no Python function in the pipeline
+            cutter = self._tf_cutter({code: plans[name] for code, name in names.items() if name in plans})
+            return self._full_batches(ds.map(cutter))
 
         def apply(wf, ped, label):
             wf, ped, label = wf.numpy(), ped.numpy(), label.numpy().reshape(-1)
@@ -469,11 +506,91 @@ class TriggerDataset:
                                                        [tf.int64, features["waveform"].dtype, features["pedestal"].dtype, tf.int64, tf.int64])
             keep.set_shape([None]); trig.set_shape([None]); start.set_shape([None])
             wf.set_shape([None, 1, None, None]); ped.set_shape([None, None])
+            if not drops:
+                # every event passes (nothing is aligned on a trigger): ``keep`` is the identity, so no feature is copied by a gather
+                out = dict(features)
+                out["waveform"], out["pedestal"], out["t_trig"], out["window_start"] = wf, ped, trig, start
+                _cut_true_signal(out)
+                return out, label
             out = {key: tf.gather(value, keep) for key, value in features.items()}
             out["waveform"], out["pedestal"], out["t_trig"], out["window_start"] = wf, ped, trig, start
+            _cut_true_signal(out)
             return out, tf.gather(label, keep)
 
-        return (ds.map(align).unbatch().batch(self.batch_size, drop_remainder=True).prefetch(tf.data.AUTOTUNE))
+        drops = self._drops_events(plans)
+        ds = ds.map(align)
+        if drops:
+            # the number of survivors changes: re-batch to full batches
+            return ds.unbatch().batch(self.batch_size, drop_remainder=True).prefetch(tf.data.AUTOTUNE)
+        return self._full_batches(ds)
+
+    def _full_batches(self, ds):
+        """Only the batches of ``batch_size`` events, with that size static: the last one can be short, and XLA does not compile it."""
+        size = self.batch_size
+        ds = ds.filter(lambda features, label: tf.equal(tf.shape(label)[0], size))
+
+        def static_batch(features, label):
+            return ({key: tf.ensure_shape(value, [size] + value.shape[1:].as_list()) for key, value in features.items()},
+                    tf.ensure_shape(label, [size] + label.shape[1:].as_list()))
+
+        return ds.map(static_batch).prefetch(tf.data.AUTOTUNE)
+
+    @staticmethod
+    def _tf_cut_possible(plans):
+        """True when the cut can be written in tensor operations: every source has the same window length (or none cuts: ``Full``)."""
+        lengths = {None if isinstance(plan.window, Full) else int(plan.window.length) for plan in plans}
+        return len(lengths) == 1
+
+    @staticmethod
+    def _tf_cutter(plan_of_code, single=None):
+        """``map`` function that cuts a batch to the window of its sources (``{label code: SourcePlan}``, or one ``single`` plan for every row).
+
+        The arithmetic of :meth:`triggerkit.alignment.SourcePlan.static_cut`, on tensors: ``features["waveform"]`` ``(B, 1, P, T)`` -> ``(B, 1, P, L)``,
+        ``window_start`` and ``t_trig`` ``(B,)`` int64, the true signal cut with it. A window that leaves the datacube is an error.
+        """
+        some = single if single is not None else next(iter(plan_of_code.values()))
+        length = None if isinstance(some.window, Full) else int(some.window.length)
+
+        def start_and_trigger(plan, n_t):
+            if plan.mode == "given":
+                window = plan.window
+                start = tf.constant(plan.at - window.offset, tf.int64)
+                if window.clamp:
+                    start = tf.clip_by_value(start, tf.constant(0, tf.int64), n_t - window.length)
+                return start, tf.constant(plan.at, tf.int64)
+            if isinstance(plan.window, Full):
+                return tf.constant(0, tf.int64), tf.constant(-1, tf.int64)
+            return tf.constant(plan.window.start, tf.int64), tf.constant(-1, tf.int64)
+
+        def cut(features, label):
+            wf = features["waveform"]                                                  # (B, 1, P, T)
+            n_t = tf.cast(tf.shape(wf)[-1], tf.int64)
+            n_rows = tf.shape(wf)[0]
+            if single is not None:
+                start, trig = start_and_trigger(single, n_t)
+                start, trig = tf.fill([n_rows], start), tf.fill([n_rows], trig)
+            else:
+                pairs = [start_and_trigger(plan_of_code[code], n_t) if code in plan_of_code else (tf.constant(-1, tf.int64), tf.constant(-1, tf.int64))
+                         for code in range(len(PARTICLES))]
+                rows = tf.cast(tf.reshape(label, (-1,)), tf.int32)
+                start, trig = (tf.gather(tf.stack([pair[i] for pair in pairs]), rows) for i in (0, 1))
+            width = n_t if length is None else tf.constant(length, tf.int64)
+            inside = tf.logical_and(tf.reduce_all(start >= 0), tf.reduce_all(start + width <= n_t))
+            tf.debugging.Assert(inside, ["the window leaves the datacube (or a source has no plan): window starts", start, "datacube samples", n_t])
+            out = dict(features)
+            if length is not None:
+                samples = start[:, None] + tf.range(length, dtype=tf.int64)[None, :]
+                out["waveform"] = tf.gather(wf, samples, axis=3, batch_dims=1)
+            out["t_trig"], out["window_start"] = trig, start
+            _cut_true_signal(out)
+            return out, label
+
+        return cut
+
+    @staticmethod
+    def _drops_events(plans):
+        """True when a source is aligned on a trigger: the upstream chain can refuse an event, so the batches have to be rebuilt."""
+        return any(plan.mode == "on_the_fly" for plan in plans.values())
 
     def _rotate_gammas(self, ds):
         """Give each gamma of the batch a random one of the ``gamma_rotations``: the same pixel permutation of its waveform, pedestal and maps."""
@@ -485,9 +602,9 @@ class TriggerDataset:
             perm = tf.gather(table, choice)                                        # (B, P): out[p] = in[perm[p]], the fold plumbing's convention
             out = dict(features)
             out["waveform"] = tf.gather(features["waveform"], perm, axis=2, batch_dims=1)          # (B, 1, P, T)
-            for key in ("pedestal", "true_image", "peak_time"):
+            for key in ("pedestal", "true_image", "peak_time", "true_signal"):
                 if key in features:
-                    out[key] = tf.gather(features[key], perm, axis=1, batch_dims=1)                # (B, P)
+                    out[key] = tf.gather(features[key], perm, axis=1, batch_dims=1)                # (B, P), (B, P, T) for the true signal
             return out, label
 
         return ds.map(rotate, num_parallel_calls=tf.data.AUTOTUNE)
@@ -607,6 +724,9 @@ class TriggerDataset:
 
     def _align_watch(self, ds, plan):
         """A watched source brought to its window: cut / aligned like the training sources, the batches keep the events that pass."""
+        if plan.mode != "on_the_fly":                               # every event passes: the same cut in tensor operations
+            return ds.map(self._tf_cutter({}, single=plan))
+
         def apply(wf, ped):
             res = plan.apply(wf.numpy()[:, 0], ped.numpy())
             ok = res["passed"]
@@ -619,6 +739,7 @@ class TriggerDataset:
             wf.set_shape([None, 1, None, None]); ped.set_shape([None, None])
             out = {key: tf.gather(value, keep) for key, value in features.items()}
             out["waveform"], out["pedestal"], out["t_trig"], out["window_start"] = wf, ped, trig, start
+            _cut_true_signal(out)
             return out, tf.gather(label, keep)
 
         return ds.map(align)

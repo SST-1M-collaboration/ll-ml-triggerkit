@@ -19,8 +19,10 @@ except Exception:
 
 
 class FileOpenerCTAOHDF5:
-    def __init__(self, filepath):
+    def __init__(self, filepath, keep_true_signal=False, native_waveform=False):
         self.filepath = filepath
+        self.keep_true_signal = bool(keep_true_signal)
+        self.native_waveform = bool(native_waveform)
         self.i_readed_events = 0
         self._file = None
         self._iterator = None
@@ -119,6 +121,14 @@ class FileOpenerCTAOHDF5:
             # separate self._file was only ever used to close, so this fixes a
             # dangling-handle leak (self.src was never closed by _close()).
             self._file = self.src
+            # tables of the noise-free signal (triggerkit-convert --true-signal), only read on request. A telescope without
+            # one is allowed (the reader decides: zeros for the NSB, an error for a shower).
+            self.true_signal_tables = {}
+            if self.keep_true_signal:
+                for tel_name in self.lst_tel:
+                    path = f"simulation/event/telescope/true_signal/{tel_name}"
+                    if path in self.src:
+                        self.true_signal_tables[tel_name] = self.src[path]
             self.calib_tables = {}
             for tel_name in self.lst_tel:
                 try:
@@ -272,6 +282,7 @@ class FileOpenerCTAOHDF5:
                             f"simulation/event/telescope/images/{tel_name}"
                         ]
                         # n_pe is true_image_sum
+                        true_signal_group = self.true_signal_tables.get(tel_name)
                         if self.current_event_index[tel_idx] >= len(tel_group):
                             continue  # no more events in this telescope
 
@@ -283,16 +294,24 @@ class FileOpenerCTAOHDF5:
                             # only telescopes present in THIS event are listed.
                             tel_ids.append(tel_id)
                             # try to get the different waveforms
-                            if tel_group_r0 is not None:
-                                waveform_r0 = self._normalize_waveform_no_channel(
-                                    event["waveform"]
-                                ).astype(np.float32)  # (n_pix, n_samples)
-                                wf0_list.append(waveform_r0)
-                            if tel_group_r1 is not None:
-                                waveform_r1 = self._normalize_waveform_no_channel(
-                                    event["waveform"]
-                                ).astype(np.float32)  # (n_pix, n_samples)
-                                wf1_list.append(waveform_r1)
+                            if self.native_waveform:
+                                # as stored (uint8 for the R0alpha), and one array for R0 and R1: both come from the same record
+                                waveform_native = self._normalize_waveform_no_channel(event["waveform"])  # (n_pix, n_samples)
+                                if tel_group_r0 is not None:
+                                    wf0_list.append(waveform_native)
+                                if tel_group_r1 is not None:
+                                    wf1_list.append(waveform_native)
+                            else:
+                                if tel_group_r0 is not None:
+                                    waveform_r0 = self._normalize_waveform_no_channel(
+                                        event["waveform"]
+                                    ).astype(np.float32)  # (n_pix, n_samples)
+                                    wf0_list.append(waveform_r0)
+                                if tel_group_r1 is not None:
+                                    waveform_r1 = self._normalize_waveform_no_channel(
+                                        event["waveform"]
+                                    ).astype(np.float32)  # (n_pix, n_samples)
+                                    wf1_list.append(waveform_r1)
                             if tel_group_dl0 is not None:
                                 event_dl0 = tel_group_dl0[
                                     self.current_event_index[tel_idx]
@@ -379,6 +398,12 @@ class FileOpenerCTAOHDF5:
                                 "tel_pos_y": tel_pos_y,
                                 "tel_pos_z": tel_pos_z,
                             }
+
+                            if true_signal_group is not None:
+                                row = true_signal_group[self.current_event_index[tel_idx]]
+                                if int(row["event_id"]) != event_id:
+                                    raise RuntimeError(f"true_signal/event mismatch in {self.filepath!r}: row of event {int(row['event_id'])} where the r0 table has event {event_id}")
+                                stat_event["true_signal"] = np.asarray(row["true_signal"], dtype=np.float16)        # (432, T), ADC, before the FADC stage; float16 as stored: half the queue
 
                             event_stat_list.append(stat_event)
 

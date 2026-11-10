@@ -291,3 +291,28 @@ def test_a_shift_larger_than_the_margin_of_the_window_is_refused(aligned_setup, 
             upstream.compute_statistics(base_name="t", folder=str(tmp_path), overwrite=True, folds=folds, window=Fixed(16, 50))
     ok = make_rotation_folds(upstream.geom, [dict(spec, shower_time_shift=16, nsb_time_shift=-16)], {"m": plain_sim})
     upstream.compute_statistics(base_name="t", folder=str(tmp_path), batch_size=16, tel_id_only=1, overwrite=True, folds=ok, window=Fixed(16, 50))
+
+
+def read_events(setup, tmp_path, n_nsb_files):
+    """The (file, event_id) of the gammas and protons a run with a small budget reads, given ``n_nsb_files`` NSB files next to them."""
+    _, chain, d = setup
+    gamma = [write_ctapipe_h5(d / f"bg{i}.h5", n_events=20, seed=40 + i, run=(100, 10)) for i in range(8)]
+    proton = [write_ctapipe_h5(d / f"bp{i}.h5", n_events=20, seed=60 + i, run=(50, 20)) for i in range(8)]
+    nsb = [write_ctapipe_h5(d / f"bn{n_nsb_files}_{i}.h5", n_events=20, kind="nsb", seed=80 + i) for i in range(n_nsb_files)]
+    sim = Simulation(gamma=gamma, proton=proton, nsb=NsbSet(nsb, n_simulated=20 * n_nsb_files))
+    out = tmp_path / f"nsb{n_nsb_files}"
+    out.mkdir()
+    chain.compute_statistics(base_name="t", folder=str(out), batch_size=8, tel_id_only=1, overwrite=True, sim=sim,
+                             events={"gamma": 30, "proton": 30, "nsb": 20})
+    s = StatsFile(next(out.glob("t_*.h5")))
+    ev = s.events(["particle", "file", "event_id"])
+    return {name: {(s.files[f].split("/")[-1], int(i)) for f, i in zip(ev["file"][ev["particle"] == code], ev["event_id"][ev["particle"] == code])}
+            for code, name in ((1, "gamma"), (2, "proton"))}
+
+
+def test_the_events_read_of_a_type_do_not_depend_on_the_other_types_files(setup, tmp_path):
+    """A statistics run with a budget reads the same showers whatever NSB files are read beside them: chains compared in one report
+    (different NSB sets) must see the same events."""
+    few, many = read_events(setup, tmp_path, 1), read_events(setup, tmp_path, 7)
+    assert len(few["gamma"]) == 30 and len(few["proton"]) == 30
+    assert few == many

@@ -603,9 +603,35 @@ class StatPlotter:
                     return False
         return True
 
+    @staticmethod
+    def pinned_uuid(config: ConfigType) -> Optional[str]:
+        """The run a config is pinned to: a ``"uuid"`` parameter in any of its stages (a prefix of at least 8 characters is enough), else ``None``.
+
+        Chains do not tell runs apart (the CNNs of one study all end in the same threshold stage); the UUID of a stats file does. A pinned config
+        is looked up by it alone, the other parameters are only there for the legend.
+        """
+        for _stage, params in config:
+            if isinstance(params, dict) and params.get("uuid"):
+                return str(params["uuid"])
+        return None
+
     def get_results(self, to_find_config: ConfigType) -> Optional[Dict[str, Any]]:
         result_config = None
         matching_files: List[str] = []
+        pinned = self.pinned_uuid(to_find_config)
+        if pinned is not None:
+            if len(pinned) < 8:
+                raise ValueError(f"uuid {pinned!r}: give at least 8 characters.")
+            for filename, result in self.all_results:
+                if str(result.get("uuid", "")).startswith(pinned):
+                    matching_files.append(filename)
+                    if result_config is None:
+                        result_config = dict(result)
+                        result_config["trigger_chain"] = [(str(s), dict(p)) for s, p in result["trigger_chain"]]
+                        result_config["_filename"] = filename
+            if len(matching_files) > 1:
+                raise ValueError(f"uuid {pinned!r} matches {len(matching_files)} stats files ({matching_files}): give more characters.")
+            return result_config
         for filename, result in self.all_results:
             trigger_chain = result.get("trigger_chain") or result.get("trigger_chain", [])
             if trigger_chain is None:
@@ -640,6 +666,8 @@ class StatPlotter:
     ) -> bool:
         if result is self.base_config_result:
             return True
+        if result is None and chain is not None and self.pinned_uuid(chain) is not None:
+            return str(self.base_config_result.get("uuid", "")).startswith(self.pinned_uuid(chain))
         if result is not None:
             chain = result.get("trigger_chain")
         if not chain:

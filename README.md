@@ -4,9 +4,9 @@ Trainable low-level ML trigger chains for Cherenkov cameras (SST-1M / DigiCam).
 
 Distribution name: `ll-ml-triggerkit`. Import name: `triggerkit`.
 
-Python 3.12 or 3.13 (the hexagonal mapping of the camera comes from `dl1-data-handler`, which needs it).
+Python 3.10 to 3.13. The tests run on 3.10, 3.11 and 3.12 (`.github/workflows/tests.yml`).
 The environment is described by `pyproject.toml` (Poetry); `poetry.lock` pins the versions the quantized models and their
-hls4ml export were validated with (TensorFlow 2.20, Keras 3.12, HGQ2 0.1.9, hls4ml 1.3.0).
+hls4ml export were validated with (TensorFlow 2.20, Keras 3.12, HGQ2 0.1.9, hls4ml 1.3.0; ctapipe 0.32 on 3.12 and 3.13, 0.28 on 3.10 and 3.11).
 
 ```bash
 poetry install                    # core + tests (the exact locked versions)
@@ -15,7 +15,16 @@ poetry install -E hexcnn          # + hex CNN bodies only (keras-hexagdly)
 poetry install -E viewer          # + pyqtgraph, PyQt5, eventio: the simtel viewer (`triggerkit-viewer`)
 ```
 
-`pip` works too (it ignores the lock, so the versions may differ): `pip install -e .`, `pip install -e '.[qat]'`.
+**Then, on every Python version**, the hexagonal mapping of the camera (`dl1-data-handler`, not on PyPI beyond 0.14.6) is installed by hand. It declares Python >= 3.12,
+which Poetry cannot lock together with 3.10 and 3.11, but its code runs on them (the whole test suite passes on 3.10); its other requirements are already installed:
+
+```bash
+pip install --no-deps --ignore-requires-python "git+https://github.com/cta-observatory/dl1-data-handler.git@v0.14.12"      # inside the environment (poetry run pip ...)
+```
+
+Without it `import triggerkit.models` fails (`triggerkit.models.grid`); the converters, `triggerkit-merge`, the viewer core and `StatsFile` do not need it (checked by importing them without it).
+
+`pip` works too (it ignores the lock, so the versions may differ): `pip install -e .`, `pip install -e '.[qat]'`, then the `dl1-data-handler` line above.
 The commands `triggerkit-convert`, `triggerkit-merge` and `triggerkit-viewer` are created when the package is installed: after an update that adds one,
 install again (`pip install -e .`), or run the module (`python -m triggerkit.tools.convert`, `python -m triggerkit.tools.merge`, `python -m triggerkit.viewer`).
 On a GPU machine, add the CUDA libraries of TensorFlow: `pip install "tensorflow[and-cuda]==2.20.0"` inside the environment.
@@ -124,6 +133,9 @@ An option of the other kind of input is an error, not ignored.
   patch), `true_signal_fadc` (uint8, the same after the FADC stage: rounded, triplet sums, clipped 0-255), `pe_count` (uint8, the photoelectrons whose pulse starts in the sample), `offset`
   (samples), `in_adc` (False if the file has no `FADC_AMPLITUDE`: the signal is then in photoelectrons) and `has_signal` (False without a p.e. list). 3D targets (patch x sample) for training.
   A statistical equivalent of a noise-free sim_telarray run (single-p.e. draws seeded by event and telescope), validated on bright showers only, with no NSB.
+  In training: `TriggerDataset(..., targets=("class", "true_signal"))` adds `features["true_signal"]`, `(B, 432, T)` float32 ADC (the `true_signal` column), cut to the window like the
+  waveform and permuted with it by `gamma_rotations` and the NSB roll; zeros for the NSB and for a gamma without a p.e. list. A shower file converted without `--true-signal` is refused.
+  It is a feature of the batches only: no model reads it yet. `true_signal_fadc` is not offered.
 
 **Cost** (zlib, per event): `r0` alone about 15 kB (simulation) / 13 kB (real); `--stages` about +109 kB / +74 kB; `--true-signal` about +3 kB and 0.03 s, with its rows held in memory until the end of the file (about 140 kB per event, so about 600 MB for a proton file of 4100 events); `--stack-stages` makes `r0` and `r1`
 91 kB per event each instead of 15 (file: 185 kB per event, measured on 150 gammas). A real file of 11 982 events takes 21 s and 160 MB with `--no-emulated`.

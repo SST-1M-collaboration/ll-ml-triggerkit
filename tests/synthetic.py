@@ -14,12 +14,14 @@ N_PIX, N_SAMPLES = 432, 50
 
 def write_ctapipe_h5(path, *, n_events=20, tels=(1,), kind="gamma", seed=0,
                      tel_present=None, fill_with_tel_id=False, with_calibration=True,
-                     layout_tels=None, n_samples=N_SAMPLES, pulse_samples=(20, 25), run=None):
+                     layout_tels=None, n_samples=N_SAMPLES, pulse_samples=(20, 25), run=None, true_signal=False):
     """Write one file. ``tel_present(event_index) -> iterable of tel ids`` controls which
     telescopes saw each event (default: all of ``tels``). ``fill_with_tel_id`` makes every
     waveform sample equal to its telescope id, to check tel_id <-> waveform alignment.
     ``n_samples`` is the datacube length; gamma pulses sit on samples ``pulse_samples``
-    (start, stop). ``run=(n_showers, shower_reuse)`` writes the ``configuration/simulation/run`` table."""
+    (start, stop). ``run=(n_showers, shower_reuse)`` writes the ``configuration/simulation/run`` table.
+    ``true_signal`` writes ``simulation/event/telescope/true_signal/tel_NNN`` like ``triggerkit-convert --true-signal``: the
+    pulse of the gamma on its patches and samples (``40 + the event number`` ADC), zeros for the other kinds."""
     rng = np.random.default_rng(seed)
     pos = sst1m.patch_positions()
     tel_present = tel_present or (lambda i: tels)
@@ -57,6 +59,7 @@ def write_ctapipe_h5(path, *, n_events=20, tels=(1,), kind="gamma", seed=0,
             name = f"tel_{t:03d}"
             r0 = np.zeros(n, dtype=[("event_id", "i8"), ("waveform", "u2", (1, N_PIX, n_samples))])
             img = np.zeros(n, dtype=[("true_image", "f4", (N_PIX,)), ("true_image_sum", "f4")])
+            sig = np.zeros(n, dtype=[("event_id", "i8"), ("true_signal", "f2", (N_PIX, n_samples))])
             cal = np.zeros(n, dtype=[("event_id", "i8"),
                                      ("waveformcalibration_pedestal_per_sample", "f4", (1, N_PIX))])
             for row, ev in enumerate(events):
@@ -66,14 +69,18 @@ def write_ctapipe_h5(path, *, n_events=20, tels=(1,), kind="gamma", seed=0,
                     wf[centre - 15:centre + 15, pulse_samples[0]:pulse_samples[1]] += rng.uniform(40, 80)
                     img["true_image"][row, centre - 15:centre + 15] = 5.0
                     img["true_image_sum"][row] = 150.0
+                    sig["true_signal"][row, centre - 15:centre + 15, pulse_samples[0]:pulse_samples[1]] = 40 + ev
                 if fill_with_tel_id:
                     wf[:] = t
                 r0["event_id"][row] = ev
                 r0["waveform"][row, 0] = np.clip(wf, 0, 4095).astype(np.uint16)
                 cal["event_id"][row] = ev
+                sig["event_id"][row] = ev
                 cal["waveformcalibration_pedestal_per_sample"][row, 0] = 100.0
             f.require_group("r0/event/telescope")[name] = r0
             f.require_group("simulation/event/telescope/images")[name] = img
+            if true_signal:
+                f.require_group("simulation/event/telescope/true_signal")[name] = sig
             if with_calibration:
                 f.require_group("calibration/event/telescope")[name] = cal
     return str(path)

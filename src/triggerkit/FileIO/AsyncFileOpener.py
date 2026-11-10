@@ -99,14 +99,21 @@ class FileType(enum.Enum):
 
 
 class FileOpenerCTAO:
-    def __init__(self, filepath):
+    def __init__(self, filepath, keep_true_signal=False, native_waveform=False):
+        """``keep_true_signal``: also read ``simulation/event/telescope/true_signal`` (written by ``triggerkit-convert --true-signal``) into
+        ``stat["true_signal"]``, ``(432, T)``. HDF5 files only.
+
+        ``native_waveform``: HDF5 files only. Give the waveform in the type the file stores it (``uint8`` for the R0alpha) instead of ``float32``, and
+        the same array for R0 and R1 when both exist: a quarter of the memory and of what goes through the queue. The default keeps ``float32``."""
         filepath = os.fspath(filepath)            # accepts pathlib.Path too
         self.filepath = filepath
         self.file_type = self._detect_file_type(filepath)
+        if keep_true_signal and self.file_type != FileType.H5:
+            raise ValueError(f"{filepath!r}: the true signal is read from HDF5 files written with `triggerkit-convert --true-signal`, not from a simtel file.")
         if self.file_type == FileType.SIMTEL:
             self._impl = FileOpenerCTAOSimtel(filepath)
         elif self.file_type == FileType.H5:
-            self._impl = FileOpenerCTAOHDF5(filepath)
+            self._impl = FileOpenerCTAOHDF5(filepath, keep_true_signal=keep_true_signal, native_waveform=native_waveform)
         else:
             raise ValueError(
                 f"Unsupported file format: {filepath!r} (expected .simtel, .simtel.gz, .h5 or .hdf5).")
@@ -149,9 +156,12 @@ class FileOpenerCTAO:
 
 
 class AsyncFileOpenerProcess:
+    #: ``SimTelTFDataset`` passes ``native_waveform=True`` to the openers that say they take it (a test double does not)
+    accepts_native_waveform = True
+
     def __init__(self, filepath, max_queue_size=200,
                  waveform_level=None, keep_dl0=True, keep_dl1=True,
-                 keep_true_image=True, keep_peak_time=False):
+                 keep_true_image=True, keep_peak_time=False, keep_true_signal=False, native_waveform=False):
         """
         waveform_level / keep_dl0 / keep_dl1 / keep_true_image let a caller
         that only needs part of each event's payload tell the producer to
@@ -171,7 +181,7 @@ class AsyncFileOpenerProcess:
         self._proc = _SPAWN_CTX.Process(
             target=self._producer,
             args=(self.filepath, self._queue, waveform_level, keep_dl0,
-                  keep_dl1, keep_true_image, keep_peak_time),
+                  keep_dl1, keep_true_image, keep_peak_time, keep_true_signal, native_waveform),
             name="CTAO Async File Opener Process",
             daemon=True,
         )
@@ -181,10 +191,10 @@ class AsyncFileOpenerProcess:
 
     @staticmethod
     def _producer(filepath, q, waveform_level=None, keep_dl0=True,
-                  keep_dl1=True, keep_true_image=True, keep_peak_time=False):
+                  keep_dl1=True, keep_true_image=True, keep_peak_time=False, keep_true_signal=False, native_waveform=False):
         setproctitle("CTAO Async File Opener Process")
         try:
-            for item in FileOpenerCTAO(filepath):
+            for item in FileOpenerCTAO(filepath, keep_true_signal=keep_true_signal, native_waveform=native_waveform):
                 (tel_ids_list, wf_r0_list, wf_r1_list, dl0_list, dl1_list,
                  true_image_list, peak_time_list, pedestal_per_sample_list,
                  event_stat_list, i_event) = item

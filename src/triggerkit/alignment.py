@@ -152,16 +152,32 @@ class Aligner:
                 "wf": _crop(wf[passed], start[passed], self.length), "ped": ped[passed]}
 
 
-def crop_given(wf, ped, at, window: Window, datacube=None):
-    """A source that is already aligned (``align='given'``): cut ``[at - offset, at - offset + length)`` of every event."""
-    wf = np.asarray(wf)
-    n_t = wf.shape[2] if datacube is None else int(datacube)
+def given_cut(at, window: Window, n_t):
+    """``(start, length, t_trig)`` of a source that is already aligned (``align='given'``): ``[at - offset, at - offset + length)``."""
     start = at - window.offset
     if window.clamp:
         start = int(np.clip(start, 0, n_t - window.length))
     if start < 0 or start + window.length > n_t:
         raise ValueError(f"Window(length={window.length}, offset={window.offset}) around the trigger at sample {at} leaves the datacube "
                          f"(0..{n_t - 1}).")
+    return int(start), int(window.length), int(at)
+
+
+def fixed_cut(window, n_t):
+    """``(start, length, t_trig)`` of a source that is not aligned: the same samples for every event (``t_trig`` = -1)."""
+    if isinstance(window, Full):
+        return 0, int(n_t), -1
+    start = int(window.start)
+    if start < 0 or start + window.length > n_t:
+        raise ValueError(f"Fixed({window.start}, {window.length}) leaves the datacube (0..{n_t - 1}).")
+    return start, int(window.length), -1
+
+
+def crop_given(wf, ped, at, window: Window, datacube=None):
+    """A source that is already aligned (``align='given'``): cut ``[at - offset, at - offset + length)`` of every event."""
+    wf = np.asarray(wf)
+    n_t = wf.shape[2] if datacube is None else int(datacube)
+    start, length, _ = given_cut(at, window, n_t)
     n = wf.shape[0]
     starts = np.full(n, start, dtype=np.int64)
     return {"passed": np.ones(n, dtype=bool), "t_trig": np.full(n, at, dtype=np.int64), "start": starts,
@@ -175,9 +191,7 @@ def crop_fixed(wf, ped, window):
     if isinstance(window, Full):
         return {"passed": np.ones(n, dtype=bool), "t_trig": np.full(n, -1, dtype=np.int64), "start": np.zeros(n, dtype=np.int64),
                 "wf": wf, "ped": np.asarray(ped)}
-    start = int(window.start)
-    if start < 0 or start + window.length > wf.shape[2]:
-        raise ValueError(f"Fixed({window.start}, {window.length}) leaves the datacube (0..{wf.shape[2] - 1}).")
+    start, _, _ = fixed_cut(window, wf.shape[2])
     starts = np.full(n, start, dtype=np.int64)
     return {"passed": np.ones(n, dtype=bool), "t_trig": np.full(n, -1, dtype=np.int64), "start": starts,
             "wf": _crop(wf, starts, window.length), "ped": np.asarray(ped)}
@@ -188,6 +202,17 @@ class SourcePlan:
 
     def __init__(self, particle, mode, window, aligner=None, at=None):
         self.particle, self.mode, self.window, self.aligner, self.at = particle, mode, window, aligner, at
+
+    def static_cut(self, n_samples):
+        """``(start, length, t_trig)`` of a source that is not aligned on a trigger: the same cut for every event, known from the datacube length.
+
+        The cut :meth:`apply` makes, without the data: the reader can take it before the events are shuffled (a shorter event in the buffer).
+        """
+        if self.mode == "on_the_fly":
+            raise ValueError("a source aligned on the fly has no fixed cut: the upstream chain decides it, event by event")
+        if self.mode == "given":
+            return given_cut(self.at, self.window, n_samples)
+        return fixed_cut(self.window, n_samples)
 
     def apply(self, wf, ped):
         if self.mode == "on_the_fly":

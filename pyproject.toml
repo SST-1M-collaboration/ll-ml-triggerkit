@@ -8,12 +8,14 @@ readme = "README.md"
 packages = [{ include = "triggerkit", from = "src" }]
 
 [tool.poetry.dependencies]
-# 3.12: dl1-data-handler (hexagonal mapping of the whole camera) and recent ctapipe need it.
-python = ">=3.12,<3.14"
-numpy = ">=2.1"
+# 3.10 to 3.13. dl1-data-handler (hexagonal mapping of the whole camera) declares >= 3.12; on 3.10 and 3.11 it is installed by hand (see the README).
+python = ">=3.10,<3.14"
+# one range per Python: the lock then keeps the recent versions for 3.12 and 3.13 (the validated stack) and the older ones that 3.10 and 3.11 can take
+numpy = [{ version = ">=2.1", python = ">=3.12" }, { version = ">=2.1", python = "<3.12" }]
 scipy = "*"
 scikit-learn = "*"
 h5py = "*"
+tables = [{ version = ">=3.11", python = ">=3.11" }, { version = ">=3.8", python = "<3.11" }]
 hdf5plugin = "*"
 matplotlib = "*"
 astropy = "*"
@@ -21,10 +23,12 @@ setproctitle = "*"
 # The versions the quantized models and their hls4ml export were validated with (qat5-qat8, qat7 ring).
 tensorflow = "~2.20.0"
 keras = "~3.12.0"
-ctapipe = ">=0.29"
-# Hexagonal mapping of the camera (HexagdlyMapper): the one source of truth, also used by CTLearn.
-# Not on PyPI beyond 0.14.6; ctlearn 0.11 needs >= 0.14.12.
-dl1-data-handler = { git = "https://github.com/cta-observatory/dl1-data-handler.git", tag = "v0.14.12" }
+# 0.26 is the oldest checked; ctapipe >= 0.29 needs Python 3.12, so 3.10 and 3.11 get an older one
+ctapipe = [{ version = ">=0.29", python = ">=3.12" }, { version = ">=0.26", python = "<3.12" }]
+# Hexagonal mapping of the camera (HexagdlyMapper): dl1-data-handler, also used by CTLearn. It is NOT a dependency here: it declares Python >= 3.12, and Poetry
+# cannot lock a package whose own requirements (tables >= 3.11) fail on 3.10 even when the dependency is limited to 3.12. Install it after the package, on every
+# Python (see the README): pip install --no-deps --ignore-requires-python "git+https://github.com/cta-observatory/dl1-data-handler.git@v0.14.12"
+# (not on PyPI beyond 0.14.6; ctlearn 0.11 needs >= 0.14.12). Its other requirements are already dependencies of this package.
 # Optional, see [tool.poetry.extras]
 keras-hexagdly = { version = ">=0.7.0,<0.8", optional = true }
 hgq2 = { version = "0.1.9", optional = true }

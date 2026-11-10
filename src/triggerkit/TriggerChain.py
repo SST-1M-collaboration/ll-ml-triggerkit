@@ -1238,7 +1238,12 @@ class TriggerChain:
         sample_shuffle_buffer=10000,
         seed=1337,
         load_ram=False, # too much data to load in ram
-        interleave_files=True,
+        # The files are read in the order given, type after type, with no shuffle and no round-robin: the events a type's budget keeps are then the
+        # first ones of its own files, whatever the other types read beside it. With one shared shuffle and one random interleave over every
+        # type's files, the 200 000 gammas of a run depended on the NSB files of that run and two chains with different NSB sets could not be
+        # compared event by event. (Training keeps the shuffle: it wants mixed batches.)
+        shuffle_files=False,
+        interleave_files=False,
         waveform_level="r0",
         gamma_tel_id_only=tel_id_only,
         # Evaluate on everything

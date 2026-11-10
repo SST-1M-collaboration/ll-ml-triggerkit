@@ -106,6 +106,14 @@ class SimTelTFDatasetConfig:
     # inside an event is 0.5-3 samples on pixels above 5 pe but 13 (i.e. uniform
     # noise) if 1-pe pixels are included. Mask it against true_image downstream.
     emit_peak_time: bool = False
+    # Emit the noise-free signal of the event, (P, S) ADC per patch and sample, on the time axis of the waveform (HDF5 files converted with
+    # ``triggerkit-convert --true-signal``; ``simulation/event/telescope/true_signal``, the ``true_signal`` column, before the FADC stage).
+    # A gamma with fewer than 9 stored p.e. has no model signal: zeros. NSB events carry zeros; a shower whose file has no such table is an error.
+    emit_true_signal: bool = False
+    # ``{label: SourcePlan}``: cut every event to its window HERE, in the reader, before the shuffle (``SourcePlan.static_cut``): the shuffle buffer holds
+    # the window and not the whole datacube. Each sample then carries ``window_start`` and ``t_trig`` (int64) as the alignment stage would add them.
+    # Only for sources that are not aligned on a trigger (the cut does not depend on the event). ``None``: the events are left whole.
+    crop: Optional[Dict[int, Any]] = None
     include_event_features: bool = True
     # Emit ``file_index`` (int32), the position of the event's source file in ``SimTelTFDataset.file_list``
     # (gamma files, then NSB files, then the extra files by label). Off by default, like the truth maps.
@@ -227,6 +235,7 @@ class SimTelTFDataset:
                 padding_values=self._padding_values(),
                 drop_remainder=False
             )
+            ds = self._true_signal_to_float32(ds)
             ds = self._maybe_apply_nsb_roll(ds)
             return ds.prefetch(tf.data.AUTOTUNE)
 
@@ -274,9 +283,30 @@ class SimTelTFDataset:
             padding_values=self._padding_values(),
             drop_remainder=False
         )
+        ds = self._true_signal_to_float32(ds)
         ds = self._maybe_apply_nsb_roll(ds)
 
         return ds.prefetch(tf.data.AUTOTUNE)
+
+    def _true_signal_to_float32(self, ds: tf.data.Dataset) -> tf.data.Dataset:
+        """The true signal travels and is shuffled as float16 (what the file stores); the batches the models see are float32."""
+        if not self.cfg.emit_true_signal:
+            return ds
+
+        def to_float32(features, label):
+            return {**features, "true_signal": tf.cast(features["true_signal"], tf.float32)}, label
+
+        return ds.map(to_float32)
+
+    def _zeros_signal(self, shape) -> np.ndarray:
+        """The all-zero true signal of the NSB, one read-only array per shape (it was allocated again for every NSB event)."""
+        cache = self.__dict__.setdefault("_zeros_cache", {})
+        shape = tuple(shape)
+        if shape not in cache:
+            zeros = np.zeros(shape, dtype=np.float16)
+            zeros.flags.writeable = False
+            cache[shape] = zeros
+        return cache[shape]
 
     def _maybe_apply_nsb_roll(self, ds: tf.data.Dataset) -> tf.data.Dataset:
         """Give each NSB row a fresh, independent random pixel-index rotation.
@@ -301,28 +331,23 @@ class SimTelTFDataset:
             # One random shift per row; same shift applied to waveform and
             # pedestal so a pixel's ADC trace and its pedestal move together.
             shifts = rng.uniform((B,), minval=0, maxval=P, dtype=tf.int32)
-            roll_idx = tf.math.floormod(tf.range(P)[None, :] - shifts[:, None], P)  # (B, P)
-
-            wf_rolled = tf.gather(wf, roll_idx, axis=2, batch_dims=1)
-            ped_rolled = tf.gather(ped, roll_idx, batch_dims=1)
-
             is_nsb = tf.equal(label, 0)
-            wf_out = tf.where(is_nsb[:, None, None, None], wf_rolled, wf)
-            ped_out = tf.where(is_nsb[:, None], ped_rolled, ped)
+            # a gamma row gets the identity permutation: one gather per array does the job of "gather the rolled copy, then pick it with
+            # tf.where", which copied every array (the waveform and the maps) twice
+            roll_idx = tf.math.floormod(tf.range(P)[None, :] - shifts[:, None], P)  # (B, P)
+            roll_idx = tf.where(is_nsb[:, None], roll_idx, tf.range(P)[None, :])
 
             features = dict(features)
-            features["waveform"] = wf_out
-            features["pedestal"] = ped_out
+            features["waveform"] = tf.gather(wf, roll_idx, axis=2, batch_dims=1)
+            features["pedestal"] = tf.gather(ped, roll_idx, batch_dims=1)
 
             # Any per-pixel truth map must follow the same permutation, or it
             # desynchronises from the waveform. NSB carries an all-zero map so
             # this is numerically a no-op today, but it keeps the maps correct
             # if the roll is ever applied to gammas too.
-            for key in ("true_image", "peak_time"):
+            for key in ("true_image", "peak_time", "true_signal"):
                 if key in features:
-                    m = features[key]
-                    m_rolled = tf.gather(m, roll_idx, batch_dims=1)
-                    features[key] = tf.where(is_nsb[:, None], m_rolled, m)
+                    features[key] = tf.gather(features[key], roll_idx, batch_dims=1)       # axis 1 = pixels, also for the (B, P, S) true signal
             return features, label
 
         # Sequential on purpose: the seeded Generator is stateful, so parallel
@@ -554,6 +579,9 @@ class SimTelTFDataset:
         # it needs (one waveform level, never dl0/dl1/true_image -- see below),
         # so it's the only one that opts into AsyncFileOpenerProcess's payload
         # trimming; the other TriggerChain call sites keep the untrimmed default.
+        opener_kwargs = {"keep_true_signal": True} if self.cfg.emit_true_signal else {}      # only passed when asked: other opener_cls keep working
+        if getattr(self.opener_cls, "accepts_native_waveform", False):
+            opener_kwargs["native_waveform"] = True        # the waveform is cast to uint16 below: no need to send it as float32
         with self.opener_cls(
             simtel_file,
             waveform_level=self.cfg.waveform_level,
@@ -561,6 +589,7 @@ class SimTelTFDataset:
             keep_dl1=False,
             keep_true_image=bool(self.cfg.emit_true_image),
             keep_peak_time=bool(self.cfg.emit_peak_time),
+            **opener_kwargs,
         ) as fo:
             for (
                 tel_ids_list, wf_r0_list, wf_r1_list, dl0_list, dl1_list, true_image_list,
@@ -643,9 +672,36 @@ class SimTelTFDataset:
                         if pt_arr is None or pt_arr.shape != (n_pix,):
                             pt_arr = np.zeros(n_pix, dtype=np.float32)
 
+                    ts_arr = None
+                    if self.cfg.emit_true_signal:
+                        ts_arr = sd.get("true_signal")
+                        if ts_arr is None:
+                            if label != 0:
+                                raise FileReadError(f"{simtel_file!r}: no simulation/event/telescope/true_signal table for tel {tel_id_i}: convert the file with `triggerkit-convert --true-signal`")
+                            ts_arr = self._zeros_signal(x.shape[1:])          # NSB: no shower, zeros (one read-only array for all the events)
+                        # float16 as the file stores it: half the memory in the queue and in the shuffle buffer; the batch is float32 (see dataset())
+                        ts_arr = np.asarray(ts_arr, dtype=np.float16)
+                        if ts_arr.shape != x.shape[1:]:
+                            raise FileReadError(f"{simtel_file!r}: true signal {ts_arr.shape} against waveform {x.shape[1:]} (patches, samples)")
+
+                    cut = None
+                    if self.cfg.crop is not None:
+                        # the window of this source, taken before the shuffle (a shorter event in its buffer)
+                        plan = self.cfg.crop.get(int(label))
+                        try:
+                            cut = plan.static_cut(x.shape[2]) if plan is not None else (0, x.shape[2], -1)
+                        except ValueError as exc:
+                            raise FileReadError(f"{simtel_file!r}: {exc}") from exc
+                        start, length, _ = cut
+                        if length != x.shape[2]:
+                            x = np.ascontiguousarray(x[..., start:start + length])
+                            if ts_arr is not None:
+                                ts_arr = np.ascontiguousarray(ts_arr[:, start:start + length])
+
                     def make_features(wf_arr: np.ndarray, ped_vec: np.ndarray,
                                       ti_vec: np.ndarray = None,
-                                      pt_vec: np.ndarray = None) -> Dict[str, np.ndarray]:
+                                      pt_vec: np.ndarray = None,
+                                      ts_vec: np.ndarray = None) -> Dict[str, np.ndarray]:
                         features: Dict[str, np.ndarray] = {
                             "waveform": wf_arr,
                             "pedestal": ped_vec,
@@ -655,12 +711,17 @@ class SimTelTFDataset:
                         }
                         if self.cfg.emit_file_index:
                             features["file_index"] = np.array(self._file_index.get(simtel_file, -1), dtype=np.int32)
+                        if cut is not None:
+                            features["window_start"] = np.array(cut[0], dtype=np.int64)
+                            features["t_trig"] = np.array(cut[2], dtype=np.int64)
                         if self.cfg.emit_true_image:
                             features["true_image"] = (
                                 ti_arr if ti_vec is None else ti_vec)
                         if self.cfg.emit_peak_time:
                             features["peak_time"] = (
                                 pt_arr if pt_vec is None else pt_vec)
+                        if self.cfg.emit_true_signal:
+                            features["true_signal"] = ts_arr if ts_vec is None else ts_vec
                         if self.cfg.include_event_features:
                             for k in self.cfg.event_feature_keys:
                                 v = sd.get(k, -1.0)
@@ -683,7 +744,7 @@ class SimTelTFDataset:
                         ped_aug = ped_arr
                         # print(ped_aug.shape) # (1296,)
                         # print(wf_aug.shape)  # (1,1296,50) -> (batch, pixels, samples)
-                        ti_aug, pt_aug = ti_arr, pt_arr
+                        ti_aug, pt_aug, ts_aug = ti_arr, pt_arr, ts_arr
                         for i in range(n):
                             wf_aug = np.roll(wf_aug, shift=1, axis=int(self.cfg.nsb_roll_axis)).copy()
                             ped_aug = np.roll(ped_aug, shift=1, axis=0).copy()
@@ -694,8 +755,10 @@ class SimTelTFDataset:
                                 ti_aug = np.roll(ti_aug, shift=1, axis=0).copy()
                             if pt_aug is not None:
                                 pt_aug = np.roll(pt_aug, shift=1, axis=0).copy()
+                            if ts_aug is not None:
+                                ts_aug = np.roll(ts_aug, shift=1, axis=0).copy()
                             if self._consume_quota(label):
-                                yield make_features(wf_aug, ped_aug, ti_aug, pt_aug), y
+                                yield make_features(wf_aug, ped_aug, ti_aug, pt_aug, ts_aug), y
                             else:
                                 break
 
@@ -716,6 +779,11 @@ class SimTelTFDataset:
             feat["true_image"] = tf.TensorSpec(shape=(None,), dtype=tf.float32)
         if self.cfg.emit_peak_time:
             feat["peak_time"] = tf.TensorSpec(shape=(None,), dtype=tf.float32)
+        if self.cfg.emit_true_signal:
+            feat["true_signal"] = tf.TensorSpec(shape=(None, None), dtype=tf.float16)          # float32 once batched
+        if self.cfg.crop is not None:
+            feat["window_start"] = tf.TensorSpec(shape=(), dtype=tf.int64)
+            feat["t_trig"] = tf.TensorSpec(shape=(), dtype=tf.int64)
         if self.cfg.include_event_features:
             for k in self.cfg.event_feature_keys:
                 feat[k] = tf.TensorSpec(shape=(), dtype=tf.float32)
@@ -736,6 +804,11 @@ class SimTelTFDataset:
             feat_shapes["true_image"] = [None]
         if self.cfg.emit_peak_time:
             feat_shapes["peak_time"] = [None]
+        if self.cfg.emit_true_signal:
+            feat_shapes["true_signal"] = [None, None]
+        if self.cfg.crop is not None:
+            feat_shapes["window_start"] = []
+            feat_shapes["t_trig"] = []
         if self.cfg.include_event_features:
             for k in self.cfg.event_feature_keys:
                 feat_shapes[k] = []
@@ -755,6 +828,11 @@ class SimTelTFDataset:
             feat_vals["true_image"] = tf.constant(0.0, tf.float32)
         if self.cfg.emit_peak_time:
             feat_vals["peak_time"] = tf.constant(0.0, tf.float32)
+        if self.cfg.emit_true_signal:
+            feat_vals["true_signal"] = tf.constant(0.0, tf.float16)
+        if self.cfg.crop is not None:
+            feat_vals["window_start"] = tf.constant(-1, tf.int64)
+            feat_vals["t_trig"] = tf.constant(-1, tf.int64)
         if self.cfg.include_event_features:
             for k in self.cfg.event_feature_keys:
                 feat_vals[k] = tf.constant(0.0, tf.float32)

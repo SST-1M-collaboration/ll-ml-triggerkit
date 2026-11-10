@@ -348,3 +348,25 @@ def test_report_draws_the_particle_ratio_plots(tmp_path):
     for png in ("particle_ratio_vs_rate.png", "particle_ratio_vs_energy.png", "particle_ratio_vs_npe.png",
                 "ratio_efficiency_npe_proton.png", "ratio_efficiency_energy_muon.png"):
         assert (out / png).stat().st_size > 0
+
+
+def test_a_config_pinned_by_uuid_picks_its_run_among_runs_with_the_same_chain(tmp_path):
+    """The CNNs of a study end in the same threshold stage: the chain cannot tell their files apart, the UUID can."""
+    (tmp_path / "a").mkdir(), (tmp_path / "b").mkdir()
+    write_stats(tmp_path / "a" / "s.h5", seed=1)
+    write_stats(tmp_path / "b" / "s.h5", seed=2)
+    sp = StatPlotter(base_reference_config=CHAIN, stat_folder=[str(tmp_path / "a"), str(tmp_path / "b")])
+    uuids = [res["uuid"] for _name, res in sp.all_results]
+    assert len(set(uuids)) == 2
+    pinned = lambda uuid: [("threshold", {"threshold": 2.0, "binary": True, "comparison": "gt", "uuid": uuid})]
+    for uuid in uuids:
+        assert sp.get_results(pinned(uuid))["uuid"] == uuid
+        assert sp.get_results(pinned(uuid[:8]))["uuid"] == uuid                       # a prefix is enough
+    assert sp.get_results(pinned("0" * 32)) is None
+    with pytest.raises(ValueError, match="at least 8"):
+        sp.get_results(pinned("abc"))
+    # a pinned config can be the base: the other one is told apart from it
+    first, second = uuids
+    sp_pinned = StatPlotter(base_reference_config=pinned(first), stat_folder=[str(tmp_path / "a"), str(tmp_path / "b")])
+    assert sp_pinned.base_config_result["uuid"] == first
+    assert sp_pinned._is_base_config(chain=pinned(first)) and not sp_pinned._is_base_config(chain=pinned(second))

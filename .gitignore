@@ -15,3 +15,5 @@ trained_models/
 *.h5
 *.hdf5
 *_history.json
+docs/_build/
+docs/generated/
