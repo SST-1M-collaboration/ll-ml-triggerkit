@@ -4,9 +4,9 @@ Trainable low-level ML trigger chains for Cherenkov cameras (SST-1M / DigiCam).
 
 Distribution name: `ll-ml-triggerkit`. Import name: `triggerkit`.
 
-Python 3.10 to 3.13. The tests run on 3.10, 3.11 and 3.12 (`.github/workflows/tests.yml`).
+Python 3.12 or 3.13 (the hexagonal mapping of the camera comes from `dl1-data-handler`, which needs it). The tests run on 3.12 in CI (`.github/workflows/tests.yml`).
 The environment is described by `pyproject.toml` (Poetry); `poetry.lock` pins the versions the quantized models and their
-hls4ml export were validated with (TensorFlow 2.20, Keras 3.12, HGQ2 0.1.9, hls4ml 1.3.0; ctapipe 0.32 on 3.12 and 3.13, 0.28 on 3.10 and 3.11).
+hls4ml export were validated with (TensorFlow 2.20, Keras 3.12, HGQ2 0.1.9, hls4ml 1.3.0).
 
 ```bash
 poetry install                    # core + tests (the exact locked versions)
@@ -15,16 +15,7 @@ poetry install -E hexcnn          # + hex CNN bodies only (keras-hexagdly)
 poetry install -E viewer          # + pyqtgraph, PyQt5, eventio: the simtel viewer (`triggerkit-viewer`)
 ```
 
-**Then, on every Python version**, the hexagonal mapping of the camera (`dl1-data-handler`, not on PyPI beyond 0.14.6) is installed by hand. It declares Python >= 3.12,
-which Poetry cannot lock together with 3.10 and 3.11, but its code runs on them (the whole test suite passes on 3.10); its other requirements are already installed:
-
-```bash
-pip install --no-deps --ignore-requires-python "git+https://github.com/cta-observatory/dl1-data-handler.git@v0.14.12"      # inside the environment (poetry run pip ...)
-```
-
-Without it `import triggerkit.models` fails (`triggerkit.models.grid`); the converters, `triggerkit-merge`, the viewer core and `StatsFile` do not need it (checked by importing them without it).
-
-`pip` works too (it ignores the lock, so the versions may differ): `pip install -e .`, `pip install -e '.[qat]'`, then the `dl1-data-handler` line above.
+`pip` works too (it ignores the lock, so the versions may differ): `pip install -e .`, `pip install -e '.[qat]'`.
 The commands `triggerkit-convert`, `triggerkit-merge` and `triggerkit-viewer` are created when the package is installed: after an update that adds one,
 install again (`pip install -e .`), or run the module (`python -m triggerkit.tools.convert`, `python -m triggerkit.tools.merge`, `python -m triggerkit.viewer`).
 On a GPU machine, add the CUDA libraries of TensorFlow: `pip install "tensorflow[and-cuda]==2.20.0"` inside the environment.

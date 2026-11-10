@@ -1,9 +1,9 @@
 Installation
 ============
 
-Python 3.10 to 3.13. The tests run on 3.10, 3.11 and 3.12. The environment is described by ``pyproject.toml`` (Poetry). ``poetry.lock`` pins the
-versions the quantized models and their hls4ml export were validated with (TensorFlow 2.20, Keras 3.12, HGQ2 0.1.9, hls4ml 1.3.0; ctapipe 0.32 on
-3.12 and 3.13, 0.28 on 3.10 and 3.11).
+Python 3.12 or 3.13 is required: the hexagonal mapping of the camera comes from ``dl1-data-handler``, which needs it. The tests run on 3.12 in CI.
+The environment is described by ``pyproject.toml`` (Poetry). ``poetry.lock`` pins the versions the quantized models and their hls4ml export were
+validated with (TensorFlow 2.20, Keras 3.12, HGQ2 0.1.9, hls4ml 1.3.0).
 
 .. code-block:: bash
 
@@ -12,16 +12,7 @@ versions the quantized models and their hls4ml export were validated with (Tenso
    poetry install -E hexcnn          # + hex CNN bodies only (keras-hexagdly)
    poetry install -E viewer          # + pyqtgraph, PyQt5, eventio: the simtel viewer (triggerkit-viewer)
 
-Then, on every Python version, install the hexagonal mapping of the camera by hand. ``dl1-data-handler`` declares Python >= 3.12, which Poetry cannot
-lock together with 3.10 and 3.11, but its code runs on them; its other requirements are already installed:
-
-.. code-block:: bash
-
-   pip install --no-deps --ignore-requires-python "git+https://github.com/cta-observatory/dl1-data-handler.git@v0.14.12"
-
-Without it ``import triggerkit.models`` fails; the converters, ``triggerkit-merge``, the viewer core and ``StatsFile`` do not need it (checked by importing them without it).
-
-``pip`` works too (it ignores the lock, so the versions may differ): ``pip install -e .`` or ``pip install -e '.[qat]'``, then the ``dl1-data-handler`` line above.
+``pip`` works too (it ignores the lock, so the versions may differ): ``pip install -e .`` or ``pip install -e '.[qat]'``.
 
 The commands ``triggerkit-convert``, ``triggerkit-merge`` and ``triggerkit-viewer`` are created when the package is installed. After an update
 that adds one, install again (``pip install -e .``), or run the module: ``python -m triggerkit.tools.convert``,
