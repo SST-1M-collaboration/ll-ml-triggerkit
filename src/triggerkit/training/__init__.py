@@ -41,6 +41,13 @@ from triggerkit.training.npe_weighting import (
     eval_targets,
     zone_labels,
 )
+from triggerkit.training.signal_maps import (
+    BalancedMapBCE,
+    MapLogit,
+    map_target,
+    receptive_field_dilation,
+    signal_mask,
+)
 from triggerkit.training.weights import make_decreasing_ring_init, remap_weights
 
 __all__ = [
@@ -75,6 +82,12 @@ __all__ = [
     "bce_target_and_weight",
     "eval_targets",
     "zone_labels",
+    # maps of the true signal
+    "BalancedMapBCE",
+    "MapLogit",
+    "map_target",
+    "receptive_field_dilation",
+    "signal_mask",
     # weights
     "make_decreasing_ring_init",
     "remap_weights",

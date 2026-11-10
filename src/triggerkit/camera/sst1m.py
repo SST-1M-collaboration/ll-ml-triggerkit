@@ -4,7 +4,7 @@ camera_config.cfg (shipped next to this module, same file as in sst1mpipe,
 digicam and CTS) gives, for each of the 1296 pixels, its position, its patch
 (patch_sw_id) and the 7 patches of the patch7 cluster of that patch. All the
 tables used by the trigger stages are derived from it, in the same order as
-the ConfigFile_SST1M/*.csv files they replace:
+the ``ConfigFile_SST1M/*.csv`` files they replace:
 
 * pixel_positions():   (1296, 2) pixel positions, CSV units (cm, camera rotated by 90 deg)
 * patch_triplets():    (432, 3) pixels of each patch, increasing pixel id

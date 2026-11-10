@@ -17,6 +17,7 @@ It also converts sim_telarray simulations and real SST-1M data to HDF5, merges s
    conversion
    merge
    dataset
+   training
    statistics
    statistics_examples
    report

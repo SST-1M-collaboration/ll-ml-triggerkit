@@ -20,6 +20,10 @@ Design points agreed for the package refactor:
   converted with ``triggerkit-convert --true-signal``), cut to the window like the waveform and permuted with it by the
   rotations and the NSB roll. A gamma with fewer than 9 p.e. has zeros, the NSB too. It is a feature of the batch, no
   model reads it yet. Any other target raises ``NotImplementedError``.
+* ``window``: a window that does not depend on the event (``Fixed`` / ``Full``, or a ``Window`` around a trigger given with ``align="given"``) is cut by the
+  reader BEFORE the shuffle, so the shuffle buffer holds the window and not the whole datacube; the cut is the one of
+  :meth:`triggerkit.alignment.SourcePlan.static_cut`. A source aligned on the fly by an upstream chain, or ``gated_by``, cuts after the batches instead. In both
+  cases the batch carries ``features["window_start"]`` and ``features["t_trig"]``.
 * ``gated_by``: cascade training -- keep only the events one or more frozen
   upstream chains fire on, so a downstream stage learns on what reaches it. The
   gates see the whole datacube (two streaming TDSCAN filters on the same data);

@@ -4,6 +4,8 @@ An event has a type. The trigger studies compare four: the night-sky background 
 ``Simulation`` gathers the files of each type, with the numbers the statistics need (how many showers were SIMULATED, not
 only how many were written) and, for a NSB, how it is aligned in time.
 
+::
+
     sim = Simulation(
         gamma=".../gammas/*.hdf5", proton=".../protons/*.hdf5", muon=".../muons/*.hdf5",
         nsb=NsbSet(".../tdscan_50khz/*.hdf5", align="given", at=22, n_simulated=12_500_000),
@@ -12,14 +14,14 @@ only how many were written) and, for a NSB, how it is aligned in time.
 Every file argument is a path, a glob pattern or a list of those. ``TriggerDataset`` takes a ``Simulation`` in place of its two file lists
 (the lists still work: they build a ``Simulation`` with ``gamma`` and ``nsb`` only).
 
-Alignment, per source (what the data already are, see ``docs/refonte_82_bins.md``):
+Alignment, per source (what the data already are):
 
 * ``"none"``       : nothing is aligned (a TDSCAN is trained on the whole datacube);
 * ``"given"``      : already aligned in the file, the trigger sits at sample ``at`` (a NSB produced with the TDSCAN inside sim_telarray);
 * ``"on_the_fly"`` : aligned by an upstream stage when the data are read (gammas, protons, muons given to a chain after a TDSCAN);
 * ``None``         : decided when the dataset is built (``on_the_fly`` if an upstream stage is given, else ``none``).
 
-The alignment itself is applied by ``TriggerDataset`` (a later step of the plan); this module only describes it and checks it is coherent.
+The alignment itself is applied by ``TriggerDataset``; this module only describes it and checks it is coherent.
 """
 import glob
 import os

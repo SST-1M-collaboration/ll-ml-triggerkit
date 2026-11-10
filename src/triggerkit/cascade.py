@@ -89,7 +89,7 @@ class Full:
 
 @dataclass(frozen=True)
 class Fixed:
-    """Samples ``start .. start + length - 1`` of the datacube, for every event."""
+    """The same ``length`` samples of the datacube for every event, from sample ``start`` to ``start + length - 1``."""
     start: int
     length: int
 
