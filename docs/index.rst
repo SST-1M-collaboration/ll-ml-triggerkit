@@ -8,8 +8,6 @@ Welcome to ll-ml-triggerkit's documentation!
 (DigiCam camera): the FADC, the patch7 sum, the TDSCAN, and trainable models (hexagonal CNNs, quantized for the FPGA) that replace or follow them.
 It also converts sim_telarray simulations and real SST-1M data to HDF5, merges simulated gammas into real noise, and shows the events in a viewer.
 
-The repository is ``ll-ml-triggerkit`` is the library; the studies built on it live in the research repository ``digicam-tdscan-triggering``.
-
 .. toctree::
    :maxdepth: 2
    :caption: Contents
@@ -20,5 +18,8 @@ The repository is ``ll-ml-triggerkit`` is the library; the studies built on it l
    merge
    dataset
    statistics
+   statistics_examples
+   report
+   statistics_checks
    viewer
    api

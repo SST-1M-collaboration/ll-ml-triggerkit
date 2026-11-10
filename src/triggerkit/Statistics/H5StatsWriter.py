@@ -187,7 +187,8 @@ class H5StatsWriter:
         cols = {k: np.asarray(v) for k, v in cols.items()}
         cols["particle"] = cols["particle"].astype(np.uint8)
         if "file" in cols:
-            cols["file"] = np.where(cols["file"] < 0, NO_FILE, cols["file"]).astype(np.uint16)
+            file = cols["file"].astype(np.int64)         # wide enough for NO_FILE whatever the caller's dtype: NumPy 2.5 refuses 65535 beside an int16 array
+            cols["file"] = np.where(file < 0, NO_FILE, file).astype(np.uint16)
         if "condition" in cols:
             cols["condition"] = cols["condition"].astype(np.uint8)
         start = self.n_events
