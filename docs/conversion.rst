@@ -137,7 +137,7 @@ Per event, zlib: ``r0alpha`` alone about 15 kB (simulation) / 13 kB (real); ``--
 Environments
 ------------
 
-* Simulation: ctapipe >= 0.26 (checked on 0.26 and 0.32, the same output), eventio, and scipy for ``--true-signal``.
+* Simulation: ctapipe >= 0.26 and < 0.33 (checked on 0.26 and 0.32, the same output; ctapipe 0.33 reorganised its containers and the converter has not been ported to it), eventio, and scipy for ``--true-signal``.
 * Real data: only protozfits, pytables and numpy (no ctapipe, no sst1mpipe): the sst1mpipe 0.9.0 environment is enough, ``triggerkit`` must
   be importable. That environment is Python 3.10 and the package needs 3.12, so it cannot be installed there: use ``PYTHONPATH=.../ll-ml-triggerkit/src python -m triggerkit.tools.convert ...``.
 * The files written by ctapipe (``r0alpha``, ``r1``, ``dl1`` of a simulation) are compressed with blosc: a plain ``h5py`` needs ``import hdf5plugin`` to read them; the tables written by this package (the raw ``r0``, the stages, the merge tables) are zlib.

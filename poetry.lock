@@ -3848,4 +3848,4 @@ viewer = ["PyQt5", "pyqtgraph"]
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.12,<3.14"
-content-hash = "1f7ad3c22bb139f3b8fc2b85643265653d1379362d7b67b11c0eb1dae380df4f"
+content-hash = "7058d7a1187318364086f1eb09b52b59ccbdf95dd81ef1c42fa90523cfa3f77b"

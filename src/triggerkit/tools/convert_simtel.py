@@ -55,7 +55,11 @@ from copy import deepcopy
 
 import astropy.units as u
 import numpy as np
-from ctapipe.containers import DL1CameraContainer, R1CameraContainer
+try:
+    from ctapipe.containers import DL1CameraContainer, R1CameraContainer
+except ImportError as error:                                  # ctapipe 0.33 renamed its containers (TelescopeDL1Container, TelescopeR1Container, ...)
+    raise ImportError("the simulation converter needs ctapipe >= 0.26 and < 0.33 (checked on 0.26 and 0.32): ctapipe 0.33 reorganised its containers and this converter has not been ported to it; "
+                      "install ctapipe<0.33") from error
 from ctapipe.instrument import CameraDescription, CameraGeometry, CameraReadout
 from ctapipe.io import DataWriter, EventSource
 

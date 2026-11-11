@@ -24,7 +24,8 @@ setproctitle = "*"
 # The versions the quantized models and their hls4ml export were validated with (qat5-qat8, qat7 ring).
 tensorflow = "~2.20.0"
 keras = "~3.12.0"
-ctapipe = ">=0.29"
+# < 0.33: ctapipe 0.33 reorganised its containers (DL1CameraContainer, R1CameraContainer and event.r0.tel[...] are gone): the simulation converter is written for 0.26 to 0.32 and has not been ported.
+ctapipe = ">=0.29,<0.33"
 # Hexagonal mapping of the camera (HexagdlyMapper): the one source of truth, also used by CTLearn.
 # Not on PyPI beyond 0.14.6; ctlearn 0.11 needs >= 0.14.12.
 dl1-data-handler = { git = "https://github.com/cta-observatory/dl1-data-handler.git", tag = "v0.14.12" }

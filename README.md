@@ -136,7 +136,7 @@ An option of the other kind of input is an error, not ignored.
 **Cost** (zlib, per event): `r0` alone about 15 kB (simulation) / 13 kB (real); `--stages` about +109 kB / +74 kB; `--waveform r0` about 78 kB (real) / 119 kB (simulation); `--true-signal` about +2 kB and 0.03 s, its rows streamed to a temporary file; `--stack-stages` makes `r0` and `r1`
 91 kB per event each instead of 15 (file: 185 kB per event, measured on 150 gammas). A real file of 11 982 events takes 21 s and 160 MB with `--no-emulated`.
 
-**Environments**: simulation: ctapipe >= 0.26 (checked on 0.26 and 0.32, the same output), eventio, and scipy for `--true-signal`. Real data: only protozfits, pytables and numpy (no ctapipe,
+**Environments**: simulation: ctapipe >= 0.26 and < 0.33 (checked on 0.26 and 0.32, the same output; ctapipe 0.33 reorganised its containers and the converter has not been ported), eventio, and scipy for `--true-signal`. Real data: only protozfits, pytables and numpy (no ctapipe,
 no sst1mpipe): the sst1mpipe 0.9.0 environment is enough, `triggerkit` must be importable. A truncated compressed simtel file is refused (gz, bz2, xz), it would otherwise be read to its
 end without an error.
 
