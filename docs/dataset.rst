@@ -41,7 +41,8 @@ Targets
 ``"peak_time"``
    the argmax of the noisy waveform;
 ``"true_signal"``
-   the noise-free signal ``(B, 432, T)`` in ADC per patch and sample. It needs HDF5 files converted with
+   the noise-free signal ``(B, 432, T)`` in ADC per patch and sample (the ``true_signal_r0_alpha`` column: the sum of the 3 pixels of each patch, each rounded to an integer ADC). It
+   needs HDF5 files converted with
    ``triggerkit-convert --true-signal`` (:doc:`conversion`) and is cut to the window like the waveform and permuted with it by the rotations and
    the NSB roll. A gamma with fewer than 9 p.e. has zeros, and so has the NSB. A shower file converted without ``--true-signal`` is refused at
    once. It is a feature of the batches only: no model reads it unless the training script uses it.
@@ -58,6 +59,14 @@ never weighted. The "zone" of the metrics (for instance the zone AUC) is the gam
 
 .. note::
    The AUC depends strongly on how bright the gammas are: compare definitions (all gammas against the zone) before comparing numbers.
+
+The NSB is not split between training and validation
+-----------------------------------------------------
+
+``TriggerDataset`` splits the gamma files (and the extra types) between training and validation, but the NSB files are **shared**. ``max_nsb_samples_train`` and
+``max_nsb_samples_val`` both read the first events of the same files, so the NSB events of the validation are all among the training ones: 30 of 30 with caps, 100 of 100
+without (checked on synthetic files). Only the random roll of the NSB rows differs between the two. A validation metric that depends on the NSB (AUC, efficiency at a fraction of
+the NSB) is therefore not independent of the training on that side; for a small model (the 10 weights of a TDSCAN) the effect is small, for a CNN it can be large.
 
 Other knobs
 -----------

@@ -10,13 +10,17 @@ validated with (TensorFlow 2.20, Keras 3.12, HGQ2 0.1.9, hls4ml 1.3.0).
    poetry install                    # core + tests (the exact locked versions)
    poetry install -E qat             # + keras-hexagdly, HGQ2 and hls4ml (fully quantized models and their export)
    poetry install -E hexcnn          # + hex CNN bodies only (keras-hexagdly)
-   poetry install -E viewer          # + pyqtgraph, PyQt5, eventio: the simtel viewer (triggerkit-viewer)
+   poetry install -E viewer          # + pyqtgraph, PyQt5: the simtel viewer (triggerkit-viewer)
+   poetry install -E real            # + protozfits: real SST-1M files (*.fits.fz), the real-data converter and triggerkit-merge
 
 ``pip`` works too (it ignores the lock, so the versions may differ): ``pip install -e .`` or ``pip install -e '.[qat]'``.
 
 The commands ``triggerkit-convert``, ``triggerkit-merge`` and ``triggerkit-viewer`` are created when the package is installed. After an update
 that adds one, install again (``pip install -e .``), or run the module: ``python -m triggerkit.tools.convert``,
 ``python -m triggerkit.tools.merge``, ``python -m triggerkit.viewer``.
+
+The converters and ``triggerkit-merge`` also run in the sst1mpipe 0.9.0 environment (Python 3.10, no TensorFlow), where the package CANNOT be installed (it requires Python 3.12): there, put the source on the path and run the module, ``PYTHONPATH=/path/to/ll-ml-triggerkit/src python -m triggerkit.tools.convert ...`` and ``python -m triggerkit.tools.merge ...``.
+The ``triggerkit-*`` commands of this documentation are those, typed with the package installed.
 
 On a GPU machine, add the CUDA libraries of TensorFlow inside the environment: ``pip install "tensorflow[and-cuda]==2.20.0"``.
 

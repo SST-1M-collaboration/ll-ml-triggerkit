@@ -5,6 +5,7 @@ import pytest
 tf = pytest.importorskip("tensorflow")
 
 from synthetic import N_PIX, write_ctapipe_h5
+from triggerkit.camera import sst1m
 from triggerkit.FileIO.AsyncFileOpener import FileOpenerCTAO
 from triggerkit.cascade import Fixed
 from triggerkit.data import NsbSet, Simulation, TriggerDataset
@@ -41,6 +42,19 @@ def test_the_opener_reads_the_table_only_when_asked(files):
     with FileOpenerCTAO(gamma, keep_true_signal=True) as fo:
         stat = next(iter(fo))[8][0]
     assert stat["true_signal"].shape == (N_PIX, 50) and stat["true_signal"].dtype == np.float16      # as the file stores it
+
+
+def test_the_opener_gives_the_pixel_signal_only_when_asked(files):
+    gamma = files[0][0]
+    with FileOpenerCTAO(gamma, keep_true_signal=True) as fo:
+        assert "true_signal_r0" not in next(iter(fo))[8][0]
+    with FileOpenerCTAO(gamma, keep_true_signal_r0=True) as fo:
+        stat = next(iter(fo))[8][0]
+    assert stat["true_signal_r0"].shape == (sst1m.N_PIXELS, 50) and stat["true_signal_r0"].dtype == np.int16 and "true_signal" not in stat
+    with FileOpenerCTAO(gamma, keep_true_signal=True, keep_true_signal_r0=True) as fo:
+        both = next(iter(fo))[8][0]
+    assert {"true_signal", "true_signal_r0"} <= set(both)
+    np.testing.assert_array_equal(both["true_signal_r0"][sst1m.patch_triplets()].sum(axis=1), both["true_signal"].astype(np.int16))      # the patch signal is the sum of the pixels'
 
 
 def test_a_simtel_file_is_refused():

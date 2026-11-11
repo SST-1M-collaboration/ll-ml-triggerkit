@@ -12,7 +12,8 @@ hls4ml export were validated with (TensorFlow 2.20, Keras 3.12, HGQ2 0.1.9, hls4
 poetry install                    # core + tests (the exact locked versions)
 poetry install -E qat             # + keras-hexagdly, HGQ2 and hls4ml (fully quantized models and their export)
 poetry install -E hexcnn          # + hex CNN bodies only (keras-hexagdly)
-poetry install -E viewer          # + pyqtgraph, PyQt5, eventio: the simtel viewer (`triggerkit-viewer`)
+poetry install -E viewer          # + pyqtgraph, PyQt5: the simtel viewer (`triggerkit-viewer`)
+poetry install -E real            # + protozfits: real SST-1M files (*.fits.fz), the real-data converter and `triggerkit-merge`
 ```
 
 `pip` works too (it ignores the lock, so the versions may differ): `pip install -e .`, `pip install -e '.[qat]'`.
@@ -73,15 +74,15 @@ triggerkit-convert --to-process-file FILE --output-hdf5-file OUT.hdf5 [options] 
 triggerkit-convert --help                                                              # what is written, the cost per event, the environments, examples
 ```
 
-**The usual conversion for our use** (a simulation, the R0alpha only: no `beta` or `gamma`, no raw 1296-pixel r0, which is never saved):
+**The usual conversion for our use** (a simulation, the R0alpha only: no `beta` or `gamma`, no raw 1296-pixel `r0`, which `--waveform r0` would add):
 
 ```bash
 triggerkit-convert --to-process-file gamma_200_..._200000.simtel.gz --output-hdf5-file gamma_200000.hdf5
 ```
 
-No option is needed. The file holds `r0` and `r1` = the FADC output (alpha, 432 patches x 82 samples, uint8), `dl1`, the shower truth and the true image per patch, for the events the
-telescope triggered on. Mind that `r1` is an exact copy of `r0`: on 150 gammas the file takes 33.4 kB per event, 15.4 kB for `r0` and 15.5 kB for `r1`, so `r1` doubles the size for nothing
-for our use; there is no option to leave it out yet (the loader reads `r0` first and only falls back on `r1` when there is no `r0`).
+No option is needed. The file holds `r0alpha` and `r1` = the FADC output (alpha, 432 patches x 82 samples, uint8), `dl1`, the shower truth and the true image per patch, for the events the
+telescope triggered on. Mind that `r1` is an exact copy of `r0alpha`: on 150 gammas the file takes 33.4 kB per event, 15.4 kB for the alpha and 15.5 kB for `r1`, so `r1` doubles the size for nothing
+for our use; there is no option to leave it out yet (the loader reads `r0alpha` first, else the FADC of `r0`, and only falls back on `r1` when there is neither).
 
 **With `beta` and `gamma` stacked, for a reader that expects `np.stack([r0_alpha, r0_beta, r0_gamma])`** (the layout of the first conversion scripts):
 
@@ -90,7 +91,7 @@ triggerkit-convert --to-process-file gamma_200_..._200000.simtel.gz --output-hdf
 ```
 
 `r0` and `r1` are then `(3, 432, 82)` int16: channel 0 alpha, channel 1 beta (the patch7 sums), channel 2 gamma (the TDSCAN score x 128), both before any threshold. They need 16 bits (beta goes up
-to 1785, gamma can be negative). The triggerkit loader reads channel 0, so these files can be used like the others. It is the biggest layout: on 150 gammas `r0` and `r1` take 91 kB per event each
+to 1785, gamma can be negative). The table keeps the name `r0` (no `r0alpha`): the triggerkit loader does not read such a file, it is for the readers of `np.stack`. It is the biggest layout: on 150 gammas `r0` and `r1` take 91 kB per event each
 (15 kB without the option) and the file 185 kB per event (33 kB). To keep `r0` and `r1` as they are and add beta and gamma beside them, use `--stages` instead (about 140 kB per event).
 
 | Option | Input | What it does |
@@ -99,18 +100,20 @@ to 1785, gamma can be negative). The triggerkit loader reads channel 0, so these
 | `--output-hdf5-file FILE.hdf5` | both | the file to write (overwritten). It is written as `FILE.hdf5.partial` and renamed when the conversion is finished: a failing conversion leaves nothing under the final name |
 | `--max-events N` | both | stop after N written events (testing) |
 | `--kind auto\|simtel\|real` | both | force the kind of input (default `auto`) |
+| `--waveform r0alpha\|r0\|both` | both | which waveform to write: `r0alpha` (default), the FADC output, 432 patches (real data: the traces recorded by the FPGA); `r0`, the RAW 1296 pixels with their `pedestal` (real data: also `pixels_flags`); or both. **The name says what the table holds**; an `r0` of 432 patches (older files) is refused by the loader |
 | `--stages` | both | also write the table `r0_stages` with `alpha`, `beta`, `gamma`, the last two BEFORE any threshold (below) |
-| `--stack-stages` (or `--stack_stages`) | both | write `r0` (and `r1` for a simulation) as `np.stack([alpha, beta, gamma])`, shape `(3, 432, T)`, int16, for a reader that expects the stack of the first conversion scripts |
+| `--stack-stages` (or `--stack_stages`) | both | write `r0` (and `r1` for a simulation) as `np.stack([alpha, beta, gamma])`, shape `(3, 432, T)`, int16, for a reader that expects `np.stack` (the table keeps the name `r0`, needs `--waveform r0alpha`, and is not read by this package's loader) |
 | `--photoelectron-times` | simulation | also write the number of shower photoelectrons and their mean arrival per patch (table `pe_arrival`) |
-| `--true-signal` | simulation | also write `true_signal`, `true_signal_fadc` and `pe_count` per patch and sample (table `true_signal`) |
+| `--true-signal` | simulation | also write the noise-free signal: `true_signal_r0` (per pixel), `true_signal_r0_alpha`, `true_signal_fadc` and `pe_count` (per patch) per sample (table `true_signal`) |
+| `--pedestal-only` | real | convert only the pedestal events (event_type bit 0x8: random triggers, real NSB), skip the others: the real noise of `RealNoise` without the rest of the night (about 70 MB instead of 940 MB with `--waveform r0`) |
 | `--no-emulated` | real | do not write our FADC computed from the raw pixels (halves the file) |
 
 An option of the other kind of input is an error, not ignored.
 
 **What a file contains without any option**
-* *Simulation*: `r0` and `r1` = the FADC output of the trigger (`alpha`), 432 patches x T samples, uint8 (T = 82 in the production); `dl1` image and `peak_time` (the argmax of the
+* *Simulation*: `r0alpha` and `r1` = the FADC output of the trigger (`alpha`), 432 patches x T samples, uint8 (T = 82 in the production); `dl1` image and `peak_time` (the argmax of the
   noisy waveform, not a true arrival time); `simulation/` shower truth and the true image compressed to the 432 patches. Only the events the telescope triggered on.
-* *Real data*: `r0` = the trigger input traces recorded by the FPGA, 432 x 50 uint8, in the patch order of the simulation files; `real/event/telescope/tel_001` (event id, `event_type`,
+* *Real data*: `r0alpha` = the trigger input traces recorded by the FPGA, 432 x 50 uint8, in the patch order of the simulation files; `real/event/telescope/tel_001` (event id, `event_type`,
   time, run, telescope, `patch7_fired`, `tdscan_fired`); `real/event/emulated_traces/tel_001` (our FADC from the raw pixels and the recorded baselines); placeholders for what the loader
   requires (shower truth -1, true image 0), so the loader reads such a file as noise (label 0). Telescopes 21 and 22 only; swapped modules of some periods are not corrected.
 
@@ -120,15 +123,17 @@ An option of the other kind of input is an error, not ignored.
   fit 8 bits (beta up to 1785, gamma can be negative), which is why they are not the 8-bit channels of the first scripts. For real data they are computed offline from the recorded traces.
 * `--photoelectron-times` -> `simulation/event/telescope/pe_arrival/tel_001`: per patch `n_pe` and `arrival` in samples relative to `readout_time`, without the constant of the production.
   Only events with at least 9 p.e. have a list.
-* `--true-signal` -> `simulation/event/telescope/true_signal/tel_001`, on the time axis of the waveform: `true_signal` (float16, ADC: the noise-free signal, sum of the 3 pixels of each
-  patch), `true_signal_fadc` (uint8, the same after the FADC stage: rounded, triplet sums, clipped 0-255), `pe_count` (uint8, the photoelectrons whose pulse starts in the sample), `offset`
+* `--waveform r0|both` -> `r0/event/telescope/tel_001`: `waveform` (1296, T) uint16, the raw ADC of the pixels, and `pedestal` (1296,) float32, what the FADC subtracts (`triplet_sums(waveform, pedestal)` is the alpha); real data also
+  `pixels_flags`. About 78 kB per real event, 119 kB per simulated one.
+* `--true-signal` -> `simulation/event/telescope/true_signal/tel_001`, on the time axis of the waveform: `true_signal_r0` (int16, 1296 x T: the noise-free signal of each pixel in integer ADC), `true_signal_r0_alpha`
+  (int16, 432 x T: the sum of the 3 rounded pixels of each patch, before the clip), `true_signal_fadc` (uint8, the same after the FADC stage: clipped 0-255), `pe_count` (uint8, the photoelectrons whose pulse starts in the sample), `offset`
   (samples), `in_adc` (False if the file has no `FADC_AMPLITUDE`: the signal is then in photoelectrons) and `has_signal` (False without a p.e. list). 3D targets (patch x sample) for training.
   A statistical equivalent of a noise-free sim_telarray run (single-p.e. draws seeded by event and telescope), validated on bright showers only, with no NSB.
-  In training: `TriggerDataset(..., targets=("class", "true_signal"))` adds `features["true_signal"]`, `(B, 432, T)` float32 ADC (the `true_signal` column), cut to the window like the
+  In training: `TriggerDataset(..., targets=("class", "true_signal"))` adds `features["true_signal"]`, `(B, 432, T)` float32 ADC (the `true_signal_r0_alpha` column), cut to the window like the
   waveform and permuted with it by `gamma_rotations` and the NSB roll; zeros for the NSB and for a gamma without a p.e. list. A shower file converted without `--true-signal` is refused.
   It is a feature of the batches only: no model reads it yet. `true_signal_fadc` is not offered.
 
-**Cost** (zlib, per event): `r0` alone about 15 kB (simulation) / 13 kB (real); `--stages` about +109 kB / +74 kB; `--true-signal` about +3 kB and 0.03 s, with its rows held in memory until the end of the file (about 140 kB per event, so about 600 MB for a proton file of 4100 events); `--stack-stages` makes `r0` and `r1`
+**Cost** (zlib, per event): `r0` alone about 15 kB (simulation) / 13 kB (real); `--stages` about +109 kB / +74 kB; `--waveform r0` about 78 kB (real) / 119 kB (simulation); `--true-signal` about +2 kB and 0.03 s, its rows streamed to a temporary file; `--stack-stages` makes `r0` and `r1`
 91 kB per event each instead of 15 (file: 185 kB per event, measured on 150 gammas). A real file of 11 982 events takes 21 s and 160 MB with `--no-emulated`.
 
 **Environments**: simulation: ctapipe >= 0.26 (checked on 0.26 and 0.32, the same output), eventio, and scipy for `--true-signal`. Real data: only protozfits, pytables and numpy (no ctapipe,
@@ -166,11 +171,11 @@ triggerkit-merge --simtel gamma_200000.simtel.gz --real SST1M2_20261026_0012.fit
 | `--signal true-signal\|r0` | `true-signal` | where the signal of a gamma comes from: `true-signal` = ordinary simtel files (with their noise), the noise-free signal rebuilt from the photoelectrons, only for events with a p.e. list (>= 9 p.e.); `r0` = simtel files simulated WITHOUT noise, their raw ADC (minus the median of each pixel, the pedestal) is the signal; a file that does not look noise-free gets a warning |
 | `--tel ID` | 1 | telescope number in the simtel files |
 | `--also-noise-alone` | off | also write, for each event, the alpha of the same real event WITHOUT the gamma, for paired comparisons (`merge/event/noise_alpha`) |
-| `--true-signal` | off | also write the gamma alone in the real window: `true_signal`, `true_signal_fadc`, `pe_count` per patch and sample, the columns of `triggerkit-convert --true-signal` plus `has_pe_count` (with `--signal r0` there is no model: `pe_count` is zero and `has_pe_count` False) |
+| `--true-signal` | off | also write the gamma alone in the real window: `true_signal_r0_alpha`, `true_signal_fadc`, `pe_count` per patch and sample, the patch columns of `triggerkit-convert --true-signal` plus `has_pe_count` (with `--signal r0` there is no model: `pe_count` is zero and `has_pe_count` False) |
 | `--stages` | off | also write `alpha`, `beta`, `gamma` of the merged event in `r0_stages` (as `triggerkit-convert --stages`, before any threshold) |
-| `--stack-stages` | off | write `r0` as `np.stack([alpha, beta, gamma])`, `(3, 432, 50)` int16 (the loader reads channel 0) |
+| `--stack-stages` | off | write the table `r0` as `np.stack([alpha, beta, gamma])`, `(3, 432, 50)` int16, instead of `r0alpha` (not read by this package's loader) |
 
-**What the file contains**: `r0` (the merged R0alpha, 432 patches x 50 samples, uint8); `simulation/event/subarray/shower` (true energy, direction, core, first interaction, x_max, primary of the
+**What the file contains**: `r0alpha` (the merged R0alpha, 432 patches x 50 samples, uint8; with `--stack-stages` the table is `r0`); `simulation/event/subarray/shower` (true energy, direction, core, first interaction, x_max, primary of the
 simulated gamma); `simulation/event/telescope/images` (the true image per patch); and `merge/event/telescope/tel_001`, one row per event: the simulated file and event id, the real event id, type, time
 and run, the shift in samples, the peak sample in the simulation, the model offset, `in_adc`, and `sim_pedestal` (the simulated pedestal that was subtracted: 0 for `true-signal`; for `r0` it is what
 the simulated r0 holds, 0 if it has none). The settings and the file names are attributes of that table. No `r1` and no `dl1`. Measured on 100 gammas: 16 kB per event without option, +74 kB with `--stages`
@@ -194,8 +199,8 @@ before they run out with `--max-events`, or the command stops with an error and 
 triggerkit-merge --simtel gamma_a.simtel.gz gamma_b.simtel.gz --real SST1M2_20261026_0012.fits.fz --output-hdf5-file gamma_on_real.hdf5 --max-events 800
 ```
 
-With the beta and gamma stages stacked in `r0`, for a reader that expects `np.stack([r0_alpha, r0_beta, r0_gamma])` (`--stack-stages`, as for `triggerkit-convert`; a merged file has no `r1`, so only `r0`
-changes: `(3, 432, 50)` int16, channel 0 the merged alpha, 1 beta, 2 gamma, both before any threshold):
+With the beta and gamma stages stacked in `r0`, for a reader that expects `np.stack([r0_alpha, r0_beta, r0_gamma])` (`--stack-stages`, as for `triggerkit-convert`; a merged file has no `r1`, so the table
+is `r0` instead of `r0alpha`: `(3, 432, 50)` int16, channel 0 the merged alpha, 1 beta, 2 gamma, both before any threshold; the noise is the pedestal events of the real file either way):
 
 ```bash
 triggerkit-merge --simtel gamma_200000.simtel.gz --real SST1M2_20261026_0012.fits.fz --output-hdf5-file gamma_on_real_stacked.hdf5 --stack-stages
@@ -211,6 +216,14 @@ triggerkit-merge --signal r0 --simtel gammas_without_noise.simtel.gz --real real
 
 It needs protozfits (real data), eventio and scipy together: run it in the sst1mpipe 0.9.0 environment. `triggerkit-merge --help` explains everything. Not validated: `--signal r0` on a real noise-free
 simulation, and that the gain of the simulated telescope is the one of the camera.
+
+## Simulated gammas on real noise, on the fly
+
+`triggerkit-merge` writes a file per (gammas, real files) pair. `triggerkit.data.RealNoise` does the same addition when the batches are read, so the gammas are never stored
+again for another real file: convert each real file once with `triggerkit-convert --waveform r0 --pedestal-only` (the raw pixels and their pedestal, 78 kB per event, of the pedestal events only: about 70 MB for a night; without `--pedestal-only` the whole night is written, 940 MB), the
+simulation once with `--true-signal`, and give the dataset `Simulation(gamma=..., nsb=RealNoise(real_files, signal="true-signal" | "r0", seed=..., max_shift=...))`. Each gamma
+meets a noise event drawn from the pool with a generator seeded by `seed`, the gamma's file name and its event number (reproducible), its peak lands on sample 25 (plus an
+optional random shift). The NSB rows are the pedestal events themselves. The addition is made on the raw pixels, with the arithmetic of `triggerkit-merge` (`true_signal_r0` of the simulation, the pedestal of the real event): checked identical to `triggerkit.tools.merge.merge_pixels` for the same pairs on real data and on synthetic files (0 cell differs); about 0.37 ms per gamma (1.9 ms before the cache of `sst1m.patch_triplets`, measured on the GPU box). More in `docs/real_noise.rst`.
 
 ## Layout
 

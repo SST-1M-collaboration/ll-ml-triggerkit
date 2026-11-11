@@ -85,7 +85,8 @@ class NpeWeighting:
         # an unknown n_pe (NaN) weighs 0, and never turns the weights of an NSB event (0 * NaN) into NaN
         w = tf.where(tf.math.is_nan(tf.cast(n_pe, tf.float32)), 0.0, self.weight(n_pe))
         pos = tf.where(gamma > 0.5, w, 0.0)
-        neg = tf.where(gamma > 0.5, (1.0 - w) if self.below == "negative" else 0.0, 1.0)
+        below = (1.0 - w) if self.below == "negative" else 0.0
+        neg = tf.where(gamma > 0.5, tf.where(tf.math.is_nan(tf.cast(n_pe, tf.float32)), 0.0, below), 1.0)          # an unknown n_pe is no negative either
         in_zone = gamma * tf.cast(tf.cast(n_pe, tf.float32) >= self.n_cut, tf.float32)
         return tf.stack([gamma, pos, neg, in_zone], axis=-1)
 

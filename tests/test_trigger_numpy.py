@@ -73,8 +73,8 @@ def test_simulation_converter_stacks_the_stages_in_r0_and_r1_on_request(tmp_path
     assert convert(SIMTEL, plain, max_events=4, progress_every=0) == 4
     assert convert(SIMTEL, stack, max_events=4, progress_every=0, stack_stages=True) == 4
     with tables.open_file(plain) as a, tables.open_file(stack) as b:
-        for group in ("r0", "r1"):
-            wa = a.get_node(f"/{group}/event/telescope/tel_001").read()["waveform"]
+        for group in ("r0", "r1"):                                       # the stack keeps the name r0; the plain file calls its alpha r0alpha
+            wa = a.get_node(f"/{'r0alpha' if group == 'r0' else group}/event/telescope/tel_001").read()["waveform"]
             wb = b.get_node(f"/{group}/event/telescope/tel_001").read()["waveform"]
             assert wb.dtype == np.int16 and wb.shape[1] == 3 and np.array_equal(wb[:, 0], wa)
             assert np.array_equal(wb[:, 1], tn.patch7_sums(wb[:, 0].astype(np.int64))) and np.array_equal(wb[:, 2], tn.tdscan_register(wb[:, 0].astype(np.int64)))
@@ -91,7 +91,7 @@ def test_real_converter_stacks_the_stages_in_r0_on_request(tmp_path):
     assert convert(FITS, plain, max_events=10, emulated=False, progress_every=0) == 10
     assert convert(FITS, stack, max_events=10, emulated=False, progress_every=0, stack_stages=True) == 10
     with tables.open_file(plain) as a, tables.open_file(stack) as b:
-        wa, wb = a.root.r0.event.telescope.tel_001.read()["waveform"], b.root.r0.event.telescope.tel_001.read()["waveform"]
+        wa, wb = a.root.r0alpha.event.telescope.tel_001.read()["waveform"], b.root.r0.event.telescope.tel_001.read()["waveform"]
     assert wb.dtype == np.int16 and wb.shape[1] == 3 and np.array_equal(wb[:, 0], wa)
     assert np.array_equal(wb[:, 2], tn.tdscan_register(wb[:, 0].astype(np.int64)))
 
@@ -106,7 +106,7 @@ def test_simulation_converter_writes_the_stages_on_request(tmp_path):
     assert convert(SIMTEL, out, max_events=5, progress_every=0, stages=True) == 5
     with tables.open_file(out) as h5:
         stages = h5.root.r0_stages.event.telescope.tel_001.read()
-        r0 = h5.root.r0.event.telescope.tel_001.read()
+        r0 = h5.root.r0alpha.event.telescope.tel_001.read()
     assert np.array_equal(stages["alpha"], r0["waveform"]) and np.array_equal(stages["event_id"], r0["event_id"])
     assert np.array_equal(stages["beta"], tn.patch7_sums(stages["alpha"].astype(np.int64)))
     assert np.array_equal(stages["gamma"], tn.tdscan_register(stages["alpha"].astype(np.int64)))
@@ -123,6 +123,6 @@ def test_real_converter_writes_the_stages_on_request(tmp_path):
     assert convert(FITS, out, max_events=20, emulated=False, progress_every=0, stages=True) == 20
     with tables.open_file(out) as h5:
         stages = h5.root.r0_stages.event.telescope.tel_001.read()
-        r0 = h5.root.r0.event.telescope.tel_001.read()
+        r0 = h5.root.r0alpha.event.telescope.tel_001.read()
     assert np.array_equal(stages["alpha"], r0["waveform"])
     assert np.array_equal(stages["gamma"], tn.tdscan_register(stages["alpha"].astype(np.int64)))

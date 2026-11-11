@@ -36,8 +36,18 @@ def _weighted_pairwise(y_true, y_pred, sharpness):
     return tf.where(n_pairs > 0.0, tf.reduce_sum(per_col) / tf.maximum(n_pairs, 1e-12), 0.0)
 
 
+class _NoSampleWeight:
+    """Mixin of the pairwise-AUC losses: they return ONE number per batch, so a Keras ``sample_weight`` would multiply it (``reduction="sum"``: by the sum of the weights) and never exclude a sample.
+    Weight the pairs with ``weighted=True`` and the ``npe_channels`` of ``TriggerDataset(npe_weighting=...)`` instead."""
+
+    def __call__(self, y_true, y_pred, sample_weight=None):
+        if sample_weight is not None:
+            raise ValueError(f"{type(self).__name__} returns one value per batch and cannot use a sample_weight; use weighted=True with the npe_channels labels (TriggerDataset(npe_weighting=...))")
+        return super().__call__(y_true, y_pred)
+
+
 @keras.utils.register_keras_serializable(package="triggerkit")
-class PairwiseAUCLoss(tf.keras.losses.Loss):
+class PairwiseAUCLoss(_NoSampleWeight, tf.keras.losses.Loss):
     """Serializable form of the pairwise-AUC loss.
 
     A closure returned by a factory cannot be saved: Keras stores the *name*
@@ -87,7 +97,7 @@ class PairwiseAUCLoss(tf.keras.losses.Loss):
 
 
 @keras.utils.register_keras_serializable(package="triggerkit")
-class PairwiseAUCLossMulti(tf.keras.losses.Loss):
+class PairwiseAUCLossMulti(_NoSampleWeight, tf.keras.losses.Loss):
     """Serializable multi-filter pairwise-AUC loss. See ``PairwiseAUCLoss`` (``weighted`` included)."""
 
     def __init__(self, sharpness=1.0, name="pairwise_auc_multi", reduction="sum", weighted=False, **kwargs):

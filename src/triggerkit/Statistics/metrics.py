@@ -15,6 +15,8 @@ from __future__ import annotations
 import numpy as np
 from scipy.stats import norm
 
+GATED_OUT_SCORE = -1e30      # /scores/score of an event an upstream trigger did not fire on: below any real score (re-exported by ``H5StatsWriter``)
+
 
 def _average_ranks(values: np.ndarray) -> np.ndarray:
     """Tie-averaged ranks (1-based), like scipy.stats.rankdata(method='average')."""
@@ -118,14 +120,22 @@ def threshold_candidates(scores, comparison="gt"):
     "include ties" candidates): ``fractions[i]`` is the fraction of ``scores``
     that fire with threshold ``taus[i]``; ``modes[i]`` is 1 for the
     include-ties candidates, else 0. ``scores`` must be non-empty.
+
+    Two kinds of event never fire, whatever the threshold, and stay in the denominator: a NaN score (a diverged model; ``nan > tau`` is False, as in the
+    decision stored in a statistics file) and an event an upstream trigger did not fire on (``GATED_OUT_SCORE``). No candidate is built from their scores: with
+    one, the "include ties" point of the lowest score would fire them all and a target rate above what passes the upstream trigger would be met by firing events
+    that never reached the chain. With nothing else, the only candidate is "fire nothing": a threshold of +inf, which no finite score reaches with ``>`` or ``>=`` and which, applied to other data (the gammas), fires none of them either.
     """
     scores = np.asarray(scores, dtype=np.float32).reshape(-1)
     comparison = normalize_comparison(comparison)
-    unique_scores, counts = np.unique(scores, return_counts=True)
-    counts = counts.astype(np.int64)
     total = int(scores.size)
+    usable = scores[~np.isnan(scores) & (scores > np.float32(GATED_OUT_SCORE))]
+    unique_scores, counts = np.unique(usable, return_counts=True)
+    counts = counts.astype(np.int64)
+    if unique_scores.size == 0:
+        return np.array([np.inf], dtype=np.float32), np.zeros(1), np.zeros(1, dtype=np.uint8)
 
-    counts_gt = total - np.cumsum(counts, dtype=np.int64)
+    counts_gt = int(usable.size) - np.cumsum(counts, dtype=np.int64)          # of the events that can fire
     counts_ge = counts_gt + counts
 
     if comparison == "ge":

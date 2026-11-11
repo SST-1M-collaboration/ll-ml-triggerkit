@@ -316,3 +316,30 @@ def test_the_events_read_of_a_type_do_not_depend_on_the_other_types_files(setup,
     few, many = read_events(setup, tmp_path, 1), read_events(setup, tmp_path, 7)
     assert len(few["gamma"]) == 30 and len(few["proton"]) == 30
     assert few == many
+
+
+def test_a_failed_or_interrupted_run_keeps_the_previous_statistics_file(setup, tmp_path, monkeypatch):
+    """The writer works on <name>.partial: an error (or Ctrl+C) must neither rename the half-written file onto the old result nor leave the .partial behind."""
+    from triggerkit.Statistics.H5StatsWriter import H5StatsWriter
+    sim, chain, _ = setup
+    _, s = run(setup, tmp_path)
+    path = s.path if hasattr(s, "path") else str(next(tmp_path.glob("t_*.h5")))
+    good = open(path, "rb").read()
+    for failure in (RuntimeError("boom"), KeyboardInterrupt()):
+        real = H5StatsWriter.append_scores
+        calls = {"n": 0}
+
+        def failing(self, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise failure
+            return real(self, *args, **kwargs)
+
+        monkeypatch.setattr(H5StatsWriter, "append_scores", failing)
+        try:
+            chain.compute_statistics(base_name="t", folder=str(tmp_path), batch_size=8, tel_id_only=1, overwrite=True, sim=sim)
+        except RuntimeError:
+            pass                                                                    # an error propagates, an interrupt is turned into an aborted run
+        monkeypatch.setattr(H5StatsWriter, "append_scores", real)
+        assert open(path, "rb").read() == good, type(failure).__name__              # the previous result is intact
+        assert not list(tmp_path.glob("*.partial"))                                  # and nothing is left behind

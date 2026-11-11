@@ -66,4 +66,7 @@ def tdscan(alpha, edges=EDGES, weights=RING_WEIGHTS):
 
 def tdscan_register(alpha, edges=EDGES, weights=RING_WEIGHTS):
     """``gamma``: the TDSCAN score in register units, (..., 432, T) int16 (``score * 128``, an exact integer for the deployed weights)."""
-    return np.rint(tdscan(alpha, edges, weights)[1] * SCORE_UNIT).astype(np.int16)
+    register = np.rint(tdscan(alpha, edges, weights)[1] * SCORE_UNIT)
+    if register.size and np.abs(register).max() > np.iinfo(np.int16).max:
+        raise OverflowError(f"the TDSCAN score in register units reaches {np.abs(register).max():.0f}, more than an int16 holds (the deployed weights stay within about +-6500): these weights cannot be written in the 16-bit register")
+    return register.astype(np.int16)

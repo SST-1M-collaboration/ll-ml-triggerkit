@@ -277,21 +277,36 @@ class TrueSignalModel:
         return fadc.triplet_sums(np.rint(pixel_signal), np.zeros(sst1m.N_PIXELS))
 
     @staticmethod
-    def patch_arrays(result, ns, offset=None):
-        """``(signal, signal_fadc, counts)`` of the 432 patches, all (432, ns) on the time axis of the waveform of the file:
+    def pixel_adc_of(pixel_signal):
+        """``(1296, ns)`` int16: the signal of every pixel digitised to the nearest integer ADC (``np.rint``), the ``true_signal_r0`` of the files.
 
-        * ``signal`` float: the true signal, the sum of the 3 pixels of each triplet (``sst1m.patch_triplets()``), in ADC, neither rounded nor clipped;
-        * ``signal_fadc`` uint8: the same signal after the FADC stage (:meth:`fadc_of`): integer, clipped to [0, 255]; it saturates where ``signal`` goes above 255;
-        * ``counts`` uint8: the photoelectrons whose pulse STARTS in each sample (the first sample whose centre follows the start, the one in which the signal first
+        It is what is ADDED to a raw ``r0`` (integer ADC): ``clip(raw + pixel_adc, 0, 4095)`` then the FADC is the pixel-level merge of ``triggerkit-merge``, and the pixel-level
+        and the patch-level numbers below come from the same integers."""
+        return np.clip(np.rint(pixel_signal), np.iinfo(np.int16).min, np.iinfo(np.int16).max).astype(np.int16)
+
+    @staticmethod
+    def adc_of(pixel_signal):
+        """``(432, ns)`` int16: the digitised signal of each patch BEFORE the clip to [0, 255], the sum of the 3 pixels of its triplet, each pixel rounded to the nearest integer ADC first
+        (the ``true_signal_r0_alpha`` of the files). ``fadc_of`` is its clip to [0, 255]; a signal summed first and rounded once per patch would differ by the rounding of three pixels."""
+        patches = np.rint(pixel_signal)[sst1m.patch_triplets()].sum(axis=1)
+        return np.clip(patches, np.iinfo(np.int16).min, np.iinfo(np.int16).max).astype(np.int16)           # saturates like pixel_adc_of, never wraps
+
+    @staticmethod
+    def arrays(result, ns, offset=None):
+        """``(pixels, patches, signal_fadc, counts)`` of an :class:`EventSignal`, all on the time axis of the waveform of the file (``ns`` samples):
+
+        * ``pixels`` int16 ``(1296, ns)``: :meth:`pixel_adc_of`, the ``true_signal_r0`` column (add it to a raw ``r0``);
+        * ``patches`` int16 ``(432, ns)``: :meth:`adc_of`, the ``true_signal_r0_alpha`` column (before the clip, neither clipped nor truncated to 255);
+        * ``signal_fadc`` uint8 ``(432, ns)``: the same signal after the FADC stage (:meth:`fadc_of`), clipped to [0, 255]: it saturates where ``patches`` goes above 255;
+        * ``counts`` uint8 ``(432, ns)``: the photoelectrons whose pulse STARTS in each sample (the first sample whose centre follows the start, the one in which the signal first
           leaves 0), saturated at 255."""
         off = result.offset if offset is None else offset
-        triplets = sst1m.patch_triplets()
         pixels = TrueSignalModel.pixel_signal(result, sst1m.N_PIXELS, ns, off)
-        signal = pixels[triplets].sum(axis=1)
         signal_fadc = TrueSignalModel.fadc_of(pixels).astype(np.uint8)
         patch_of_pixel = sst1m.patch_of_pixel()
         start = np.ceil((np.asarray(result.pe["time"], float) - result.readout_time) / 4.0 + off - 0.5).astype(int)
         inside = (start >= 0) & (start < ns)
         counts = np.zeros((sst1m.N_PATCHES, ns), dtype=np.int64)
         np.add.at(counts, (patch_of_pixel[np.asarray(result.pe["pixel_id"])[inside]], start[inside]), 1)
-        return signal, signal_fadc, np.minimum(counts, 255).astype(np.uint8)
+        counts = np.minimum(counts, 255).astype(np.uint8)
+        return TrueSignalModel.pixel_adc_of(pixels), TrueSignalModel.adc_of(pixels), signal_fadc, counts

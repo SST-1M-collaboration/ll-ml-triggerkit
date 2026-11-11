@@ -16,6 +16,7 @@ It also converts sim_telarray simulations and real SST-1M data to HDF5, merges s
    concepts
    conversion
    merge
+   real_noise
    dataset
    training
    statistics

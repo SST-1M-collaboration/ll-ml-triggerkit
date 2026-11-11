@@ -27,7 +27,8 @@ class ExactMetrics(keras.callbacks.Callback):
     @staticmethod
     def _auc_eff(scores, labels, positives):
         """(exact AUC, efficiency at 1 % of the negatives) of the ``positives`` mask against the negatives (label 0)."""
-        negatives = labels == 0
+        finite = np.isfinite(scores)                      # a NaN score (a diverged filter) must not kill the training in on_epoch_end: it is left out, as the AUC of the statistics does
+        negatives, positives = (labels == 0) & finite, positives & finite
         if not positives.any() or not negatives.any():
             return float("nan"), float("nan")
         keep = positives | negatives

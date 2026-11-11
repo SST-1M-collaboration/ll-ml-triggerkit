@@ -28,7 +28,8 @@ def files(tmp_path_factory):
 
 def dataset(files, **kw):
     gamma, nsb = files
-    return TriggerDataset(Simulation(gamma=gamma, nsb=nsb), batch_size=BATCH, tel_id_only=1, percent_validation=0.5, load_ram=False,
+    kw.setdefault("load_ram", False)
+    return TriggerDataset(Simulation(gamma=gamma, nsb=nsb), batch_size=BATCH, tel_id_only=1, percent_validation=0.5,
                           targets=("class", "true_signal"), window=Fixed(18, 16), **kw)
 
 
@@ -144,7 +145,7 @@ def test_the_batches_carry_a_float32_signal_and_the_values_of_the_file(files):
     for path in gamma:
         with tables.open_file(path) as h:
             table = h.root.simulation.event.telescope.true_signal.tel_001.read()
-        ids.update({(int(e), i): s for i, (e, s) in enumerate(zip(table["event_id"], table["true_signal"]))})
+        ids.update({(int(e), i): s for i, (e, s) in enumerate(zip(table["event_id"], table["true_signal_r0_alpha"]))})
     stored = {int(e): s for (e, _), s in ids.items()}
     checked = 0
     for features, label in dataset(files).train_val_datasets()[1]:
@@ -321,3 +322,21 @@ def test_an_opener_without_the_native_option_still_works(files):
     ds = SimTelTFDataset.__new__(SimTelTFDataset)
     ds.opener_cls = Plain
     assert getattr(ds.opener_cls, "accepts_native_waveform", False) is False
+
+
+def test_load_ram_gives_the_same_events_as_the_stream_with_the_window_cut_in_the_reader(files):
+    """The cached path stacks every feature of the reader, including the ones added by the cut in the reader (``window_start``, ``t_trig``) and the float16 signal."""
+    def rows(load_ram):
+        out = {}
+        for features, label in dataset(files, load_ram=load_ram, nsb_roll=False).train_val_datasets()[1].take(6):
+            for i in range(len(label)):
+                out[(int(features["event_id"][i]), int(label[i]))] = (features["waveform"][i].numpy(), features["true_signal"][i].numpy(), int(features["window_start"][i]))
+        return out
+    stream, cached = rows(False), rows(True)
+    common = sorted(set(stream) & set(cached))
+    assert len(common) >= 16
+    for key in common:
+        np.testing.assert_array_equal(stream[key][0], cached[key][0])
+        np.testing.assert_array_equal(stream[key][1], cached[key][1])
+        assert stream[key][2] == cached[key][2] == 18
+    assert next(iter(cached.values()))[1].dtype == np.float32

@@ -7,6 +7,9 @@ import hdf5plugin  # do not remove, needed to read some h5 files compressed with
 from astropy import units as u
 from ctapipe.instrument import CameraGeometry
 
+from triggerkit.FileIO import layout
+from triggerkit.camera import fadc
+
 # Ensure HDF5 can find filter plugins bundled with hdf5plugin.
 _plugin_path = os.environ.get("HDF5_PLUGIN_PATH")
 if not _plugin_path or not os.path.isdir(_plugin_path):
@@ -19,10 +22,25 @@ except Exception:
 
 
 class FileOpenerCTAOHDF5:
-    def __init__(self, filepath, keep_true_signal=False, native_waveform=False):
+    """Events of a converted HDF5 file, one tuple per event (see ``__next__``).
+
+    The waveform is the FADC output, ``(432, T)``: read from the ``r0alpha`` table when the file has it, computed from the raw ``r0`` table (``(1296, T)`` pixels and their ``pedestal``,
+    :func:`triggerkit.camera.fadc.triplet_sums`) when it has not (:mod:`triggerkit.FileIO.layout`). A file of an older layout (an ``r0`` of 432 patches) raises a ``ValueError``.
+
+    Parameters
+    ----------
+    keep_true_signal : also ``stat["true_signal"]`` ``(432, T)`` float16, the ``true_signal_r0_alpha`` column (``triggerkit-convert --true-signal``).
+    native_waveform : give the waveform in the type it is stored in (``uint8`` for the FADC output) instead of ``float32``, and one array for R0 and R1.
+    keep_true_signal_r0 : also ``stat["true_signal_r0"]`` ``(1296, T)`` int16, the signal of each pixel in integer ADC: what :class:`triggerkit.data.RealNoise` adds to a raw real event.
+    raw_waveform : give the RAW waveform ``(1296, T)`` (the ``r0`` table, which must exist) instead of its FADC output: ``RealNoise(signal="r0")`` takes the signal of a noise-free simulation from it.
+    """
+
+    def __init__(self, filepath, keep_true_signal=False, native_waveform=False, keep_true_signal_r0=False, raw_waveform=False):
         self.filepath = filepath
         self.keep_true_signal = bool(keep_true_signal)
         self.native_waveform = bool(native_waveform)
+        self.keep_true_signal_r0 = bool(keep_true_signal_r0)
+        self.raw_waveform = bool(raw_waveform)
         self.i_readed_events = 0
         self._file = None
         self._iterator = None
@@ -57,14 +75,21 @@ class FileOpenerCTAOHDF5:
             pix_type="hexagonal",
         )
         # configuration/instrument/telescope/optics
-        try:
-            self.lst_tel = [
-                key for key in self.src["r0/event/telescope"].keys()
-            ]  # [tel_001, tel_002, tel_003, tel_004]
-        except KeyError:
-            self.lst_tel = [
-                key for key in self.src["r1/event/telescope"].keys()
-            ]  # [tel_001, tel_002, tel_003, tel_004]
+        self.tables = layout.waveform_tables(self.src)                  # the waveform tables of the file, among r0alpha, r0, r1
+        if not self.tables:
+            raise ValueError(f"{filepath!r}: no waveform table (r0alpha, r0 or r1) in the file")
+        self.lst_tel = list(self.src[layout.group_name(self.tables[0])].keys())  # [tel_001, tel_002, tel_003, tel_004]
+        if layout.R0 in self.tables:                                    # the raw r0 is (1296, T); an older file has 432 patches there (or a stack of three)
+            r0_group = self.src[layout.group_name(layout.R0)]
+            for tel_name in r0_group:
+                layout.check_r0_is_raw(r0_group[tel_name].dtype["waveform"].shape, repr(filepath))
+        if self.raw_waveform and layout.R0 not in self.tables:
+            raise ValueError(f"{filepath!r}: no raw r0 table: convert the file with `triggerkit-convert --waveform r0` (or both)")
+        # the table the waveform is read from: the raw r0 when it is asked for or when there is no r0alpha, else r0alpha, else r1
+        if layout.R0 in self.tables and (self.raw_waveform or layout.R0_ALPHA not in self.tables):
+            self.waveform_table = layout.R0
+        else:
+            self.waveform_table = layout.R0_ALPHA if layout.R0_ALPHA in self.tables else layout.R1
         layout_tel_ids = subarray["layout"]["tel_id"].tolist()  # [1, 2, 3, 4]
         # Telescope id of each key in lst_tel, taken from the key itself
         # ("tel_002" -> 2). Pairing lst_tel with the layout list BY POSITION is
@@ -124,7 +149,7 @@ class FileOpenerCTAOHDF5:
             # tables of the noise-free signal (triggerkit-convert --true-signal), only read on request. A telescope without
             # one is allowed (the reader decides: zeros for the NSB, an error for a shower).
             self.true_signal_tables = {}
-            if self.keep_true_signal:
+            if self.keep_true_signal or self.keep_true_signal_r0:
                 for tel_name in self.lst_tel:
                     path = f"simulation/event/telescope/true_signal/{tel_name}"
                     if path in self.src:
@@ -155,6 +180,7 @@ class FileOpenerCTAOHDF5:
 
                 # reset event index for each telescope
                 self.current_event_index = [0] * len(self.lst_tel)
+                pending_rows = {}                      # the row of a telescope whose event is not consumed yet: a raw r0 row is big, it is read once
 
                 while True:
                     tel_ids = []
@@ -169,41 +195,17 @@ class FileOpenerCTAOHDF5:
                     event_ids = []
 
                     # for each telescope, get the current event id
+                    event_rows = {}
                     for tel_idx, tel_name in enumerate(self.lst_tel):
-                        # HDF5 LST dataset contains only R0, and DL1
-                        # HDF5 SST-1M dataset contains only R1, DL1
-                        try:
-                            tel_group_r0 = self.src[
-                                f"r0/event/telescope/{tel_name}"
-                            ]
-                        except KeyError:
-                            tel_group_r0 = None
-                        try:
-                            tel_group_r1 = self.src[
-                                f"r1/event/telescope/{tel_name}"
-                            ]
-                        except KeyError:
-                            tel_group_r1 = None
-
-                        if tel_group_r0 is None and tel_group_r1 is None:
+                        tel_group = self._waveform_group(tel_name)
+                        if tel_group is None:
                             continue  # no data for this telescope
-
-                        if tel_group_r0 is not None:
-                            tel_group = tel_group_r0
-                        else:
-                            if tel_group_r1 is not None:
-                                tel_group = tel_group_r1
-                            else:
-                                raise ValueError(
-                                    f"No R0 or R1 data found for telescope {tel_name}"
-                                )
-
                         if self.current_event_index[tel_idx] >= len(tel_group):
                             continue  # no more events in this telescope
-
-                        event = tel_group[self.current_event_index[tel_idx]]
-                        event_id = int(event["event_id"])
-                        event_ids.append(event_id)
+                        if tel_idx not in pending_rows:
+                            pending_rows[tel_idx] = tel_group[self.current_event_index[tel_idx]]
+                        event_rows[tel_idx] = pending_rows[tel_idx]
+                        event_ids.append(int(event_rows[tel_idx]["event_id"]))
 
                     if not event_ids:
                         break  # no more events in any telescope
@@ -236,22 +238,8 @@ class FileOpenerCTAOHDF5:
                         tel_id = self.lst_tel_ids[tel_idx]
                         tel_pos_x, tel_pos_y, tel_pos_z = self.tel_positions.get(int(tel_id), (-1.0, -1.0, -1.0))
 
-                        # try getting r0 group first
-                        tel_group_r0 = None
-                        tel_group_r1 = None
-                        try:
-                            tel_group_r0 = self.src[
-                                f"r0/event/telescope/{tel_name}"
-                            ]
-                        except KeyError:
-                            # it's probably a SST-1M file with r1 instead of r0
-                            pass
-                        try:
-                            tel_group_r1 = self.src[
-                                f"r1/event/telescope/{tel_name}"
-                            ]
-                        except KeyError:
-                            pass
+                        has_r1 = layout.group_name(layout.R1) in self.src and tel_name in self.src[layout.group_name(layout.R1)]
+                        has_r0 = self.waveform_table != layout.R1
 
                         # try getting dl0 and dl1 groups
                         try:
@@ -267,51 +255,38 @@ class FileOpenerCTAOHDF5:
                         except KeyError:
                             tel_group_dl1 = None
 
-                        # get the right tel_group
-                        if tel_group_r0 is not None:
-                            tel_group = tel_group_r0
-                        else:
-                            if tel_group_r1 is not None:
-                                tel_group = tel_group_r1
-                            else:
-                                raise ValueError(
-                                    f"No R0 or R1 data found for telescope {tel_name}"
-                                )
+                        tel_group = self._waveform_group(tel_name)
+                        if tel_group is None:
+                            raise ValueError(f"No waveform (r0alpha, r0 or r1) found for telescope {tel_name}")
 
                         sim_image_group = self.src[
                             f"simulation/event/telescope/images/{tel_name}"
                         ]
                         # n_pe is true_image_sum
                         true_signal_group = self.true_signal_tables.get(tel_name)
-                        if self.current_event_index[tel_idx] >= len(tel_group):
+                        if tel_idx not in event_rows:
                             continue  # no more events in this telescope
 
-                        event = tel_group[self.current_event_index[tel_idx]]
+                        event = event_rows[tel_idx]
                         event_id = int(event["event_id"])
 
                         if event_id == min_event_id:
                             # tel_ids must stay aligned with the waveform lists:
                             # only telescopes present in THIS event are listed.
                             tel_ids.append(tel_id)
-                            # try to get the different waveforms
+                            # the waveform: the FADC output (432, T), or the raw pixels with raw_waveform
+                            waveform_native = self._waveform_of(event)
                             if self.native_waveform:
                                 # as stored (uint8 for the R0alpha), and one array for R0 and R1: both come from the same record
-                                waveform_native = self._normalize_waveform_no_channel(event["waveform"])  # (n_pix, n_samples)
-                                if tel_group_r0 is not None:
+                                if has_r0:
                                     wf0_list.append(waveform_native)
-                                if tel_group_r1 is not None:
+                                if has_r1:
                                     wf1_list.append(waveform_native)
                             else:
-                                if tel_group_r0 is not None:
-                                    waveform_r0 = self._normalize_waveform_no_channel(
-                                        event["waveform"]
-                                    ).astype(np.float32)  # (n_pix, n_samples)
-                                    wf0_list.append(waveform_r0)
-                                if tel_group_r1 is not None:
-                                    waveform_r1 = self._normalize_waveform_no_channel(
-                                        event["waveform"]
-                                    ).astype(np.float32)  # (n_pix, n_samples)
-                                    wf1_list.append(waveform_r1)
+                                if has_r0:
+                                    wf0_list.append(waveform_native.astype(np.float32))  # (n_pix, n_samples)
+                                if has_r1:
+                                    wf1_list.append(waveform_native.astype(np.float32))
                             if tel_group_dl0 is not None:
                                 event_dl0 = tel_group_dl0[
                                     self.current_event_index[tel_idx]
@@ -402,13 +377,18 @@ class FileOpenerCTAOHDF5:
                             if true_signal_group is not None:
                                 row = true_signal_group[self.current_event_index[tel_idx]]
                                 if int(row["event_id"]) != event_id:
-                                    raise RuntimeError(f"true_signal/event mismatch in {self.filepath!r}: row of event {int(row['event_id'])} where the r0 table has event {event_id}")
-                                stat_event["true_signal"] = np.asarray(row["true_signal"], dtype=np.float16)        # (432, T), ADC, before the FADC stage; float16 as stored: half the queue
+                                    raise RuntimeError(f"true_signal/event mismatch in {self.filepath!r}: row of event {int(row['event_id'])} where the waveform table has event {event_id}")
+                                names = true_signal_group.dtype.names
+                                if self.keep_true_signal:
+                                    stat_event["true_signal"] = self._column(row, names, layout.TRUE_SIGNAL_R0_ALPHA, np.float16)      # (432, T), ADC, before the clip; float16: half the queue
+                                if self.keep_true_signal_r0:
+                                    stat_event["true_signal_r0"] = self._column(row, names, layout.TRUE_SIGNAL_R0, np.int16)         # (1296, T), integer ADC per pixel
 
                             event_stat_list.append(stat_event)
 
                             # increment only if this telescope had the min event id
                             self.current_event_index[tel_idx] += 1
+                            pending_rows.pop(tel_idx, None)
 
                     yield (
                         tel_ids,
@@ -424,6 +404,27 @@ class FileOpenerCTAOHDF5:
 
             self.current_event_index = [0] * len(self.lst_tel)
             self._iterator = h5_event_iterator()
+
+    def _waveform_group(self, tel_name):
+        """The h5py table the events and waveforms of ``tel_name`` are read from (see ``waveform_table``), or None when the telescope has none."""
+        group = self.src.get(layout.group_name(self.waveform_table))
+        return group[tel_name] if group is not None and tel_name in group else None
+
+    def _waveform_of(self, event):
+        """The waveform of a row of the waveform table: the stored ``(432, T)`` alpha, the FADC of a raw row, or the raw row itself with ``raw_waveform``; in the type it is stored in
+        (``uint8`` for the FADC output computed here, the raw ``uint16``)."""
+        waveform = np.asarray(event["waveform"])
+        if self.waveform_table != layout.R0:
+            return self._normalize_waveform_no_channel(waveform)            # (n_pix, n_samples)
+        if self.raw_waveform:
+            return waveform                                                  # (1296, T) uint16
+        return fadc.triplet_sums(waveform, np.asarray(event["pedestal"])).astype(np.uint8)       # (432, T): the FADC output of the raw pixels
+
+    def _column(self, row, names, name, dtype):
+        if name not in names:
+            raise ValueError(f"{self.filepath!r}: the true_signal table has no {name} column: it was converted before the layout 'true_signal_r0 / true_signal_r0_alpha': convert the simulation "
+                             "again with `triggerkit-convert --true-signal`")
+        return np.asarray(row[name], dtype=dtype)
 
     def _close(self):
         """Close the file."""

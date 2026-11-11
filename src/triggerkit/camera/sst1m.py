@@ -49,15 +49,23 @@ def pixel_positions():
     return np.round(np.c_[-rows[:, _Y_PIXEL], -rows[:, _X_PIXEL]] / 10, 3)  # CSV precision: 0.01 mm
 
 
+@lru_cache(maxsize=None)
 def patch_of_pixel():
-    """(1296,) the patch (0..431) each pixel belongs to."""
-    return _camera_config()[:, _PATCH_SW_ID].astype(int)
+    """(1296,) the patch (0..431) each pixel belongs to. Cached and read-only: shared by every caller (copy it to change it)."""
+    table = _camera_config()[:, _PATCH_SW_ID].astype(int)
+    table.flags.writeable = False
+    return table
 
 
+@lru_cache(maxsize=None)
 def patch_triplets():
-    """(432, 3) pixel ids of each patch, in increasing order."""
+    """(432, 3) pixel ids of each patch, in increasing order. Cached and read-only: shared by every caller (copy it to change it).
+
+    It used to be rebuilt at each call (1.3 ms, a loop over the 432 patches), which was most of the time of ``fadc.triplet_sums`` and of the merge of ``RealNoise`` (about 1.7 ms per gamma)."""
     patch_of_pixel = _camera_config()[:, _PATCH_SW_ID].astype(int)
-    return np.array([np.flatnonzero(patch_of_pixel == patch) for patch in range(N_PATCHES)])
+    triplets = np.array([np.flatnonzero(patch_of_pixel == patch) for patch in range(N_PATCHES)])
+    triplets.flags.writeable = False
+    return triplets
 
 
 def patch7_clusters():

@@ -79,14 +79,16 @@ def read_n_simulated(files):
 
 
 def count_written(files, tel_id_only=None):
-    """Events recorded in ``files``: rows of the R0 table of ``tel_id_only`` (all telescopes if ``None``)."""
+    """Events recorded in ``files``: rows of the waveform table (r0alpha, else r0, else r1) of ``tel_id_only`` (all telescopes if ``None``)."""
     import h5py
     import hdf5plugin  # noqa: F401
 
     total = 0
     for path in files:
         with h5py.File(path, "r") as f:
-            group = f["r0/event/telescope"]
+            from triggerkit.FileIO import layout
+            layout.check_file(path)                      # a file of the old layout is refused, not counted: it would not be read, and the efficiency would divide by it
+            group = f[layout.group_name(layout.waveform_tables(f)[0])]
             names = [f"tel_{int(tel_id_only):03d}"] if tel_id_only is not None else list(group)
             total += sum(group[name].shape[0] for name in names if name in group)
     return total
@@ -130,6 +132,10 @@ class Source:
     @property
     def code(self):
         return PARTICLES[self.particle]
+
+    def written(self, tel_id_only=None):
+        """Events recorded in the files (the R0 rows of ``tel_id_only``)."""
+        return count_written(self.files, tel_id_only)
 
     def simulated(self):
         """Showers simulated: the given ``n_simulated``, else read from the run tables (read once, ``n_simulated`` stays as given)."""

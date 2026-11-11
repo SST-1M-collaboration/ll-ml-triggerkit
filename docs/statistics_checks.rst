@@ -31,7 +31,7 @@ score is recomputed.
    view = s.fold(fold_name, columns=["particle", "event_id", "file"], decide=False)
    for row in range(0, len(view["score"]), 50):
        with h5py.File(s.files[int(view["file"][row])], "r") as f:
-           table = f["r0/event/telescope/tel_001"]
+           table = f["r0alpha/event/telescope/tel_001"]
            i = int(np.flatnonzero(table["event_id"][()] == view["event_id"][row])[0])
            wf = np.asarray(table[i]["waveform"]).reshape(-1, 82)[-432:]
        assert view["score"][row] == numpy_score(wf, folds[fold_name], int(view["particle"][row]))

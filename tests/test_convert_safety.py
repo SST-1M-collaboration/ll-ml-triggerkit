@@ -75,3 +75,29 @@ def test_an_event_without_recorded_traces_is_refused_with_a_clear_message():
     for raw in (np.zeros(0, dtype=np.uint8), np.zeros(1000, dtype=np.uint8)):
         with pytest.raises(ValueError, match="no recorded FPGA traces"):
             recorded_traces(raw, 22)
+
+
+SIMTEL = os.environ.get("TRIGGERKIT_TEST_SIMTEL")
+
+
+@pytest.mark.skipif(not SIMTEL, reason="TRIGGERKIT_TEST_SIMTEL is not set (a simtel file)")
+def test_a_failure_in_the_middle_of_a_conversion_leaves_no_side_file_and_keeps_the_old_output(tmp_path, monkeypatch):
+    """The failure comes AFTER the raw r0, true_signal and stages side files exist (the test above fails before any of them is created)."""
+    pytest.importorskip("ctapipe")
+    from triggerkit.tools import convert_simtel
+
+    out = str(tmp_path / "out.hdf5")
+    open(out, "wb").write(b"an earlier good output")
+    real = convert_simtel.fadc.triplet_sums
+    calls = {"n": 0}
+
+    def fails_on_the_fourth_event(*args, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 4:
+            raise RuntimeError("injected failure")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(convert_simtel.fadc, "triplet_sums", fails_on_the_fourth_event)
+    with pytest.raises(RuntimeError, match="injected failure"):
+        convert_simtel.convert(SIMTEL, out, max_events=10, progress_every=0, true_signal=True, stages=True, waveform="both")
+    assert sorted(os.listdir(tmp_path)) == ["out.hdf5"] and open(out, "rb").read() == b"an earlier good output"       # no .partial, no .tmp, the old file is kept

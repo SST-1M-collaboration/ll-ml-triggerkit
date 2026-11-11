@@ -270,7 +270,9 @@ class StatsFile:
             raise ValueError("of must be 'simulated' or 'read'")
         name = particle if isinstance(particle, str) else PARTICLE_NAMES[int(particle)]
         counts = self.counts(fold, threshold).get(name, {"read": 0, "triggered": 0})
-        total = counts["read"] if of == "read" else self.simulated(fold, name)
+        total = counts["read"] if of == "read" else self.simulated(fold, name)       # a type with no denominators at all is still a KeyError
+        if counts["read"] == 0:
+            return float("nan"), float("nan"), float("nan")          # this fold read no event of the type: an efficiency of 0 would be a measurement, this is none
         return wilson(counts["triggered"], total, level)
 
     def nsb_window_sec(self, fold) -> float:

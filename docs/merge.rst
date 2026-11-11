@@ -10,11 +10,30 @@ For each pixel it computes ``(Si - Psi) + (Di - Pdi)``:
 It is done on the pixels, before the FADC, because the FADC is not linear (it clips each triplet sum at 0 and 255). Nothing is rescaled. The real
 events are the pedestal events of the real file (random triggers: unbiased NSB).
 
+The script is ``src/triggerkit/tools/merge.py``: ``triggerkit-merge ARGS``, or ``PYTHONPATH=/path/to/ll-ml-triggerkit/src python /path/to/ll-ml-triggerkit/src/triggerkit/tools/merge.py ARGS``, or ``python -m triggerkit.tools.merge ARGS``
+(without the package installed, the ``PYTHONPATH`` is needed; the sst1mpipe environment cannot install it).
+
 The simplest command (ordinary simtel files; each gamma is put at sample 25, the middle of the 50-sample window, of a real pedestal event):
 
 .. code-block:: bash
 
    triggerkit-merge --simtel gamma_200000.simtel.gz --real SST1M2_20261026_0012.fits.fz --output-hdf5-file gamma_on_real.hdf5
+
+In the ``np.stack`` layout (``--stack-stages``: the table ``r0`` holds ``np.stack([alpha, beta, gamma])``, ``(n, 3, 432, 50)`` ``int16``, channel 0 the alpha), the noise being in both
+cases the pedestal events of the real acquisition file, one per gamma:
+
+.. code-block:: bash
+
+   # 1. ordinary simtel.gz productions (with their own NSB and noise): the noise-free signal of each pixel is rebuilt from the photoelectrons
+   #    (what `triggerkit-convert --true-signal` stores as true_signal_r0, computed here), then added to the real raw pixels
+   triggerkit-merge --signal true-signal --stack-stages --simtel gamma_200000.simtel.gz gamma_200001.simtel.gz \
+       --real SST1M2_20261026_0012.fits.fz --output-hdf5-file gamma_on_real_stack.hdf5
+
+   # 2. simtel.gz simulated WITHOUT NSB or electronic noise: their raw r0 pixels, minus the median of each pixel (the pedestal), are the signal
+   triggerkit-merge --signal r0 --stack-stages --simtel gamma_nonoise_200000.simtel.gz \
+       --real SST1M2_20261026_0012.fits.fz SST1M2_20261026_0013.fits.fz --output-hdf5-file gamma_nonoise_on_real_stack.hdf5
+
+Without ``--stack-stages`` the same commands write the alpha in ``r0alpha``, the layout the loader reads.
 
 Options
 -------
@@ -51,19 +70,19 @@ Options
      - also write, for each event, the alpha of the same real event without the gamma, for paired comparisons (``merge/event/noise_alpha``)
    * - ``--true-signal``
      - off
-     - also write the gamma alone in the real window: ``true_signal``, ``true_signal_fadc``, ``pe_count`` per patch and sample, plus
-       ``has_pe_count``
+     - also write the gamma alone in the real window: ``true_signal_r0_alpha`` (``int16``), ``true_signal_fadc``, ``pe_count`` per patch and sample, plus
+       ``has_pe_count`` (the patch columns of ``triggerkit-convert --true-signal``; there is no per-pixel column here)
    * - ``--stages``
      - off
      - also write ``alpha``, ``beta``, ``gamma`` of the merged event in ``r0_stages`` (before any threshold)
    * - ``--stack-stages``
      - off
-     - write ``r0`` as ``np.stack([alpha, beta, gamma])``, ``(3, 432, 50)`` ``int16`` (the loader reads channel 0)
+     - write the table ``r0`` as ``np.stack([alpha, beta, gamma])``, ``(3, 432, 50)`` ``int16``, instead of ``r0alpha`` (the loader of this package does not read it)
 
 What the file contains
 ----------------------
 
-* ``r0``: the merged R0alpha, 432 patches x 50 samples, ``uint8``.
+* ``r0alpha``: the merged R0alpha, 432 patches x 50 samples, ``uint8`` (the name says it is the FADC output; see :doc:`conversion`).
 * ``simulation/event/subarray/shower``: true energy, direction, core, first interaction, x_max, primary of the simulated gamma.
 * ``simulation/event/telescope/images``: the true image per patch.
 * ``merge/event/telescope/tel_001``: one row per event: the simulated file (its index in the ``--simtel`` list) and event id, the real event
@@ -93,3 +112,6 @@ Requirements and limits
 
 It needs protozfits (real data), eventio and scipy together: run it in the sst1mpipe 0.9.0 environment. Not validated: ``--signal r0`` on a real
 noise-free simulation, and that the gain of the simulated telescope is the one of the camera.
+
+.. seealso::
+   :doc:`real_noise`: the same addition made when the batches are read, with no file written.

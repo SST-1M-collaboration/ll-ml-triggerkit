@@ -93,7 +93,7 @@ def test_gammas_merged_into_the_pedestal_events_of_a_real_file(tmp_path):
     assert merge.merge([SIMTEL], [FITS], out, max_events=6, progress_every=0, also_noise_alone=True, stages=True, true_signal=True) == 6
     with tables.open_file(out) as h5:
         info = h5.root.merge.event.telescope.tel_001.read()
-        alpha = h5.root.r0.event.telescope.tel_001.read()["waveform"]
+        alpha = h5.root.r0alpha.event.telescope.tel_001.read()["waveform"]
         alone = h5.root.merge.event.noise_alpha.tel_001.read()["waveform"]
         shower = h5.root.simulation.event.subarray.shower.read()
         stages = h5.root.r0_stages.event.telescope.tel_001.read()
@@ -107,5 +107,19 @@ def test_gammas_merged_into_the_pedestal_events_of_a_real_file(tmp_path):
         assert np.array_equal(alone[i], convert_real.emulated_traces(event["raw"], event["baseline"], event["flags"]))       # the noise alone is the FADC of the real event
         assert (alpha[i] != alone[i]).any()
     assert (shower["true_energy"] > 0).all() and np.array_equal(stages["alpha"], alpha)
-    assert truth["true_signal"].shape == (6, sst1m.N_PATCHES, 50) and truth["true_signal_fadc"].dtype == np.uint8 and truth["has_pe_count"].all()
-    assert np.array_equal(truth["offset"], info["offset"]) and truth["pe_count"].sum() > 0 and (truth["true_signal"].astype(float).max(axis=(1, 2)) > 0).all()
+    assert truth["true_signal_r0_alpha"].shape == (6, sst1m.N_PATCHES, 50) and truth["true_signal_r0_alpha"].dtype == np.int16 and "true_signal" not in truth.dtype.names and truth["true_signal_fadc"].dtype == np.uint8 and truth["has_pe_count"].all()
+    assert np.array_equal(truth["offset"], info["offset"]) and truth["pe_count"].sum() > 0 and (truth["true_signal_r0_alpha"].astype(float).max(axis=(1, 2)) > 0).all()
+
+
+@pytest.mark.skipif(not (SIMTEL and FITS), reason="TRIGGERKIT_TEST_SIMTEL and TRIGGERKIT_TEST_FITS are not set (a simtel file and a real file)")
+def test_the_stack_mode_still_merges_simtel_and_real_pedestals(tmp_path):
+    """The colleague's ``np.stack`` layout: the table keeps the name ``r0`` (3, 432, T), its channel 0 is the alpha of the same merge written as ``r0alpha``."""
+    tables = pytest.importorskip("tables")
+    pytest.importorskip("protozfits")
+    plain, stack = str(tmp_path / "plain.hdf5"), str(tmp_path / "stack.hdf5")
+    assert merge.merge([SIMTEL], [FITS], plain, max_events=5, progress_every=0) == 5
+    assert merge.merge([SIMTEL], [FITS], stack, max_events=5, progress_every=0, stack_stages=True, true_signal=True) == 5
+    with tables.open_file(plain) as a, tables.open_file(stack) as b:
+        alpha, stacked = a.root.r0alpha.event.telescope.tel_001.read()["waveform"], b.root.r0.event.telescope.tel_001.read()["waveform"]
+        assert "/r0alpha" not in b
+    assert stacked.shape == (5, 3, sst1m.N_PATCHES, 50) and stacked.dtype == np.int16 and np.array_equal(stacked[:, 0], alpha)

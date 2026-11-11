@@ -29,6 +29,7 @@ Not stored, because they follow from the above: the decision of a chain that has
 the file is READ: there is no threshold, and no NSB rate, in the file), the counts per type and fold, rates, efficiencies. ``triggerkit.Statistics.stats_file.StatsFile`` reads all of it.
 """
 import json
+import os
 from collections.abc import Mapping
 
 import h5py
@@ -43,7 +44,8 @@ FORMAT = "stats_v2"
 NO_FILE = int(np.iinfo(np.uint16).max)          # /events/file of an event whose source file is not known
 NO_CONDITION = 255                              # /folds/condition of a fold with no condition
 ALL, NOT_READ = -1, -2
-GATED_OUT_SCORE = -1e30                        # /scores/score of an event an upstream trigger did not fire on: below any real score                          # /folds/budget values: every event of the type / the fold does not read this type
+from triggerkit.Statistics.metrics import GATED_OUT_SCORE   # noqa: E402,F401  -1e30, the /scores/score of an event an upstream trigger did not fire on: below any real score
+# /folds/budget values: every event of the type / the fold does not read this type
 
 _STRING = h5py.string_dtype()
 
@@ -61,8 +63,9 @@ class H5StatsWriter:
     """
 
     def __init__(self, path, trigger_chain, camera_name="unknown", compression="lzf", chunk_rows=200_000, description=""):
-        self.path = path
-        self.f = h5py.File(path, "w")
+        self.final_path = path
+        self.path = path + ".partial"                # written here and renamed at close(): an old statistics file of the same name survives a crash or a Ctrl+C
+        self.f = h5py.File(self.path, "w")
         self.f.attrs["format"] = FORMAT
         self.f.attrs["camera_name"] = camera_name
         self.f.attrs["trigger_chain_json"] = json.dumps(self._to_jsonable(trigger_chain))
@@ -232,7 +235,21 @@ class H5StatsWriter:
         self.description = str(text)
 
     # ---------------------------------------------------------------- close
-    def close(self, window_sec):
+    def abort(self):
+        """Close the file WITHOUT publishing it: the ``.partial`` stays for the caller to delete, a previous file of the same name is untouched."""
+        try:
+            self.f.close()
+        except Exception:
+            pass
+        self._closed = True
+
+    def publish(self):
+        """Rename the finished ``.partial`` onto the final path (after ``close(window_sec, publish=False)``)."""
+        os.replace(self.path, self.final_path)
+
+    def close(self, window_sec, publish=True):
+        """Write the summaries, close the file and (``publish=True``) rename it onto its final path. ``publish=False`` leaves it as ``<path>.partial``: a caller that writes several files
+        closes them all, then publishes them one after the other, so that a failure does not leave a mix of new and old files."""
         if self._closed:
             return
         f = self.f
@@ -241,6 +258,14 @@ class H5StatsWriter:
         f.attrs["n_events"] = self.n_events
         f.attrs["n_scores"] = self.n_scores
 
+        if not self._events or not self._scores:               # a run that read no event still writes a file StatsFile can read: empty columns of the usual types
+            for group_name, store, columns in (("events", self._events, (("particle", np.uint8), ("condition", np.uint8), ("file", np.uint16), ("event_id", np.int64),
+                                                                          ("tel_id", np.int32), ("n_pe", np.float32))),
+                                               ("scores", self._scores, (("fold", np.uint16), ("event", np.uint32), ("decision", np.uint8)))):
+                group = f.require_group(group_name)
+                if not store:
+                    for name, dtype in columns:
+                        store[name] = group.create_dataset(name, shape=(0,), maxshape=(None,), dtype=dtype, chunks=(self.chunk_rows,), compression=self.compression)
         desc = f.create_group("description")
         for key, value in {"uuid": self.uuid, **self.info}.items():
             desc.attrs[key] = value
@@ -275,3 +300,5 @@ class H5StatsWriter:
                 cg.create_dataset(key, data=np.array(vals, dtype=object), dtype=_STRING)
         f.close()
         self._closed = True
+        if publish:
+            self.publish()

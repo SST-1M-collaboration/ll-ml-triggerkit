@@ -844,7 +844,7 @@ class StatPlotter:
         if metric not in view:
             raise KeyError(f"Metric '{metric}' not found in {result['_path']} (has {sorted(view)}).")
         x = np.asarray(view[metric]).reshape(-1)
-        keep = np.isfinite(x)
+        keep = np.isfinite(x)      # NaN and +-inf events are left out here (for a plot), whereas the thresholds of ``metrics`` keep a NaN in the denominator (it never fires): a fold with NaN scores gives a slightly different rate here
         if drop_gated_out and metric == PRE_THRESHOLD_SCORE_DATASET:
             keep &= x > GATED_OUT_SCORE
         return x[keep].astype(np.float32, copy=False)

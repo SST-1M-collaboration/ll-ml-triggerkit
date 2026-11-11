@@ -107,13 +107,20 @@ class SimTelTFDatasetConfig:
     # noise) if 1-pe pixels are included. Mask it against true_image downstream.
     emit_peak_time: bool = False
     # Emit the noise-free signal of the event, (P, S) ADC per patch and sample, on the time axis of the waveform (HDF5 files converted with
-    # ``triggerkit-convert --true-signal``; ``simulation/event/telescope/true_signal``, the ``true_signal`` column, before the FADC stage).
+    # ``triggerkit-convert --true-signal``; ``simulation/event/telescope/true_signal``, the ``true_signal_r0_alpha`` column: the sum of the 3 rounded pixels of each patch, before the clip of the FADC stage).
     # A gamma with fewer than 9 stored p.e. has no model signal: zeros. NSB events carry zeros; a shower whose file has no such table is an error.
     emit_true_signal: bool = False
     # ``{label: SourcePlan}``: cut every event to its window HERE, in the reader, before the shuffle (``SourcePlan.static_cut``): the shuffle buffer holds
     # the window and not the whole datacube. Each sample then carries ``window_start`` and ``t_trig`` (int64) as the alignment stage would add them.
     # Only for sources that are not aligned on a trigger (the cut does not depend on the event). ``None``: the events are left whole.
     crop: Optional[Dict[int, Any]] = None
+    # A :class:`triggerkit.data.real_noise.RealNoise`: the NSB files are real files read as their pedestal events, and every shower event is merged with one of them
+    # when it is read (the signal of the simulation added to the RAW pixels of the real event, then the FADC: see that module). ``None``: the files are read as they are.
+    real_noise: Optional[Any] = None
+    # Every pass over the dataset repeats exactly the same events, in the same order, with the same NSB rolls (validation): the file order and the interleave are drawn again from ``seed`` at the
+    # start of each pass, and the roll of an NSB event is a function of the batch it is in (a stateless draw) instead of a generator that goes on from one pass to the next. False (training):
+    # the draws go on, so every epoch sees another order and other rolls.
+    reseed_each_pass: bool = False
     include_event_features: bool = True
     # Emit ``file_index`` (int32), the position of the event's source file in ``SimTelTFDataset.file_list``
     # (gamma files, then NSB files, then the extra files by label). Off by default, like the truth maps.
@@ -187,6 +194,15 @@ class SimTelTFDataset:
 
         self.opener_cls = opener_cls
         self.cfg = config or SimTelTFDatasetConfig()
+        # the HDF5 files must be readable by the loader: refused here, for the training and for the statistics alike, because the readers below run under ignore_errors and would only
+        # skip a file of the old layout (an r0 of 432 patches) with a warning
+        from triggerkit.FileIO import layout
+        for path in self.file_list:
+            if str(path).endswith((".h5", ".hdf5")) and os.path.exists(path):
+                try:
+                    layout.check_file(path, self.cfg.waveform_level)
+                except OSError:
+                    pass                    # not an HDF5 file / unreadable: the reader's ignore_errors decides (a FileReadError, or a warning and a skipped file); a ValueError (layout) is raised here
         # global quota trackers {label: events still allowed or None}, set/reset in dataset()
         self._quota: Dict[int, Optional[int]] = {}
         self._labels_present = sorted(
@@ -242,18 +258,19 @@ class SimTelTFDataset:
         def infinite_generator() -> Iterator[Tuple[Dict[str, np.ndarray], np.ndarray]]:
             # every pass starts from full quotas, so the stream is re-iterable
             self._reset_quotas()
+            pass_rng = np.random.default_rng(self.cfg.seed) if self.cfg.reseed_each_pass else rng      # validation: the same draws at every pass, so a capped subset is the same
             while True:
                 if self._quotas_exhausted():
                     break
                 pairs = list(file_label_pairs)
                 if self.cfg.shuffle_files:
-                    rng.shuffle(pairs)
+                    pass_rng.shuffle(pairs)
 
                 if self.cfg.interleave_files:
-                    yield from self._interleaved_files(pairs, rng)
+                    yield from self._interleaved_files(pairs, pass_rng)
                 else:
                     for filepath, label in pairs:
-                        yield from self._iter_one_file(filepath, label, rng)
+                        yield from self._iter_one_file(filepath, label, pass_rng)
 
                 if not self.cfg.repeat:
                     break
@@ -330,7 +347,12 @@ class SimTelTFDataset:
 
             # One random shift per row; same shift applied to waveform and
             # pedestal so a pixel's ADC trace and its pedestal move together.
-            shifts = rng.uniform((B,), minval=0, maxval=P, dtype=tf.int32)
+            if self.cfg.reseed_each_pass:
+                # a stateless draw keyed by the batch (its event ids), so that every pass gives the same shifts to the same batch
+                key = tf.cast(tf.math.floormod(tf.reduce_sum(features["event_id"]), 2_000_003), tf.int32)
+                shifts = tf.random.stateless_uniform((B,), seed=tf.stack([tf.constant(int(self.cfg.nsb_roll_seed) % 2_000_003, tf.int32), key]), minval=0, maxval=P, dtype=tf.int32)
+            else:
+                shifts = rng.uniform((B,), minval=0, maxval=P, dtype=tf.int32)
             is_nsb = tf.equal(label, 0)
             # a gamma row gets the identity permutation: one gather per array does the job of "gather the rolled copy, then pick it with
             # tf.where", which copied every array (the waveform and the maps) twice
@@ -579,10 +601,25 @@ class SimTelTFDataset:
         # it needs (one waveform level, never dl0/dl1/true_image -- see below),
         # so it's the only one that opts into AsyncFileOpenerProcess's payload
         # trimming; the other TriggerChain call sites keep the untrimmed default.
-        opener_kwargs = {"keep_true_signal": True} if self.cfg.emit_true_signal else {}      # only passed when asked: other opener_cls keep working
-        if getattr(self.opener_cls, "accepts_native_waveform", False):
+        merging = self.cfg.real_noise is not None
+        merged_shower = merging and label != 0                                                      # a shower event added to a real noise event
+        opener_kwargs = {}                                                                          # only passed when asked: other opener_cls keep working
+        if merged_shower:
+            # the signal comes from the file at the pixel level: the true signal per pixel (true-signal), or the raw waveform of a noise-free simulation (r0); the feature
+            # "true_signal" is then the merged signal, computed here, not read
+            if self.cfg.real_noise.signal == "true-signal":
+                opener_kwargs["keep_true_signal_r0"] = True
+            else:
+                opener_kwargs["raw_waveform"] = True
+        elif not (merging and label == 0) and self.cfg.emit_true_signal:
+            opener_kwargs["keep_true_signal"] = True
+        opener_cls = self.opener_cls
+        if merging and label == 0:
+            from triggerkit.data.real_noise import RealNoiseOpener
+            opener_cls = RealNoiseOpener                  # the NSB files are real files: their pedestal events
+        if getattr(opener_cls, "accepts_native_waveform", False):
             opener_kwargs["native_waveform"] = True        # the waveform is cast to uint16 below: no need to send it as float32
-        with self.opener_cls(
+        with opener_cls(
             simtel_file,
             waveform_level=self.cfg.waveform_level,
             keep_dl0=False,
@@ -641,6 +678,18 @@ class SimTelTFDataset:
                     elif x.ndim != 3:
                         raise ValueError(f"Unexpected waveform ndim={x.ndim}, shape={x.shape}")
 
+                    merged_signal = None
+                    if merged_shower:
+                        # the simulated gamma on a real pedestal event: the waveform is the merged alpha, the true signal the gamma alone in that window
+                        try:
+                            merged = self.cfg.real_noise.merge(simtel_file, event_id, x, sd.get("true_signal_r0"))
+                        except ValueError as exc:
+                            raise FileReadError(f"{simtel_file!r}: {exc}") from exc
+                        if merged is None:
+                            continue
+                        x, merged_signal = merged
+                        ped = None                                  # the pedestal of the simulation is not the one of the real event: the merged alpha is already subtracted
+
                     if ped is None:
                         ped = np.zeros(x.shape[1], dtype=np.float32)  # assume shape [C, P, S] -> ped per pixel
                     ped_arr = np.array(ped, dtype=np.int32)
@@ -674,7 +723,7 @@ class SimTelTFDataset:
 
                     ts_arr = None
                     if self.cfg.emit_true_signal:
-                        ts_arr = sd.get("true_signal")
+                        ts_arr = merged_signal if merged_signal is not None else sd.get("true_signal")
                         if ts_arr is None:
                             if label != 0:
                                 raise FileReadError(f"{simtel_file!r}: no simulation/event/telescope/true_signal table for tel {tel_id_i}: convert the file with `triggerkit-convert --true-signal`")

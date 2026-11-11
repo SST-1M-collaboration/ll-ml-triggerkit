@@ -54,7 +54,7 @@ def pick_best_filter_from_history(history_dict, n_filters):
 
 
 def _selection_config(max_gamma=25_000, max_nsb=25_000, batch_size=128):
-    """Dataset config for held-out filter selection (more samples than calib)."""
+    """Dataset config for held-out filter selection (more samples than calib). Telescope 1 (the one telescope of the converted files), not the ``tel_id_only`` of the training."""
     return SimTelTFDatasetConfig(
         batch_size=batch_size,
         shuffle_samples=False,
@@ -143,18 +143,19 @@ def collect_multi_filter_scores(chain, score_outputs, gamma_files, config=None, 
 def _efficiency_at_rate(scores_g, scores_n, target_fraction):
     """Gamma efficiency of a single score column at a target NSB fire fraction.
 
-    Sets tau so ``P(nsb > tau) == target_fraction`` (the deploy-time ``score > tau``
-    rule), then returns ``(tau, gamma_eff, achieved_fraction)``. tau is the
-    ``(1 - target_fraction)`` quantile of the NSB scores; ties make the achieved
-    fraction land near, not exactly on, the target.
+    Sets tau with :func:`triggerkit.Statistics.metrics.pick_threshold_from_scores` (the deploy-time ``score > tau``
+    rule, the same as the calibration and the statistics files), then returns ``(tau, gamma_eff, achieved_fraction)``.
+    The achieved NSB fraction is the closest one the scores allow: a quantile of the NSB scores undershoots with quantized
+    scores (target 0.01 gave 0.0065 on integer scores), by a different amount for each filter, which made
+    :func:`select_best_filter` compare filters at different NSB rates.
     """
     scores_g = np.asarray(scores_g, np.float32).ravel()
     scores_n = np.asarray(scores_n, np.float32).ravel()
     if scores_n.size == 0 or scores_g.size == 0:
         return float("nan"), float("nan"), float("nan")
     target_fraction = float(np.clip(target_fraction, 0.0, 1.0))
-    tau = float(np.quantile(scores_n, 1.0 - target_fraction))
-    achieved = float(np.mean(scores_n > tau))
+    from triggerkit.Statistics.metrics import pick_threshold_from_scores
+    tau, achieved, _mode = pick_threshold_from_scores(scores_n, target_fraction, "gt")
     gamma_eff = float(np.mean(scores_g > tau))
     return tau, gamma_eff, achieved
 

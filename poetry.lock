@@ -2486,6 +2486,38 @@ files = [
 ]
 
 [[package]]
+name = "protozfits"
+version = "2.13.1"
+description = "Python bindings for the protobuf zfits library"
+optional = true
+python-versions = ">=3.9"
+files = [
+    {file = "protozfits-2.13.1-cp310-cp310-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:dd01504517de9883b5d229bce5a612d661560a96eb740971ab98f96621242d1b"},
+    {file = "protozfits-2.13.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:a2d428698a4942964645db6f1e59c391ae4f8ef8ee4ce4b7fd81b418f25f9ea8"},
+    {file = "protozfits-2.13.1-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:47466c2d7bb04025d5d5191d838fa52457fc6e56f3eb784950c1bb217cd32263"},
+    {file = "protozfits-2.13.1-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:8381edd9081a84fea17821d5806ec99d7eecefd9afefb2c0ccd6aa534162bd3d"},
+    {file = "protozfits-2.13.1-cp314-cp314-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:b2fd2170e6c7612f8b19ce74f0222f7df87af0574bc1787e90f4e6887f8fbd25"},
+    {file = "protozfits-2.13.1-cp314-cp314t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:42a322e599e30af13212a9c30b01641e9f7c82c7fe3a9f1fd4a79b40cb9565ed"},
+    {file = "protozfits-2.13.1-cp315-cp315-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:6dd05342288835a7ea0e1b9e5d01b1f49610c2de698f374271e9eae4150f873c"},
+    {file = "protozfits-2.13.1-cp315-cp315t-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:db2c29033630e38b10069d463442afe8ae3a12481be511d88fe97b2df78f1ebd"},
+    {file = "protozfits-2.13.1-cp39-cp39-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:39c9dde537fe08b5eee3ef0a0a5333a1e6c0f333dd7b42fd6686f2cbf911915a"},
+    {file = "protozfits-2.13.1.tar.gz", hash = "sha256:6be133da2d60dcd840cc86818eccd56be40f6a584d5aa0a548a617e0586f9fa1"},
+]
+
+[package.dependencies]
+astropy = "*"
+numpy = "*"
+protobuf = "*"
+pyyaml = "*"
+tqdm = "*"
+
+[package.extras]
+all = ["protozfits[dev,doc,tests]"]
+dev = ["sphinx-autobuild", "towncrier"]
+doc = ["ctao-sphinx-theme", "numpydoc", "sphinx", "sphinx-automodapi", "sphinx-changelog"]
+tests = ["pytest", "pytest-cov"]
+
+[[package]]
 name = "psutil"
 version = "7.2.2"
 description = "Cross-platform lib for process and system monitoring."
@@ -3810,9 +3842,10 @@ cffi = ["cffi (>=1.17,<2.0)", "cffi (>=2.0.0b)"]
 [extras]
 hexcnn = ["keras-hexagdly"]
 qat = ["hgq2", "hls4ml", "keras-hexagdly"]
-viewer = ["PyQt5", "eventio", "pyqtgraph"]
+real = ["protozfits"]
+viewer = ["PyQt5", "pyqtgraph"]
 
 [metadata]
 lock-version = "2.0"
 python-versions = ">=3.12,<3.14"
-content-hash = "607eb8e7251a60e19e17a2c59d4d800dbab6503d95fabd83dbfb9f0b19f7ad1c"
+content-hash = "1f7ad3c22bb139f3b8fc2b85643265653d1379362d7b67b11c0eb1dae380df4f"

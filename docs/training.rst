@@ -95,5 +95,6 @@ Pitfalls
 
 * The first edge of the TDSCAN score quantizer is 16 ADC: below it the TDSCAN sees nothing, so a mask with a lower cut asks it for what it cannot see.
 * ``true_signal`` is the model of the noise-free signal, validated on bright showers only; gammas with fewer than 9 stored photoelectrons have zeros.
+* The NSB events of the validation are all among the training ones (:doc:`dataset`): a validation NSB metric is optimistic for a model that can learn noise windows.
 * A validation set of one NSB file makes the AUC jump from epoch to epoch (single epochs reach 0.97 to 1.0 on a model that holds 0.91 the rest of the time).
   Judge the trend, or use more NSB files, not the best epoch.

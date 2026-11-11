@@ -18,6 +18,7 @@ from triggerkit.FileIO.FileOpenerCTAO import (
 
 
 def _default_calib_config():
+    """Calibration sample: telescope 1 (the one telescope of the converted files), not the ``tel_id_only`` of the training."""
     return SimTelTFDatasetConfig(
         batch_size=256,
         shuffle_samples=True,

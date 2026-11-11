@@ -2,6 +2,19 @@
 
     triggerkit-merge --simtel GAMMAS.simtel.gz --real SST1M2_....fits.fz --output-hdf5-file merged.hdf5 [--signal true-signal|r0] [options]      (``--help`` lists them)
 
+Ways to run it (the same arguments each time; ``/path/to`` is the clone of ll-ml-triggerkit)::
+
+    triggerkit-merge --simtel FILE --real FILE --output-hdf5-file merged.hdf5 [options]                                                  # the package installed (pip install -e .)
+    python -m triggerkit.tools.merge --simtel FILE --real FILE --output-hdf5-file merged.hdf5 [options]                                     # the package installed, or with PYTHONPATH=/path/to/ll-ml-triggerkit/src
+    PYTHONPATH=/path/to/ll-ml-triggerkit/src python /path/to/ll-ml-triggerkit/src/triggerkit/tools/merge.py --simtel FILE --real FILE --output-hdf5-file merged.hdf5 [options]      # the script by its path
+
+For example, from anywhere, the script by its path (S the simulated gammas, R the real file, M the merged output)::
+
+    PYTHONPATH=/chemin/ll-ml-triggerkit/src python /chemin/ll-ml-triggerkit/src/triggerkit/tools/merge.py --simtel S --real R --output-hdf5-file M.hdf5
+
+The script is ``src/triggerkit/tools/merge.py``. Run by its path, it needs ``PYTHONPATH=.../src`` (or the package installed): without it the import fails with "No module named 'triggerkit'". In the sst1mpipe 0.9.0
+environment (Python 3.10) the package cannot be installed: use the ``PYTHONPATH`` forms.
+
 Two ways to get the signal of a simulated gamma, the rest is the same (``--signal``):
 
 * ``true-signal`` (default): the simtel files are ordinary productions, with NSB and noise. The noise-free signal of every event is rebuilt from its photoelectrons
@@ -17,20 +30,37 @@ How the two are added (pixel by pixel, BEFORE the FADC, because the FADC is not 
 2. the signal of the gamma, moved in time by a whole number of samples so that its peak (the sample of the maximum of the signal summed over the pixels) lands on
    sample ``TARGET_SAMPLE`` = 25, the middle of the 50-sample window: ``true-signal`` re-evaluates the model at the shifted offset, ``r0`` shifts the samples (nothing is interpolated);
 3. ``raw + signal``, rounded to an integer ADC and clipped to 0..4095;
-4. the FADC of ``triggerkit.tools.convert_real.emulated_traces`` with the baseline of the real event: the result is the R0 alpha (432 patches x T, uint8) written in ``r0``.
+4. the FADC of ``triggerkit.tools.convert_real.emulated_traces`` with the baseline of the real event: the result is the R0 alpha (432 patches x T, uint8) written in ``r0alpha``
+   (``--stack-stages``: the stack, in ``r0``).
 
-The file holds what the loader reads for a gamma file (``r0``, ``simulation/event/subarray/shower`` with the true energy, direction, core of the simulated gamma, the true image per
+The file holds what the loader reads for a gamma file (``r0alpha``, ``simulation/event/subarray/shower`` with the true energy, direction, core of the simulated gamma, the true image per
 patch from its photoelectrons) and ``merge/event/telescope/tel_001``: for every event the simulated event id, the real event id, type and time, the shift, the offset of the model,
 and ``in_adc``; the settings and file names are attributes of that table. ``--also-noise-alone`` adds the alpha of the real event WITHOUT the gamma (same noise, paired). ``--true-signal`` adds ``simulation/event/telescope/true_signal/tel_001``: the gamma
-alone in the window of the real event, shifted like the signal that was added, as ``true_signal`` (float16 ADC per patch), ``true_signal_fadc`` (the same after the FADC stage, uint8) and
-``pe_count`` (the p.e. whose pulse starts in each sample): 3D targets for training on the merged events. With ``--signal r0`` there is no model: ``true_signal`` is the added signal summed per
-patch, ``true_signal_fadc`` its FADC, ``pe_count`` is zero and ``has_pe_count`` False.
+alone in the window of the real event, shifted like the signal that was added, as ``true_signal_r0_alpha`` (int16 ADC per patch: the sum of the 3 pixels, each rounded to an integer, before the clip),
+``true_signal_fadc`` (the same after the FADC stage, uint8) and ``pe_count`` (the p.e. whose pulse starts in each sample): 3D targets for training on the merged events (the columns of
+``triggerkit-convert --true-signal`` that a patch-level file has: there is no per-pixel ``true_signal_r0`` here). With ``--signal r0`` there is no model: ``true_signal_r0_alpha`` is the added
+signal summed per patch, ``true_signal_fadc`` its FADC, ``pe_count`` is zero and ``has_pe_count`` False.
 ``--stages`` and ``--stack-stages`` are those of ``triggerkit-convert`` (beta and gamma are computed on the merged alpha).
 
 Nothing is rescaled: the real raw ADC keeps the scale of the acquisition and the signal keeps the ADC scale of the simulation (``true-signal``: the FADC_AMPLITUDE, pulse and single-p.e.
 spectrum written in the simtel file; ``r0``: its own raw ADC). What it assumes, and does not check: that the gain of the simulated telescope is the one of the camera; that the pixel numbering of the simulation and of the real file are the same (the camera_config.cfg of
 both); that a window of T samples of the real file holds the gamma at sample 25 (no trigger time is involved: the TDSCAN of the test must find the gamma itself);
 the real files must have a pedestal event per simulated gamma (the command stops with an error otherwise, and writes nothing).
+
+Examples in the np.stack layout (``--stack-stages``: the table ``r0`` holds ``np.stack([alpha, beta, gamma])``, ``(n, 3, 432, 50)`` int16, channel 0 the alpha), the noise being in both cases the
+pedestal events of the real acquisition file (``.fits.fz``), one per gamma, in file order::
+
+    # 1. ordinary simtel.gz productions (with their own NSB and noise): the noise-free signal of each pixel is rebuilt from the photoelectrons (what
+    #    ``triggerkit-convert --true-signal`` stores as ``true_signal_r0``, here computed on the fly and not rounded before it is added), then added to the real raw pixels
+    triggerkit-merge --signal true-signal --stack-stages --simtel gamma_200000.simtel.gz gamma_200001.simtel.gz \
+        --real SST1M2_20261026_0012.fits.fz --output-hdf5-file gamma_on_real_stack.hdf5
+
+    # 2. simtel.gz simulated WITHOUT NSB or electronic noise (a production with no noise): their raw ``r0`` pixels, minus the median of each pixel (the pedestal), are the signal
+    triggerkit-merge --signal r0 --stack-stages --simtel gamma_nonoise_200000.simtel.gz \
+        --real SST1M2_20261026_0012.fits.fz SST1M2_20261026_0013.fits.fz --output-hdf5-file gamma_nonoise_on_real_stack.hdf5
+
+Add ``--true-signal`` for the gamma alone (``true_signal_r0_alpha`` per patch), ``--also-noise-alone`` for the same real events without the gamma, ``--stages`` for ``r0_stages``. Without
+``--stack-stages`` the same commands write the alpha in ``r0alpha`` (the layout the loader reads).
 
 Needs, in one environment, protozfits (real data), eventio, scipy (``true-signal``), pytables and numpy: the sst1mpipe 0.9.0 environment has them all. triggerkit must be importable.
 """
@@ -42,6 +72,7 @@ from collections import namedtuple
 
 import numpy as np
 
+from triggerkit.FileIO import layout
 from triggerkit.camera import simtel_blocks, sst1m
 from triggerkit.tools import convert_real, stages_table
 
@@ -127,7 +158,7 @@ def real_noise_events(real_files):
         with File(path) as source:
             for event in source.Events:
                 event_type = convert_real._int(event.event_type)
-                if not event_type & PEDESTAL_BIT:
+                if not layout.is_pedestal(event_type):                          # an empty event_type (-1) is not a pedestal event
                     continue
                 order = np.argsort(np.asarray(event.hiGain.waveforms.pixelsIndices))
                 yield {"raw": np.asarray(event.hiGain.waveforms.samples).reshape(len(order), -1)[order],
@@ -173,6 +204,7 @@ def _merge(simtel_files, real_files, output_file, signal, also_noise_alone, stag
             if tables_ is None:
                 convert_real._write_configuration(h5, noise["tel_id"])
                 tables_ = convert_real._create_tables(h5, noise["tel_id"], n_samples, stacked=stack_stages, real_tables=False)
+                r0alpha_table = tables_.alpha
                 merge_table = h5.create_table("/merge/event/telescope", "tel_001", {
                     "event_id": tables.Int64Col(pos=0), "sim_file": tables.Int16Col(pos=1), "sim_event_id": tables.Int64Col(pos=2), "real_event_id": tables.Int64Col(pos=3),
                     "real_event_type": tables.Int64Col(pos=4), "real_time_s": tables.Int64Col(pos=5), "real_time_ns": tables.Int64Col(pos=6), "real_run_id": tables.Int64Col(pos=7),
@@ -189,10 +221,10 @@ def _merge(simtel_files, real_files, output_file, signal, also_noise_alone, stag
                     shape = (sst1m.N_PATCHES, n_samples)
                     signal_table = h5.create_table("/simulation/event/telescope/true_signal", "tel_001", {
                         "event_id": tables.Int64Col(pos=0), "has_signal": tables.BoolCol(pos=1), "offset": tables.Float32Col(pos=2),
-                        "true_signal": tables.Float16Col(shape=shape, pos=3), "true_signal_fadc": tables.UInt8Col(shape=shape, pos=4),
+                        "true_signal_r0_alpha": tables.Int16Col(shape=shape, pos=3), "true_signal_fadc": tables.UInt8Col(shape=shape, pos=4),
                         "pe_count": tables.UInt8Col(shape=shape, pos=5), "in_adc": tables.BoolCol(pos=6), "has_pe_count": tables.BoolCol(pos=7)},
                         createparents=True, filters=filters,
-                        title="the gamma alone, in the window of the real event: true_signal (ADC, float), true_signal_fadc (after the FADC stage, uint8) and pe_count (p.e. whose pulse starts in the sample)")
+                        title="the gamma alone, in the window of the real event: true_signal_r0_alpha (ADC, int16 per patch, before the clip), true_signal_fadc (after the FADC stage, uint8) and pe_count (p.e. whose pulse starts in the sample)")
             if gamma.pixels.shape[0] != noise["raw"].shape[0]:
                 raise ValueError(f"the simulated camera has {gamma.pixels.shape[0]} pixels, the real one {noise['raw'].shape[0]}")
             shift = TARGET_SAMPLE - gamma.peak
@@ -202,9 +234,9 @@ def _merge(simtel_files, real_files, output_file, signal, also_noise_alone, stag
             else:
                 moved, offset = window_signal(gamma.pixels, shift, n_samples), np.nan
             alpha = merge_pixels(noise["raw"], noise["baseline"], noise["flags"], moved)
-            r0, _, _, shower, images = tables_
+            shower, images = tables_.shower, tables_.images
             event_id = written
-            r0.append([(0, event_id, 1, stages_table.stack_of(alpha) if stack_stages else alpha.astype(np.uint8))])
+            r0alpha_table.append([(0, event_id, 1, stages_table.stack_of(alpha) if stack_stages else alpha.astype(np.uint8))])
             run, energy, alt, az, core_x, core_y, h_first, x_max, depth, primary = gamma.truth
             shower.append([(run, event_id, energy, alt, az, core_x, core_y, h_first, x_max, depth, primary)])
             images.append([(0, event_id, 1, int(gamma.true_image.sum()), gamma.true_image)])
@@ -214,12 +246,11 @@ def _merge(simtel_files, real_files, output_file, signal, also_noise_alone, stag
                 stage_table.append([(event_id, *stages_table.stages_of(alpha))])
             if signal_table is not None:
                 if signal == "true-signal":
-                    patch_signal, patch_fadc, counts = TrueSignalModel.patch_arrays(gamma.result, n_samples, offset=offset)
+                    _, patch_signal, patch_fadc, counts = TrueSignalModel.arrays(gamma.result, n_samples, offset=offset)
                 else:                                          # the signal is the raw ADC of a noise-free simulation: no model, no p.e. placed in time
-                    patch_signal, patch_fadc = moved[sst1m.patch_triplets()].sum(axis=1), TrueSignalModel.fadc_of(moved).astype(np.uint8)
+                    patch_signal, patch_fadc = TrueSignalModel.adc_of(moved), TrueSignalModel.fadc_of(moved).astype(np.uint8)
                     counts = np.zeros((sst1m.N_PATCHES, n_samples), dtype=np.uint8)
-                limit = np.finfo(np.float16).max
-                signal_table.append([(event_id, True, offset, np.clip(patch_signal, -limit, limit).astype(np.float16), patch_fadc, counts, gamma.in_adc, signal == "true-signal")])
+                signal_table.append([(event_id, True, offset, patch_signal, patch_fadc, counts, gamma.in_adc, signal == "true-signal")])
             if alone_table is not None:
                 alone_table.append([(event_id, convert_real.emulated_traces(noise["raw"], noise["baseline"], noise["flags"]).astype(np.uint8))])
             written += 1
@@ -248,13 +279,13 @@ HOW THEY ARE ADDED (pixel by pixel, BEFORE the FADC, which is not linear: it cli
   1. a real noise event: a pedestal event (event_type with the bit 0x8 = INTERNAL: a random trigger, real NSB with no trigger bias), its raw pixels and recorded baseline;
   2. the signal of the gamma moved by a whole number of samples so that its peak lands on sample 25, the middle of the 50-sample window; nothing is interpolated;
   3. raw + signal, rounded to an integer ADC, clipped to 0..4095; nothing is rescaled: the real ADC and the simulated ADC keep their own scale;
-  4. the FADC of the real data (triggerkit.tools.convert_real.emulated_traces, real baseline): the merged R0 alpha, 432 patches x T samples, uint8, in the table r0.
+  4. the FADC of the real data (triggerkit.tools.convert_real.emulated_traces, real baseline): the merged R0 alpha, 432 patches x T samples, uint8, in the table r0alpha.
 
 OUTPUT (what the loader reads for a gamma file, plus the provenance)
-  r0                                 the merged alpha (with --stack-stages: np.stack([alpha, beta, gamma]), int16)
+  r0alpha                            the merged alpha (with --stack-stages the table is r0 and holds np.stack([alpha, beta, gamma]), int16)
   simulation/event/subarray/shower   the true energy, direction, core, first interaction, x_max, primary of the simulated gamma
   simulation/event/telescope/images  the true image per patch (photoelectrons of the simulated gamma)
-  simulation/event/telescope/true_signal/tel_001   with --true-signal: the gamma alone in the real window, true_signal / true_signal_fadc / pe_count (patch x sample)
+  simulation/event/telescope/true_signal/tel_001   with --true-signal: the gamma alone in the real window, true_signal_r0_alpha / true_signal_fadc / pe_count (patch x sample)
   merge/event/noise_alpha/tel_001    with --also-noise-alone: the alpha of the same real event WITHOUT the gamma (same noise), for paired comparisons
   merge/event/telescope/tel_001      per event: simulated file and event id, real event id / type / time / run, shift, peak sample, model offset, in_adc, sim_pedestal (the simulated
                                      pedestal Psi that was subtracted, ADC: 0 for true-signal and for a simulated r0 that has none);
@@ -271,9 +302,22 @@ WHAT IT ASSUMES AND DOES NOT CHECK
 
 ENVIRONMENT  one environment with protozfits (real data), eventio, scipy (true-signal), pytables and numpy: the sst1mpipe 0.9.0 environment has them all.
 
+HOW TO RUN IT (the same arguments each time; /path/to is the clone of ll-ml-triggerkit)
+  triggerkit-merge ARGS                                                                      the package installed (pip install -e .)
+  python -m triggerkit.tools.merge ARGS                                                      the package installed, or with PYTHONPATH=/path/to/ll-ml-triggerkit/src
+  PYTHONPATH=/path/to/ll-ml-triggerkit/src python /path/to/ll-ml-triggerkit/src/triggerkit/tools/merge.py ARGS      the script by its path
+  Run by its path, the script needs PYTHONPATH=.../src (or the package installed), else "No module named 'triggerkit'". The sst1mpipe 0.9.0 environment (Python 3.10) cannot install the
+  package: use the PYTHONPATH forms there.
+
 EXAMPLES
   triggerkit-merge --simtel gamma_200000.simtel.gz gamma_200005.simtel.gz --real SST1M2_20261026_0012.fits.fz --output-hdf5-file gamma_on_real.hdf5
   triggerkit-merge --signal r0 --simtel gammas_without_noise.simtel.gz --real real_a.fits.fz real_b.fits.fz --output-hdf5-file merged.hdf5 --also-noise-alone
+
+THE np.stack LAYOUT (--stack-stages: table r0 = np.stack([alpha, beta, gamma]), (n, 3, 432, 50) int16), the noise being the pedestal events of the real file in both cases
+  1. simtel.gz productions with NSB and noise: the signal is the noise-free signal rebuilt from the photoelectrons (the true_signal_r0 of triggerkit-convert --true-signal, computed here)
+     triggerkit-merge --signal true-signal --stack-stages --simtel gamma_200000.simtel.gz gamma_200001.simtel.gz --real SST1M2_20261026_0012.fits.fz --output-hdf5-file gamma_on_real_stack.hdf5
+  2. simtel.gz simulated without NSB or noise: their raw r0 pixels (minus the median of each pixel) are the signal
+     triggerkit-merge --signal r0 --stack-stages --simtel gamma_nonoise_200000.simtel.gz --real SST1M2_20261026_0012.fits.fz --output-hdf5-file gamma_nonoise_on_real_stack.hdf5
 """
 
 
@@ -289,14 +333,20 @@ def build_parser():
     how.add_argument("--tel", type=int, default=1, metavar="ID", help="telescope number in the simtel files (default: 1)")
     extra = parser.add_argument_group("extra content")
     extra.add_argument("--also-noise-alone", action="store_true", help="also write the alpha of each real event WITHOUT the gamma (merge/event/noise_alpha), same noise, for paired comparisons")
-    extra.add_argument("--true-signal", action="store_true", help="also write the gamma ALONE in the window of the real event: true_signal, true_signal_fadc and pe_count per patch and sample (table true_signal, same columns as triggerkit-convert --true-signal plus has_pe_count)")
+    extra.add_argument("--true-signal", action="store_true", help="also write the gamma ALONE in the window of the real event: true_signal_r0_alpha, true_signal_fadc and pe_count per patch and sample (table true_signal, the patch columns of triggerkit-convert --true-signal plus has_pe_count)")
     extra.add_argument("--stages", action="store_true", help="also write alpha, beta (patch7 sums) and gamma (TDSCAN score x 128) of the merged event in the table r0_stages, before any threshold")
-    extra.add_argument("--stack-stages", "--stack_stages", dest="stack_stages", action="store_true", help="write r0 as np.stack([alpha, beta, gamma]), (3, 432, T) int16 (the loader reads channel 0)")
+    extra.add_argument("--stack-stages", "--stack_stages", dest="stack_stages", action="store_true", help="write the table r0 as np.stack([alpha, beta, gamma]), (3, 432, T) int16, instead of r0alpha (not read by the loader of this package)")
     return parser
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.max_events is not None and args.max_events < 1:
+        parser.error(f"--max-events must be at least 1 (or left out for all the events), got {args.max_events}")
+    for path in (*args.simtel, *args.real):
+        if not os.path.exists(path):
+            parser.error(f"{path}: no such file")
     n = merge(args.simtel, args.real, args.output_hdf5_file, signal=args.signal, also_noise_alone=args.also_noise_alone, stages=args.stages, stack_stages=args.stack_stages,
               true_signal=args.true_signal, max_events=args.max_events, tel=args.tel)
     print(f"{n} merged events written to {args.output_hdf5_file}")

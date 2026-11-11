@@ -627,31 +627,37 @@ class TriggerCascade:
             existing = [p for p in paths if os.path.exists(p)]
             if existing and not overwrite:
                 raise FileExistsError(f"{existing} already exist; pass overwrite=True to replace them.")
-            description = self._description()
+            cascade_description = self._description()
             camera = getattr(self.stages[0], "camera_name", "unknown")
-            for k, path in enumerate(paths):
-                writer = H5StatsWriter(path, trigger_chain=self.stats_config(k, base_name), camera_name=camera,
-                                       description=f"{description} [cascade stage {k}: {self.names[k]}]".strip())
-                writer.begin_fold("all")
-                writer.f.attrs["cascade_json"] = json.dumps(
-                    H5StatsWriter._to_jsonable(description))
-                writer.f.attrs["cascade_stage"] = k
-                writers.append(writer)
+            try:
+                for k, path in enumerate(paths):
+                    text = " ".join(part for part in (str(description).strip() if description else "", f"[cascade stage {k}: {self.names[k]}]") if part)      # the caller's description is kept
+                    writer = H5StatsWriter(path, trigger_chain=self.stats_config(k, base_name), camera_name=camera, description=text)
+                    writers.append(writer)
+                    writer.begin_fold("all")
+                    writer.f.attrs["cascade_json"] = json.dumps(
+                        H5StatsWriter._to_jsonable(cascade_description))
+                    writer.f.attrs["cascade_stage"] = k
+            except BaseException:                        # a writer that fails to start leaves no .partial of the earlier ones
+                for writer in writers:
+                    writer.abort()
+                    if os.path.exists(writer.path):
+                        os.remove(writer.path)
+                raise
         try:
             g_total, g_pass = self._survival_counts(
                 gamma_files, nsb_files, 1, config, max_gamma_events, writers)
             n_total, n_pass = self._survival_counts(
                 gamma_files, nsb_files, 0, config, max_nsb_events, writers)
             for writer in writers:
-                writer.close(window_sec=ws)
+                writer.close(window_sec=ws, publish=False)
+            for writer in writers:                       # published one after the other only when every stage is written: a failure before leaves the old files untouched
+                writer.publish()
         except BaseException:
-            for writer, path in zip(writers, paths):     # never leave partial files behind
-                try:
-                    writer.f.close()
-                except Exception:
-                    pass
-                if os.path.exists(path):
-                    os.remove(path)
+            for writer in writers:                       # never leave partial files behind (the writers work on <path>.partial: a previous file is kept)
+                writer.abort()
+                if os.path.exists(writer.path):
+                    os.remove(writer.path)
             raise
 
         def _per_stage(total, passed):

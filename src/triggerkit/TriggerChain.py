@@ -126,7 +126,7 @@ def _verify_model_reloads(model_path, ckpt_path=None):
 
 
 class TriggerChain:
-  def __init__(self, simtel_path, simtel_nsb_path=None, num_samples=None):
+  def __init__(self, simtel_path, simtel_nsb_path=None, num_samples=None, datacube_samples=None):
     """``simtel_path`` / ``simtel_nsb_path``: a path or a list/tuple of paths (``str`` or
     ``pathlib.Path``). Both are stored as lists of ``str``; the NSB list may be empty.
 
@@ -134,7 +134,10 @@ class TriggerChain:
     uses the datacube length of the files. A smaller value builds a chain that sees only
     a window of the datacube; the window is cut by :class:`triggerkit.cascade.TriggerCascade`
     (``windows=``). Such a chain cannot read the files itself (training, statistics,
-    threshold search raise), since it would not know which samples to take."""
+    threshold search raise), since it would not know which samples to take.
+
+    ``datacube_samples``: the samples per event the data pipeline DELIVERS, when that is not the length stored in the first file. Only for simulated gammas merged on real
+    noise (:class:`triggerkit.data.RealNoise`): the files hold 82 samples, the merged events have the 50 of the real data (``real_noise.n_samples``)."""
     self.simtel_path = normalize_files(simtel_path, name="simtel_path")
     self.simtel_nsb_path = normalize_files(simtel_nsb_path, name="simtel_nsb_path")
     # the geometry is read from the first gamma file (else the first NSB file)
@@ -167,6 +170,8 @@ class TriggerChain:
     if not hasattr(self, 'num_samples'):
         raise ValueError("Could not determine number of samples from the simtel file.")
     # datacube length in the files; num_samples is what the model takes as input
+    if datacube_samples is not None:
+        self.num_samples = int(datacube_samples)
     self.file_num_samples = int(self.num_samples)
     if num_samples is not None:
         num_samples = int(num_samples)
@@ -746,8 +751,9 @@ class TriggerChain:
             try:
                 self.model.save(save_path_model)
                 _verify_model_reloads(save_path_model, ckpt_path)
-            except BaseException as e:
+            except Exception as e:                    # a save that fails must not hide the error of the training this `finally` belongs to, but it must be seen
                 print(f"Full model save failed with error '{e}'. A weights-only checkpoint is available at {ckpt_path}")
+                warnings.warn(f"the trained model was NOT saved to {save_path_model} ({type(e).__name__}: {e}); the weights-only checkpoint is {ckpt_path}", RuntimeWarning, stacklevel=2)
         else:
             print(f"Skip full-model save because Ctrl+C was requested. Latest weights are in {ckpt_path}")
 
@@ -1106,8 +1112,9 @@ class TriggerChain:
             try:
                 self.model.save(save_path_model)
                 _verify_model_reloads(save_path_model, ckpt_path)
-            except BaseException as e:
+            except Exception as e:                    # a save that fails must not hide the error of the training this `finally` belongs to, but it must be seen
                 print(f"Full model save failed with error '{e}'. A weights-only checkpoint is available at {ckpt_path}")
+                warnings.warn(f"the trained model was NOT saved to {save_path_model} ({type(e).__name__}: {e}); the weights-only checkpoint is {ckpt_path}", RuntimeWarning, stacklevel=2)
         else:
             print(f"Skip full-model save because Ctrl+C was requested. Latest weights are in {ckpt_path}")
 
@@ -1183,6 +1190,7 @@ class TriggerChain:
     (``made_by`` with ``rate_hz``) keeps that rate in ``/sources``, and the reader turns the fraction of its events that fire into a rate.
     """
     from triggerkit.alignment import window_length, plan_sources
+    from triggerkit.data.real_noise import RealNoise
     from triggerkit.data.simulation import PARTICLES, Simulation, count_written
     from triggerkit.Statistics.H5StatsWriter import GATED_OUT_SCORE, PARTICLE_CODES
     PARTICLE_NAMES = {code: name for name, code in PARTICLE_CODES.items()}
@@ -1490,6 +1498,7 @@ class TriggerChain:
                 max_gamma_samples_total=caps.get("gamma"),
                 max_nsb_samples_total=caps.get("nsb"),
                 max_samples_by_label={PARTICLES[p]: caps[p] for p in ("proton", "muon") if p in caps and caps[p] is not None},
+                real_noise=group_sim["nsb"] if "nsb" in group_sim and isinstance(group_sim["nsb"], RealNoise) else None,
                 **base_cfg_kwargs,
             )
 
@@ -1664,7 +1673,7 @@ class TriggerChain:
                     continue
                 made_by = getattr(source, "made_by", None) or {}
                 writer.add_source(condition, p,
-                                  written=count_written(files, tel_id_only if p != "nsb" else None),
+                                  written=source.written(tel_id_only if p != "nsb" else None),
                                   simulated=simulated, simulated_given=given, rate_hz=made_by.get("rate_hz"))
 
             for f, fold_idx, *_ in fold_setup:
@@ -1709,11 +1718,7 @@ class TriggerChain:
     finally:
         # Ensure file handles are closed before cleanup.
         if (stop_flags["interrupted"] or not writer_closed):
-            try:
-                writer.set_files(all_files)
-                writer.close(window_sec=stats_window_sec)
-            except Exception:
-                pass
+            writer.abort()                            # closes the handle WITHOUT publishing: a half-written file must never replace the previous result
         # Restore original signal handlers
         signal.signal(signal.SIGINT, previous_sigint)
         signal.signal(signal.SIGTERM, previous_sigterm)
@@ -1730,12 +1735,13 @@ class TriggerChain:
                     child.join(timeout=10)
 
         # Delete partial file if run was interrupted
-        if (stop_flags["interrupted"] or not writer_closed) and os.path.exists(out_h5_path):
+        partial_path = writer.path                    # the writer works there and renames it at close(): a previous file of the same name is kept
+        if (stop_flags["interrupted"] or not writer_closed) and os.path.exists(partial_path):
             try:
-                os.remove(out_h5_path)
-                print(f"Removed partial statistics file: {out_h5_path}")
+                os.remove(partial_path)
+                print(f"Removed partial statistics file: {partial_path}")
             except Exception as e:
-                print(f"Could not remove partial statistics file {out_h5_path}: {e}")
+                print(f"Could not remove partial statistics file {partial_path}: {e}")
 
     if stop_flags["interrupted"]:
         print("Statistics computation aborted.")
@@ -1798,6 +1804,9 @@ class TriggerChain:
 
   def find_threshold_for_target_rate(self, target_rate_hz, tolerance_hz=2, N_event_esimate_threshold=25_000, batch_size=4096, nsb_skip_original_events=True, nsb_roll_copies=1):
     """Estimate the tau giving ``target_rate_hz`` on NSB events (does NOT assign it).
+
+    Reads telescope 1 (``gamma_tel_id_only=1``, the one telescope of the converted files), whatever ``tel_id_only`` the training and the statistics use (their default is 2): pass
+    files of that telescope.
 
     Returns ``(tau, predicted_rate_hz)``. Despite its name, ``tolerance_hz`` is a
     PERCENTAGE of the target rate (2 -> +-2 %), kept for backward compatibility.
@@ -3043,6 +3052,7 @@ class TriggerChain:
     return trigger_chain_info
     
   def generate_output_filename(self, folder, base_name="gamma", suffix="stats.h5"):
+    folder = folder or "."                       # folder="" (the default of compute_statistics) is the current directory; os.makedirs("") raises
     if not os.path.exists(folder):
         os.makedirs(folder)
     stages_name = self.generate_chain_signature()
@@ -3053,7 +3063,7 @@ class TriggerChain:
     # stages_name with a stable hash so the name fits. The hash is deterministic
     # and identical across suffixes, so the model/history/weights still share a
     # prefix and inspect_training resolves them together.
-    MAX_NAME_BYTES = 255
+    MAX_NAME_BYTES = 255 - len(".partial")      # the statistics writer works on <name>.partial: that name must fit too
     if len(file_name.encode("utf-8")) > MAX_NAME_BYTES:
         import hashlib
         digest = hashlib.md5(stages_name.encode("utf-8")).hexdigest()

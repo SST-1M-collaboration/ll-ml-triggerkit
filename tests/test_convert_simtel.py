@@ -22,10 +22,10 @@ def test_first_events_are_identical_to_the_production(tmp_path):
     out = str(tmp_path / "out.hdf5")
     assert convert(SIMTEL, out, max_events=K, progress_every=0) == K
     with tables.open_file(out) as a, tables.open_file(PRODUCTION) as b:
-        paths = [t._v_pathname for t in a.walk_nodes("/", "Table") if t._v_pathname.split("/")[1] in ("r0", "r1", "dl1", "simulation") and "event" in t._v_pathname]
+        paths = [t._v_pathname for t in a.walk_nodes("/", "Table") if t._v_pathname.split("/")[1] in ("r0alpha", "r1", "dl1", "simulation") and "event" in t._v_pathname]
         assert paths
         for path in paths:
-            mine, theirs = a.get_node(path)[:], b.get_node(path)[:K]
+            mine, theirs = a.get_node(path)[:], b.get_node(path.replace("/r0alpha/", "/r0/"))[:K]          # the production was written before the table was called r0alpha
             assert mine.dtype == theirs.dtype and len(mine) == K, path
             for name in mine.dtype.names:
                 assert np.array_equal(mine[name], theirs[name], equal_nan=mine[name].dtype.kind == "f"), (path, name)
@@ -45,6 +45,6 @@ def test_photoelectron_times_add_one_table_and_leave_the_rest_identical(tmp_path
                 x, y = a.get_node(path)[:][name], b.get_node(path)[:][name]
                 assert np.array_equal(x, y, equal_nan=x.dtype.kind == "f"), (path, name)
         table = b.get_node("/simulation/event/telescope/pe_arrival/tel_001")[:]
-        assert len(table) == K and np.array_equal(table["event_id"], b.get_node("/r0/event/telescope/tel_001").col("event_id"))
+        assert len(table) == K and np.array_equal(table["event_id"], b.get_node("/r0alpha/event/telescope/tel_001").col("event_id"))
         true_sum = b.get_node("/simulation/event/telescope/images/tel_001").col("true_image_sum")
         assert np.array_equal(table["n_pe"].sum(axis=1), true_sum)             # every p.e. of the list lands in a patch

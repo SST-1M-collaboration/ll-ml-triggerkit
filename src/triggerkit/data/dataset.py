@@ -24,6 +24,12 @@ Design points agreed for the package refactor:
   reader BEFORE the shuffle, so the shuffle buffer holds the window and not the whole datacube; the cut is the one of
   :meth:`triggerkit.alignment.SourcePlan.static_cut`. A source aligned on the fly by an upstream chain, or ``gated_by``, cuts after the batches instead. In both
   cases the batch carries ``features["window_start"]`` and ``features["t_trig"]``.
+* Full batches only: every batch has exactly ``batch_size`` events (XLA compiles one static shape), so the last, shorter batch of a pass is dropped: up to ``batch_size - 1`` events of a
+  pass are not seen, and with ``gated_by`` or a window that drops events (the survivors are re-batched) the same holds for the survivors. Compare counts with ``compute_statistics``,
+  which reads every event, not with the batches of a dataset.
+* NSB and validation: the gamma files (and the extra types) are split between training and validation, the NSB is NOT: ``max_nsb_samples_train`` and ``max_nsb_samples_val`` both
+  read the FIRST events of the same NSB files, so the validation NSB events are all among the training ones (measured: 30 of 30, and 100 of 100 without caps). The roll of the
+  NSB rows differs between the two (another seed), the events do not. The NSB side of a validation metric is therefore not independent of the training.
 * ``gated_by``: cascade training -- keep only the events one or more frozen
   upstream chains fire on, so a downstream stage learns on what reaches it. The
   gates see the whole datacube (two streaming TDSCAN filters on the same data);
@@ -210,6 +216,7 @@ class TriggerDataset:
             if nsb_files is None:
                 raise TypeError("TriggerDataset(gamma_files, nsb_files): nsb_files is missing (or give one Simulation).")
             self.simulation = Simulation.from_lists(gamma_files, nsb_files)
+            gamma_files, nsb_files = self.simulation.files("gamma"), self.simulation.files("nsb")          # the lists the Simulation expanded (a glob pattern is not a file)
         self.gamma_files = normalize_files(gamma_files, name="gamma_files")
         self.nsb_files = normalize_files(nsb_files, name="nsb_files")
 
@@ -401,6 +408,7 @@ class TriggerDataset:
             # the survivors are re-batched to batch_size in _gate()
             batch_size=max(self.batch_size, 1024) if self.gated_by else self.batch_size,
             shuffle_samples=shuffle,
+            reseed_each_pass=not training,               # validation: every pass is the same events in the same order, with the same NSB rolls
             sample_shuffle_buffer=10000,
             seed=self.seed,
             load_ram=self.load_ram,
@@ -413,6 +421,7 @@ class TriggerDataset:
             emit_true_image=("true_image" in self.targets),
             emit_peak_time=("peak_time" in self.targets),
             emit_true_signal=("true_signal" in self.targets),
+            real_noise=self._real_noise(),
             include_event_features=True,
             event_feature_keys=self.event_feature_keys,
             nsb_skip_original_events=False,
@@ -429,16 +438,60 @@ class TriggerDataset:
             ignore_errors=True,
         )
 
+    def _check_real_noise(self, real_noise):
+        """Everything that would otherwise fail INSIDE the pipeline, where ``ignore_errors`` only skips the file with a warning.
+
+        The real files are read now; the window of every source that is not aligned on a trigger must fit the samples of the real data (the merged events have those, not the
+        82 of the simulation files: ``Fixed(16, 50)`` does not fit 50); and the NSB roll, which would turn the pixels of the real noise rows only, is flagged.
+        """
+        n_samples = real_noise.n_samples
+        if real_noise.target_sample >= n_samples:
+            raise ValueError(f"RealNoise(target_sample={real_noise.target_sample}) is outside the {n_samples} samples of the real noise: every gamma would be put on pure noise")
+        if real_noise.target_sample - real_noise.max_shift < 0 or real_noise.target_sample + real_noise.max_shift >= n_samples:
+            warnings.warn(f"RealNoise(target_sample={real_noise.target_sample}, max_shift={real_noise.max_shift}) can put the peak outside the {n_samples} samples of the real noise: the part of "
+                          "the pulse that leaves the window is cut, and a gamma whose whole pulse leaves it is skipped", UserWarning, stacklevel=3)
+        for particle, plan in (self._plans or {}).items():
+            if plan.mode == "on_the_fly":
+                continue
+            try:
+                plan.static_cut(n_samples)
+            except ValueError as exc:
+                raise ValueError(f"{particle}: the window {plan.window} does not fit the {n_samples} samples of the real noise (the merged events have the samples of the real "
+                                 f"data, not those of the simulation files): {exc}") from exc
+        if self.nsb_roll:
+            warnings.warn("RealNoise with nsb_roll=True: the NSB rows are rolled on the pixel axis but the gammas are merged on UNROLLED real noise, so the two classes differ "
+                          "by the broken neighbour correlations of the rolled rows, which a model can learn. Pass nsb_roll=False.", UserWarning, stacklevel=3)
+
+    def _real_noise(self):
+        """The :class:`~triggerkit.data.real_noise.RealNoise` that is the NSB source of this dataset, or ``None``."""
+        from triggerkit.data.real_noise import RealNoise
+        nsb = self.simulation.sources.get("nsb")
+        return nsb if isinstance(nsb, RealNoise) else None
+
     @staticmethod
-    def _check_true_signal(files):
-        """The shower files must hold the true signal table: a reader error would only skip the file (``ignore_errors``), silently."""
+    def _check_files(files, true_signal=None, raw=False, level="r0"):
+        """What a reader error would only turn into a silently skipped file (``ignore_errors``), checked now on the HDF5 ``files`` (a simtel file is read as it is, nothing to check):
+        a waveform table must be there and a raw ``r0`` must be ``(1296, T)`` (an older layout is refused, see :mod:`triggerkit.FileIO.layout`); with ``true_signal`` the table
+        ``true_signal`` must hold that column (``"true_signal_r0_alpha"`` for the feature, ``"true_signal_r0"`` to merge onto a real noise); with ``raw`` a raw ``r0`` must exist."""
         import h5py
+        from triggerkit.FileIO import layout
         for path in files:
             if not str(path).endswith((".h5", ".hdf5")):
-                raise ValueError(f"{path!r}: the true signal is read from HDF5 files converted with `triggerkit-convert --true-signal`")
+                if true_signal or raw:
+                    raise ValueError(f"{path!r}: the true signal and the raw r0 are read from HDF5 files converted with `triggerkit-convert`")
+                continue
             with h5py.File(path, "r") as f:
-                if "simulation/event/telescope/true_signal" not in f:
-                    raise ValueError(f"{path!r} has no simulation/event/telescope/true_signal: convert it again with `triggerkit-convert --true-signal`")
+                layout.check_file(path, level)
+                tables = layout.waveform_tables(f)
+                if raw and layout.R0 not in tables:
+                    raise ValueError(f"{path!r} has no raw r0 table: convert it again with `triggerkit-convert --waveform r0` (or both)")
+                if true_signal:
+                    if layout.TRUE_SIGNAL not in f:
+                        raise ValueError(f"{path!r} has no {layout.TRUE_SIGNAL}: convert it again with `triggerkit-convert --true-signal`")
+                    group = f[layout.TRUE_SIGNAL]
+                    if not all(true_signal in (group[name].dtype.names or ()) for name in group):
+                        raise ValueError(f"{path!r}: the true_signal table has no {true_signal} column (it was converted before the layout 'true_signal_r0 / true_signal_r0_alpha'): convert it "
+                                         "again with `triggerkit-convert --true-signal`")
 
     def _dataset(self, gamma_files, *, training, extra_files=None):
         """Raw ``tf.data`` of ``(features, label)`` for a gamma-file subset.
@@ -447,8 +500,16 @@ class TriggerDataset:
         pedestal, event_id, tel_id, and the scalar event features). Packing to
         model inputs happens downstream.
         """
-        if "true_signal" in self.targets:
-            self._check_true_signal([*gamma_files, *(f for files in (extra_files or {}).values() for f in files)])
+        real_noise = self._real_noise()
+        if real_noise is not None:
+            self._check_real_noise(real_noise)
+        shower_files = [*gamma_files, *(f for files in (extra_files or {}).values() for f in files)]
+        if real_noise is not None:
+            # merging onto a real noise: the pixel signal of the gammas (true-signal) or their raw r0 (r0); the true signal of the batch is the merged one, not read
+            self._check_files(shower_files, true_signal="true_signal_r0" if real_noise.signal == "true-signal" else None, raw=real_noise.signal == "r0", level=self.waveform_level)
+        else:
+            self._check_files(shower_files, true_signal="true_signal_r0_alpha" if "true_signal" in self.targets else None, level=self.waveform_level)
+            self._check_files(self.nsb_files or [], level=self.waveform_level)
         config = self._config(training=training)
         # a window that does not depend on the event (no source aligned on a trigger) is cut by the reader, before the shuffle: its buffer then holds
         # 50 samples of an event and not 82. The gates need the whole datacube, so with them the cut stays after.
@@ -599,10 +660,11 @@ class TriggerDataset:
     def _rotate_gammas(self, ds):
         """Give each gamma of the batch a random one of the ``gamma_rotations``: the same pixel permutation of its waveform, pedestal and maps."""
         table = tf.constant(self._rotation_index)                                  # (R, P)
+        generator = tf.random.Generator.from_seed(int(self.seed) + 4711)             # seeded: two runs with the same seed give the same rotations (a bare tf.random.uniform did not)
 
         def rotate(features, label):
             gamma = tf.equal(features["particle"], PARTICLES["gamma"])
-            choice = tf.where(gamma, tf.random.uniform(tf.shape(features["particle"]), 0, table.shape[0], dtype=tf.int32), 0)
+            choice = tf.where(gamma, generator.uniform(tf.shape(features["particle"]), 0, table.shape[0], dtype=tf.int32), 0)
             perm = tf.gather(table, choice)                                        # (B, P): out[p] = in[perm[p]], the fold plumbing's convention
             out = dict(features)
             out["waveform"] = tf.gather(features["waveform"], perm, axis=2, batch_dims=1)          # (B, 1, P, T)
@@ -611,7 +673,7 @@ class TriggerDataset:
                     out[key] = tf.gather(features[key], perm, axis=1, batch_dims=1)                # (B, P), (B, P, T) for the true signal
             return out, label
 
-        return ds.map(rotate, num_parallel_calls=tf.data.AUTOTUNE)
+        return ds.map(rotate, num_parallel_calls=1)            # sequential: the generator is stateful, parallel calls would draw in a nondeterministic order
 
     def _binary_label(self, ds):
         """gamma = 1 against everything else = 0, and ``features["particle_weight"]`` (the negative weight of the extra types)."""
