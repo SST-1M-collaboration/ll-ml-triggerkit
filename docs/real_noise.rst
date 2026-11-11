@@ -47,7 +47,7 @@ The merge is made on the RAW pixels (``r0``, 1296 pixels), before the FADC, what
 
    sim = Simulation(gamma=sorted(glob.glob("gammas/*.hdf5")), nsb=RealNoise(["noise_0012.hdf5"], signal="true-signal", seed=1337))
 
-**2. Simulation WITHOUT NSB or electronic noise: the signal is its raw ``r0``** (minus the median of each pixel). The files need the raw ``r0``, not the true signal.
+**2. Simulation WITHOUT NSB or electronic noise: the signal is its raw ``r0``** (minus the pedestal stored with it, which is 0 for a production with ``FADC_PEDESTAL 0``: then nothing is subtracted). The files need the raw ``r0``, not the true signal.
 
 .. code-block:: bash
 
@@ -79,7 +79,7 @@ Where the signal comes from
    signal of every pixel in integer ADC, rebuilt from the photoelectrons (``triggerkit-convert --true-signal``). Events with fewer than 9 photoelectrons have none and are left out.
 ``signal="r0"``
    The simulation was run WITHOUT noise (no NSB, no electronic noise). Its raw ``r0`` table (``triggerkit-convert --waveform r0``, 1296 pixels) is the signal on a constant pedestal:
-   the median of each pixel is taken away, as ``triggerkit-merge --signal r0`` does; no ``true_signal`` table is needed. This mode is exact too, now that the raw pixels are
+   the pedestal stored with it (the ``pedestal`` column of its ``r0`` table; 0 for ``FADC_PEDESTAL 0``) is taken away, never an estimate such as a median, as ``triggerkit-merge --signal r0`` does; no ``true_signal`` table is needed. This mode is exact too, now that the raw pixels are
    stored.
 
 How the pairs are drawn

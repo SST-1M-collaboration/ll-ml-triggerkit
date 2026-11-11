@@ -209,13 +209,16 @@ def test_the_true_signal_mode_needs_the_pixel_table_with_the_right_number_of_pix
 def test_the_r0_mode_takes_the_signal_from_the_noise_free_waveform(real_files):
     noise = RealNoise(real_files, signal="r0", seed=4)
     waveform = (500 + pulse(peak=33, amplitude=80)).astype(np.uint16)[None]                      # a constant pedestal of 500 and a pulse
-    alpha, moved = noise.merge("g.hdf5", 2, waveform, None)
+    pedestal = np.full(N_PIXELS, 500.0, np.float32)                                              # the one stored with the raw r0 of the simulation
+    with pytest.raises(ValueError, match="needs the pedestal"):
+        noise.merge("g.hdf5", 2, waveform, None)                                                 # never estimated (no median): it has to be given
+    alpha, moved = noise.merge("g.hdf5", 2, waveform, None, pedestal)
     assert int(np.argmax(moved.astype(np.float32).sum(axis=0))) == 25
     per_patch = np.bincount(sst1m.patch_of_pixel()[300:330], minlength=N_PATCHES).max()
     assert moved.astype(np.float32).max() == 80.0 * per_patch                                    # the pedestal of 500 is taken away, the pulse of 80 ADC per pixel stays
     file_index, row, _ = noise.pair("g.hdf5", 2)
     pool = load_pool(real_files[file_index])
-    pixels = (waveform[0].astype(float) - np.median(waveform[0], axis=1)[:, None])
+    pixels = waveform[0].astype(float) - pedestal[:, None]
     exact = merge.merge_pixels(pool.waveforms[row], pool.pedestal[row], np.ones(N_PIXELS, np.uint8), merge.window_signal(pixels, 25 - 33, T))
     np.testing.assert_array_equal(alpha[0], exact)
 
@@ -287,3 +290,12 @@ def test_the_integer_patch_signal_saturates_instead_of_wrapping():
     assert adc[3, 0] == 32767 and adc.dtype == np.int16
     pixels[sst1m.patch_triplets()[3], 0] = -20000.0
     assert ts.TrueSignalModel.adc_of(pixels)[3, 0] == -32768
+
+
+def test_a_pulse_wider_than_half_the_window_is_not_cut_by_the_pedestal_of_the_r0_mode(real_files):
+    """The median of a pixel is the pedestal only while the pulse is shorter than half the window: a wide pulse made it eat the signal. The stored pedestal (0 here) removes nothing."""
+    noise = RealNoise(real_files, signal="r0", seed=4, target_sample=5)                              # the peak (the first of the equal samples) stays at sample 5: no shift, nothing leaves the window
+    wide = np.zeros((1, N_PIXELS, 50), np.uint16); wide[0, 300, 5:45] = 30                          # 40 of 50 samples above 0: its median is 30
+    _, moved = noise.merge("g.hdf5", 2, wide, None, np.zeros(N_PIXELS, np.float32))
+    patch = int(sst1m.patch_of_pixel()[300])
+    assert moved.astype(np.float32)[patch].sum() == 30.0 * 40                                    # the whole pulse survives (a median subtraction left 0)

@@ -168,12 +168,38 @@ triggerkit-merge --simtel gamma_200000.simtel.gz --real SST1M2_20261026_0012.fit
 | `--real FILE...` | required | the real data files (`*.fits.fz`) that provide the noise |
 | `--output-hdf5-file FILE.hdf5` | required | the file to write (overwritten); written as `FILE.hdf5.partial` and renamed at the end |
 | `--max-events N` | all | stop after N merged events |
-| `--signal true-signal\|r0` | `true-signal` | where the signal of a gamma comes from: `true-signal` = ordinary simtel files (with their noise), the noise-free signal rebuilt from the photoelectrons, only for events with a p.e. list (>= 9 p.e.); `r0` = simtel files simulated WITHOUT noise, their raw ADC (minus the median of each pixel, the pedestal) is the signal; a file that does not look noise-free gets a warning |
+| `--signal true-signal\|r0` | `true-signal` | where the signal of a gamma comes from: `true-signal` = ordinary simtel files (with their noise), the noise-free signal rebuilt from the photoelectrons, only for events with a p.e. list (>= 9 p.e.); `r0` = simtel files simulated WITHOUT noise, their raw ADC (minus the pedestal stored in the file, 0 for `FADC_PEDESTAL 0`) is the signal; a file that does not look noise-free gets a warning |
 | `--tel ID` | 1 | telescope number in the simtel files |
 | `--also-noise-alone` | off | also write, for each event, the alpha of the same real event WITHOUT the gamma, for paired comparisons (`merge/event/noise_alpha`) |
+| `--seed N` | off (in order) | pair each gamma with a pedestal event drawn AT RANDOM, reproducibly: the pool of pedestal events is shuffled with `N`, each used once before any is reused (no error when the gammas outnumber the pedestals); with FITS files the events are read ahead by 4 processes (about 18 ms per gamma instead of 40), no extra cost with real files converted by `triggerkit-convert --waveform r0 --no-emulated --pedestal-only` (`--real` takes both); `real_file` and `real_row` of the merge table say which event each gamma got |
+| `--keep-simulated-alpha` | off | also write the `r0alpha` of the simulation AS SIMULATED (`merge/event/simulated_r0alpha`): unshifted, in its own window (the samples of the simtel file), the FADC of its raw `r0` with the pedestal stored in its file (the table `triggerkit-convert` writes); about 15 kB per event |
 | `--true-signal` | off | also write the gamma alone in the real window: `true_signal_r0_alpha`, `true_signal_fadc`, `pe_count` per patch and sample, the patch columns of `triggerkit-convert --true-signal` plus `has_pe_count` (with `--signal r0` there is no model: `pe_count` is zero and `has_pe_count` False) |
 | `--stages` | off | also write `alpha`, `beta`, `gamma` of the merged event in `r0_stages` (as `triggerkit-convert --stages`, before any threshold) |
 | `--stack-stages` | off | write the table `r0` as `np.stack([alpha, beta, gamma])`, `(3, 432, 50)` int16, instead of `r0alpha` (not read by this package's loader) |
+
+**Recipe: pure gammas (no NSB) on real noise, with the simulation's own `r0alpha` kept and a seed**
+
+```bash
+triggerkit-merge --signal r0 \
+    --simtel gammas/*.simtel.gz \
+    --real real/*.fits.fz \
+    --output-hdf5-file gammas_on_real.hdf5 \
+    --keep-simulated-alpha \
+    --seed 1234 \
+    --max-events 197000
+```
+
+`--signal r0` subtracts the pedestal stored in the simulation file (0 for `FADC_PEDESTAL 0`: nothing), never a median. `--keep-simulated-alpha` writes the `r0alpha` of the simulation as simulated (unshifted, its own
+window: 50 samples for `NSB_no`, 82 for `NSB_med4_82bins`) in `merge/event/simulated_r0alpha`. `--seed 1234` draws the pedestal of each gamma at random, reproducibly; the pedestals are reused evenly when there are more gammas than pedestals
+(10 000 gammas on 500 pedestals: 20 uses each). Without `--seed` the pairing is in order and stops with an error when the pedestals run out. `--simtel` and `--real` take lists or unquoted globs.
+For a large production convert the pedestals once, the random draw is then as fast as in order (FITS directly: about 18 ms per gamma with the 4 reader processes, 40 with one):
+
+```bash
+for f in real/*.fits.fz; do triggerkit-convert --to-process-file $f --output-hdf5-file ped/$(basename $f .fits.fz).hdf5 --waveform r0 --no-emulated --pedestal-only; done
+triggerkit-merge --signal r0 --keep-simulated-alpha --seed 1234 --simtel gammas/*.simtel.gz --real ped/*.hdf5 --output-hdf5-file gammas_on_real.hdf5 --max-events 197000
+```
+
+Details, measurements and the content of the file: `docs/merge.rst`.
 
 **What the file contains**: `r0alpha` (the merged R0alpha, 432 patches x 50 samples, uint8; with `--stack-stages` the table is `r0`); `simulation/event/subarray/shower` (true energy, direction, core, first interaction, x_max, primary of the
 simulated gamma); `simulation/event/telescope/images` (the true image per patch); and `merge/event/telescope/tel_001`, one row per event: the simulated file and event id, the real event id, type, time

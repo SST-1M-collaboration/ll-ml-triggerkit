@@ -682,7 +682,7 @@ class SimTelTFDataset:
                     if merged_shower:
                         # the simulated gamma on a real pedestal event: the waveform is the merged alpha, the true signal the gamma alone in that window
                         try:
-                            merged = self.cfg.real_noise.merge(simtel_file, event_id, x, sd.get("true_signal_r0"))
+                            merged = self.cfg.real_noise.merge(simtel_file, event_id, x, sd.get("true_signal_r0"), sd.get("r0_pedestal"))
                         except ValueError as exc:
                             raise FileReadError(f"{simtel_file!r}: {exc}") from exc
                         if merged is None:

@@ -18,7 +18,7 @@ only those: 871 events, 68.5 MB for a night)::
     triggerkit-convert --to-process-file gamma_200000.simtel.gz --output-hdf5-file gamma_200000.hdf5 --true-signal
     nsb = RealNoise(["noise_0012.hdf5"], signal="true-signal")
 
-    # 2. a simulation WITHOUT NSB or electronic noise: the signal is its raw r0 minus the median of each pixel (the file needs the raw r0)
+    # 2. a simulation WITHOUT NSB or electronic noise: the signal is its raw r0 minus the pedestal stored with it (the file needs the raw r0)
     triggerkit-convert --to-process-file gamma_nonoise_200000.simtel.gz --output-hdf5-file gamma_nonoise_200000.hdf5 --waveform r0
     nsb = RealNoise(["noise_0012.hdf5"], signal="r0")
 
@@ -50,7 +50,7 @@ signal of a gamma comes from:
                     in integer ADC, rebuilt from the photoelectrons. Gammas with fewer than 9 p.e. have no signal and are skipped. A table written before this column existed is refused, with
                     the command to convert it again.
 ``"r0"``           the raw ``r0`` table (``triggerkit-convert --waveform r0``) of a simulation made WITHOUT noise (no NSB, no electronic noise): its raw ADC is already the signal on a constant
-                    pedestal and is taken as it is, pixel by pixel, after subtracting the median of each pixel, as ``triggerkit-merge --signal r0``.
+                    pedestal and is taken as it is, pixel by pixel, after subtracting the pedestal stored with it (its ``pedestal`` column, 0 for ``FADC_PEDESTAL 0``: nothing is estimated), as ``triggerkit-merge --signal r0``.
 
 The signal is moved by a whole number of samples (nothing is interpolated) so that its peak, the sample of the maximum of the signal summed over the camera, lands on
 ``target_sample`` (25, the middle of the 50 real samples), plus, if ``max_shift`` is not 0, a random whole shift in ``[-max_shift, max_shift]`` that is also a function of the
@@ -212,11 +212,12 @@ class RealNoise(NsbSet):
             index -= len(pool)
         raise AssertionError("unreachable")
 
-    def merge(self, gamma_file, event_id, waveform, true_signal_r0=None):
+    def merge(self, gamma_file, event_id, waveform, true_signal_r0=None, r0_pedestal=None):
         """The gamma merged with its noise: ``(alpha (1, 432, T) uint16, signal (432, T) float16)``, or ``None`` when the event has no signal to add.
 
         The signal of the gamma is, with ``signal="true-signal"``, ``true_signal_r0`` ``(1296, Ts)`` (the column of the ``true_signal`` table: integer ADC per pixel, ``None`` when the file has
-        no such table) and, with ``signal="r0"``, ``waveform``, the raw ``r0`` ``(1, 1296, Ts)`` (or ``(1296, Ts)``) of a noise-free simulation, its median per pixel taken away.
+        no such table) and, with ``signal="r0"``, ``waveform``, the raw ``r0`` ``(1, 1296, Ts)`` (or ``(1296, Ts)``) of a noise-free simulation, minus ``r0_pedestal`` ``(1296,)``, the pedestal stored with it (the
+        ``pedestal`` column of its ``r0`` table; 0 for a production with ``FADC_PEDESTAL 0``, which then changes nothing). The pedestal is required: no estimate (a median) is made.
         ``alpha`` is the FADC of the real pedestal event plus that signal; ``signal`` the gamma alone in the window of the real event, summed over the 3 pixels of each patch
         (each pixel rounded to an integer first), as ``triggerkit-merge --true-signal`` writes it.
         """
@@ -227,7 +228,12 @@ class RealNoise(NsbSet):
         else:
             raw = np.asarray(waveform, dtype=np.float64)
             raw = raw.reshape(-1, raw.shape[-1])
-            pixels = raw - np.median(raw, axis=1)[:, None]
+            if r0_pedestal is None:
+                raise ValueError("signal='r0' needs the pedestal stored with the raw r0 of the simulation (the `pedestal` column of its r0 table): it is subtracted as it is, never estimated")
+            pedestal = np.asarray(r0_pedestal, dtype=np.float64).reshape(-1)
+            if pedestal.shape[0] != raw.shape[0]:
+                raise ValueError(f"the pedestal has {pedestal.shape[0]} values for {raw.shape[0]} pixels")
+            pixels = raw - pedestal[:, None]
         if pixels.shape[0] != sst1m.N_PIXELS:
             raise ValueError(f"the simulated signal has {pixels.shape[0]} pixels, expected {sst1m.N_PIXELS}: {'give a raw r0 (convert with --waveform r0)' if self.signal == 'r0' else 'a true_signal_r0 table'} of the camera")
         if not pixels.any():

@@ -113,7 +113,7 @@ def test_the_r0_mode_needs_the_raw_waveform_and_no_true_signal_table(files):
     assert g.sum() >= 16                                                                      # the last, short batch is dropped
     for wf, event_id in zip(got["wf"][g], got["event_id"][g]):
         row = int(np.flatnonzero(table["event_id"] == event_id)[0])
-        alpha, _ = noise.merge(plain[1], event_id, raw["waveform"][row], None)
+        alpha, _ = noise.merge(plain[1], event_id, raw["waveform"][row], None, raw["pedestal"][row])
         np.testing.assert_array_equal(wf, alpha)
 
 

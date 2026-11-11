@@ -383,6 +383,8 @@ class FileOpenerCTAOHDF5:
                                     stat_event["true_signal"] = self._column(row, names, layout.TRUE_SIGNAL_R0_ALPHA, np.float16)      # (432, T), ADC, before the clip; float16: half the queue
                                 if self.keep_true_signal_r0:
                                     stat_event["true_signal_r0"] = self._column(row, names, layout.TRUE_SIGNAL_R0, np.int16)         # (1296, T), integer ADC per pixel
+                            if self.raw_waveform:
+                                stat_event["r0_pedestal"] = np.asarray(event["pedestal"], dtype=np.float32)                          # (1296,): the pedestal stored with the raw r0, for RealNoise(signal="r0")
 
                             event_stat_list.append(stat_event)
 

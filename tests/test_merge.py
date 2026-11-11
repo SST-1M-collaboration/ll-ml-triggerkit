@@ -79,9 +79,9 @@ def test_help_names_both_signals_and_every_option(capsys):
         parser.parse_args(["--help"])
     assert stop.value.code == 0
     text = capsys.readouterr().out
-    for word in ("true-signal", "r0", "BEFORE the FADC", "pedestal", "--true-signal", "--stages", "--also-noise-alone", "WHAT IT ASSUMES"):
-        assert word in text
-    for removed in ("--target-sample", "--jitter", "--seed", "--noise-events", "--reuse-noise", "--scale"):
+    for word in ("true-signal", "r0", "BEFORE the FADC", "pedestal", "--true-signal", "--stages", "--also-noise-alone", "--keep-simulated-alpha", "--seed", "WHAT IT ASSUMES"):
+        assert word in text                                                                    # --seed and --keep-simulated-alpha were asked for by the owner
+    for removed in ("--target-sample", "--jitter", "--noise-events", "--reuse-noise", "--scale"):
         assert removed not in text
 
 
@@ -123,3 +123,151 @@ def test_the_stack_mode_still_merges_simtel_and_real_pedestals(tmp_path):
         alpha, stacked = a.root.r0alpha.event.telescope.tel_001.read()["waveform"], b.root.r0.event.telescope.tel_001.read()["waveform"]
         assert "/r0alpha" not in b
     assert stacked.shape == (5, 3, sst1m.N_PATCHES, 50) and stacked.dtype == np.int16 and np.array_equal(stacked[:, 0], alpha)
+
+
+def test_signal_r0_with_true_signal_warns_that_nothing_is_reconstructed(tmp_path):
+    """--signal r0 --true-signal writes the PURE r0 of the simulation, not a truth rebuilt from the photoelectrons: the command says so, before it reads anything."""
+    out = str(tmp_path / "m.hdf5")
+    with pytest.warns(UserWarning, match="derived from the r0 of your simulation, NOT reconstructed"):
+        with pytest.raises(Exception):                                               # the files do not exist: the warning comes first
+            merge.merge([str(tmp_path / "g.simtel.gz")], [str(tmp_path / "r.fits.fz")], out, signal="r0", true_signal=True)
+    import warnings
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        with pytest.raises(Exception):
+            merge.merge([str(tmp_path / "g.simtel.gz")], [str(tmp_path / "r.fits.fz")], out, signal="true-signal", true_signal=True)      # the model: no such warning
+        with pytest.raises(Exception):
+            merge.merge([str(tmp_path / "g.simtel.gz")], [str(tmp_path / "r.fits.fz")], out, signal="r0")                                  # no --true-signal: nothing written to warn about
+    assert not [w for w in caught if "NOT reconstructed" in str(w.message)]
+
+
+@pytest.mark.skipif(not (SIMTEL and FITS), reason="TRIGGERKIT_TEST_SIMTEL and TRIGGERKIT_TEST_FITS are not set (a simtel file and a real file)")
+def test_the_simulated_r0alpha_is_kept_unshifted_and_equals_what_the_converter_writes(tmp_path):
+    """--keep-simulated-alpha: the r0alpha of the simulation as simulated (own window, own pedestal, no shift), the very table triggerkit-convert writes for the same event."""
+    tables = pytest.importorskip("tables")
+    pytest.importorskip("protozfits")
+    pytest.importorskip("ctapipe")
+    from triggerkit.tools.convert_simtel import convert
+
+    merged, converted = str(tmp_path / "merged.hdf5"), str(tmp_path / "converted.hdf5")
+    assert merge.merge([SIMTEL], [FITS], merged, signal="r0", true_signal=True, keep_simulated_alpha=True, max_events=6, progress_every=0) == 6
+    convert(SIMTEL, converted, max_events=400, progress_every=0)
+    with tables.open_file(merged) as a, tables.open_file(converted) as b:
+        kept = a.root.merge.event.simulated_r0alpha.tel_001.read()
+        info = a.root.merge.event.telescope.tel_001.read()
+        window = a.root.r0alpha.event.telescope.tel_001.read()["waveform"].shape[2]
+        alpha = b.root.r0alpha.event.telescope.tel_001.read()
+    assert np.array_equal(kept["event_id"], info["event_id"]) and kept["waveform"].dtype == np.uint8
+    assert kept["waveform"].shape[2] == alpha["waveform"].shape[2] != window                       # the simulation's own samples (82), not the 50 of the real noise
+    for k in range(6):
+        row = int(np.flatnonzero(alpha["event_id"] == info["sim_event_id"][k])[0])
+        assert np.array_equal(kept["waveform"][k], alpha["waveform"][row])
+
+
+def test_the_simulated_alpha_is_not_written_unless_asked_and_says_so_in_the_help():
+    from triggerkit.tools.merge import build_parser
+    parser = build_parser()
+    assert parser.parse_args(["--simtel", "a", "--real", "b", "--output-hdf5-file", "c"]).keep_simulated_alpha is False
+    assert parser.parse_args(["--simtel", "a", "--real", "b", "--output-hdf5-file", "c", "--keep-simulated-alpha"]).keep_simulated_alpha is True
+
+
+# ------------------------------------------------------------------------------------------------------------------------------ --seed: the real pedestal events in a random, reproducible order
+def test_the_random_pedestal_order_uses_every_event_once_before_any_is_used_again(monkeypatch):
+    import sys
+    import types
+
+    pool = [(0, r) for r in range(6)] + [(1, r) for r in range(4)]                     # 10 pedestal events in 2 files
+
+    class Events:
+        def __init__(self, file_index): self.file_index = file_index
+        def __getitem__(self, row): return (self.file_index, row)
+
+    class FakeFile:
+        def __init__(self, path): self.Events = Events(int(path))
+        def __enter__(self): return self
+        def __exit__(self, *exc): return False
+
+    monkeypatch.setitem(sys.modules, "protozfits", types.SimpleNamespace(File=FakeFile))
+    monkeypatch.setattr(merge, "pedestal_index", lambda real_files, executor=None: list(pool))
+    monkeypatch.setattr(merge, "_noise_dict", lambda event, file_index, row: {"file_index": file_index, "row": row, "event": event})
+    stream = merge.random_noise_events(["0", "1"], seed=3, workers=1)
+    drawn = [(e["file_index"], e["row"]) for e, _ in zip(stream, range(25))]
+    assert sorted(drawn[:10]) == sorted(pool) and sorted(drawn[10:20]) == sorted(pool)       # a permutation, then another one: gammas outnumbering the pedestals reuse them evenly
+    assert drawn[:10] != pool and drawn[:10] != drawn[10:20]                                   # shuffled, and not the same shuffle twice
+    again = merge.random_noise_events(["0", "1"], seed=3, workers=1)
+    assert [(e["file_index"], e["row"]) for e, _ in zip(again, range(25))] == drawn           # the same seed, the same sequence
+    other = merge.random_noise_events(["0", "1"], seed=4, workers=1)
+    assert [(e["file_index"], e["row"]) for e, _ in zip(other, range(25))] != drawn
+    monkeypatch.setattr(merge, "pedestal_index", lambda real_files, executor=None: [])
+    with pytest.raises(RuntimeError, match="no pedestal event"):
+        next(merge.random_noise_events(["0"], seed=1, workers=1))
+
+
+def test_a_negative_seed_is_refused_and_the_default_is_in_order(tmp_path):
+    from triggerkit.tools.merge import build_parser
+    assert build_parser().parse_args(["--simtel", "a", "--real", "b", "--output-hdf5-file", "c"]).seed is None
+    assert build_parser().parse_args(["--simtel", "a", "--real", "b", "--output-hdf5-file", "c", "--seed", "7"]).seed == 7
+    with pytest.raises(ValueError, match="seed must be >= 0"):
+        merge.merge(["g.simtel.gz"], ["r.fits.fz"], str(tmp_path / "o.hdf5"), seed=-1)
+    with pytest.raises(SystemExit):
+        merge.main(["--simtel", __file__, "--real", __file__, "--output-hdf5-file", str(tmp_path / "o.hdf5"), "--seed", "-2"])
+
+
+@pytest.mark.skipif(not (SIMTEL and FITS), reason="TRIGGERKIT_TEST_SIMTEL and TRIGGERKIT_TEST_FITS are not set (a simtel file and a real file)")
+def test_the_seed_draws_the_noise_at_random_and_reproducibly(tmp_path):
+    tables = pytest.importorskip("tables")
+    pytest.importorskip("protozfits")
+
+    def run(name, **kw):
+        out = str(tmp_path / f"{name}.hdf5")
+        assert merge.merge([SIMTEL], [FITS], out, max_events=6, progress_every=0, **kw) == 6
+        with tables.open_file(out) as h5:
+            return h5.root.merge.event.telescope.tel_001.read(), h5.root.r0alpha.event.telescope.tel_001.read()["waveform"]
+
+    in_order, _ = run("order")
+    a, alpha_a = run("a", seed=5)
+    b, alpha_b = run("b", seed=5)
+    c, _ = run("c", seed=6)
+    assert np.array_equal(a["real_event_id"], b["real_event_id"]) and np.array_equal(alpha_a, alpha_b)         # the same seed: the same pairs and the same events
+    assert not np.array_equal(a["real_row"], c["real_row"]) and not np.array_equal(a["real_row"], in_order["real_row"])
+    assert np.all(np.diff(in_order["real_row"]) > 0)                                                            # without a seed: in order, as before
+    assert len(set(a["real_row"].tolist())) == 6 and (a["real_file"] == 0).all()                                # each pedestal event once, in a file known by its index
+
+
+@pytest.mark.skipif(not (SIMTEL and FITS), reason="TRIGGERKIT_TEST_SIMTEL and TRIGGERKIT_TEST_FITS are not set (a simtel file and a real file)")
+def test_a_converted_pedestal_file_gives_the_same_merge_as_the_fits_file_in_order_and_with_a_seed(tmp_path):
+    """--real takes the file made by `triggerkit-convert --waveform r0 --no-emulated --pedestal-only` too: the same pedestal events in the same order, so the same pairs and the same alphas."""
+    tables = pytest.importorskip("tables")
+    pytest.importorskip("protozfits")
+    converted = str(tmp_path / "ped.hdf5")
+    convert_real.convert(FITS, converted, max_events=1500, emulated=False, progress_every=0, waveform="r0", pedestal_only=True)
+
+    def run(name, real, **kw):
+        out = str(tmp_path / f"{name}.hdf5")
+        assert merge.merge([SIMTEL], [real], out, max_events=5, progress_every=0, **kw) == 5
+        with tables.open_file(out) as h5:
+            return h5.root.merge.event.telescope.tel_001.read(), h5.root.r0alpha.event.telescope.tel_001.read()["waveform"]
+
+    for kw in ({}, {"seed": 9}):
+        from_fits, alpha_fits = run("fits", FITS, **kw)
+        from_h5, alpha_h5 = run("h5", converted, **kw)
+        assert np.array_equal(from_fits["real_event_id"], from_h5["real_event_id"]) and np.array_equal(alpha_fits, alpha_h5), kw
+        assert np.array_equal(from_fits["real_time_s"], from_h5["real_time_s"])
+
+
+@pytest.mark.skipif(not (SIMTEL and FITS), reason="TRIGGERKIT_TEST_SIMTEL and TRIGGERKIT_TEST_FITS are not set (a simtel file and a real file)")
+def test_reading_the_fits_pedestals_ahead_in_several_processes_changes_nothing_but_the_time(tmp_path, monkeypatch):
+    tables = pytest.importorskip("tables")
+    pytest.importorskip("protozfits")
+
+    def run(name, workers):
+        monkeypatch.setattr(merge, "READ_WORKERS", workers)
+        out = str(tmp_path / f"{name}.hdf5")
+        assert merge.merge([SIMTEL], [FITS], out, max_events=12, progress_every=0, seed=21) == 12
+        with tables.open_file(out) as h5:
+            return h5.root.merge.event.telescope.tel_001.read(), h5.root.r0alpha.event.telescope.tel_001.read()["waveform"]
+
+    one, alpha_one = run("one", 1)
+    several, alpha_several = run("several", 3)
+    assert np.array_equal(one["real_event_id"], several["real_event_id"]) and np.array_equal(one["real_row"], several["real_row"])      # the same pairs, in the same order
+    assert np.array_equal(alpha_one, alpha_several)
