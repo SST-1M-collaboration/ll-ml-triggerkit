@@ -6,4 +6,4 @@ when you import the submodules that need them -- importing ``triggerkit`` itself
 stays light.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "ll-ml-triggerkit"
-version = "0.1.0"
+version = "0.2.0"
 description = "Trainable low-level ML trigger chains for Cherenkov cameras (SST-1M / DigiCam)."
 authors = ["Tanguy Dietrich"]
 license = "MIT"

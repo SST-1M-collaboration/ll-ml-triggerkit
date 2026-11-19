@@ -285,3 +285,7 @@ poetry run pytest   # several hundred tests, CPU only, several minutes (some spa
 ```
 Some tests need a data file and are skipped without it: `TRIGGERKIT_TEST_SIMTEL=FILE.simtel.gz` (a simulation), `TRIGGERKIT_TEST_FITS=FILE.fits.fz` (a real file; needs protozfits, so run them in the
 sst1mpipe environment), `TRIGGERKIT_TEST_HDF5` (a production HDF5 made from that simtel file). The window tests of the viewer (`tests/test_viewer_app.py`) need PyQt5 and pyqtgraph.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Changes: [CHANGELOG.md](CHANGELOG.md).
