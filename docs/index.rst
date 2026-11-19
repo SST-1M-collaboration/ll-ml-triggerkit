@@ -6,7 +6,7 @@ Welcome to ll-ml-triggerkit's documentation!
 
 ``ll-ml-triggerkit`` (import name ``triggerkit``) trains, evaluates and exports **low-level trigger chains** for the SST-1M telescope
 (DigiCam camera): the FADC, the patch7 sum, the TDSCAN, and trainable models (hexagonal CNNs, quantized for the FPGA) that replace or follow them.
-It also converts sim_telarray simulations and real SST-1M data to HDF5, merges simulated gammas into real noise, and shows the events in a viewer.
+It also converts sim_telarray simulations and real SST-1M data to HDF5, merges simulated gammas into real noise, shows the events in a viewer and reports on a real acquisition.
 
 .. toctree::
    :maxdepth: 2
@@ -16,6 +16,7 @@ It also converts sim_telarray simulations and real SST-1M data to HDF5, merges s
    concepts
    conversion
    merge
+   night_report
    real_noise
    dataset
    training

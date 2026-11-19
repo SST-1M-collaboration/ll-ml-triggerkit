@@ -42,6 +42,7 @@ protozfits = { version = "*", optional = true }
 triggerkit-convert = "triggerkit.tools.convert:main"
 triggerkit-viewer = "triggerkit.viewer.app:main"
 triggerkit-merge = "triggerkit.tools.merge:main"
+triggerkit-night-report = "triggerkit.realdata.report:main"
 
 [tool.poetry.extras]
 # Hex CNN bodies (models/hexcnn.py, SequentialBody hex layers).
