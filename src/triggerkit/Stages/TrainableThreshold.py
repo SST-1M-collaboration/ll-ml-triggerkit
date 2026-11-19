@@ -1,4 +1,7 @@
 
+import threading
+
+import numpy as np
 import tensorflow as tf
 """
 Trainable differentiable threshold layer.
@@ -171,3 +174,45 @@ class TrainableThreshold(tf.keras.layers.Layer):
             pix_type=input_geometry_dict["pix_type"]
         )
         return cls(input_geometry=input_geometry, **config)
+
+
+CHAIN_LOCK = threading.RLock()
+"""Held around ``model(x)`` followed by :func:`chain_fired` (or by a read of ``TrainableThreshold.last_score``): the score a threshold keeps is an attribute of the LAYER, written by its own
+``call``, so two threads calling the same model (the gate of ``TriggerDataset(gated_by=...)`` runs in ``tf.py_function`` threads of the data pipeline, the train and validation streams share it) could
+decide on each other's scores. The lock makes "call + decision" one step."""
+
+
+def chain_fired(model, output):
+    """Which events a chain's Keras ``model`` fired on in the call that gave ``output``: a ``(B,)`` boolean numpy array.
+
+    The decision is the threshold's own comparison of the score in front of it (:meth:`TrainableThreshold.hard_decision`), not
+    ``output > 0.5``: with ``binary_output=False`` the output is a sigmoid, exactly 0.5 for a score equal to tau, so ``> 0.5`` did not fire
+    those events even with ``comparison="ge"``, and a soft OR of branches could pass 0.5 with no branch above its threshold. An OR chain fires
+    when one of its branches does. A model that ends with neither a threshold nor an OR of thresholds is decided on ``output > 0.5``. ``output`` may be a dict or a list (its first
+    value is used). Call it under :data:`CHAIN_LOCK`, in the same step as the call that gave ``output``.
+    """
+    from triggerkit.Stages.OrMerge import OrMerge
+
+    if isinstance(output, dict):
+        output = next(iter(output.values()))
+    elif isinstance(output, (list, tuple)):
+        output = output[0]
+    n = int(output.shape[0])
+    last = model.layers[-1] if getattr(model, "layers", None) else None
+    thresholds = []
+    if isinstance(last, TrainableThreshold):
+        thresholds = [last]
+    elif isinstance(last, OrMerge):
+        inputs = last.input if isinstance(last.input, (list, tuple)) else [last.input]
+        by_output = {id(layer.output): layer for layer in model.layers if isinstance(layer, TrainableThreshold)}
+        thresholds = [by_output.get(id(x)) for x in inputs]
+        if any(t is None for t in thresholds):
+            thresholds = []                       # a branch that does not end with a threshold: no score to decide on
+    if thresholds and all(getattr(t, "last_score", None) is not None for t in thresholds):
+        fired = np.zeros(n, dtype=bool)
+        for t in thresholds:
+            score = tf.reshape(tf.cast(t.last_score, tf.float32), (n, -1))
+            fired |= tf.reduce_any(t.hard_decision(score), axis=1).numpy()
+        return fired
+    out = tf.reshape(tf.cast(output, tf.float32), (n, -1))
+    return tf.reduce_max(out, axis=1).numpy() > 0.5

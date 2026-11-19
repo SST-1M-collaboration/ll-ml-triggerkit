@@ -2,7 +2,8 @@
 
 A loss and a metric for the gammas against the NSB say nothing about protons and muons. This callback scores the validation stream and
 the watched sources (``TriggerDataset(watch=[...]).watch_datasets()``, protons and muons that are NOT learned from) with the model in
-inference mode, sets the cut on the NSB (its quantile ``1 - nsb_fraction``) and prints the fraction of every type above it:
+inference mode, sets the cut on the NSB (the achievable cut whose NSB fraction is closest to ``nsb_fraction``,
+:func:`triggerkit.Statistics.metrics.pick_threshold_from_scores`, as the statistics do) and prints the fraction of every type above it:
 
     PARTICLES epoch=3 cut=-8.123 nsb=0.0100 gamma=0.3612 proton=0.0214 muon=0.4033
 
@@ -13,6 +14,7 @@ import numpy as np
 from tensorflow import keras
 
 from triggerkit.data.simulation import PARTICLES
+from triggerkit.Statistics.metrics import pick_threshold_from_scores
 
 NAMES = {code: name for name, code in PARTICLES.items()}
 
@@ -30,7 +32,7 @@ class ParticleRates(keras.callbacks.Callback):
         for x, y in dataset.take(self.batches):
             if not len(np.asarray(y[self.particle_key]).reshape(-1)):          # a batch every event of which an upstream trigger dropped
                 continue
-            out = self.model(x, training=False)
+            out = self.model.predict_on_batch(x)               # a compiled call, as ExactMetrics: the eager call of the quantized hexagonal layers failed at random on the GPU
             out = out[self.output] if isinstance(out, dict) else out
             scores.append(np.asarray(out).reshape(len(out), -1)[:, 0])
             particles.append(np.asarray(y[self.particle_key]).reshape(-1))
@@ -44,7 +46,7 @@ class ParticleRates(keras.callbacks.Callback):
         if nsb.size == 0:
             print(f"PARTICLES epoch={epoch + 1} no NSB event in the validation stream: no cut", flush=True)
             return
-        cut = float(np.quantile(nsb, 1.0 - self.nsb_fraction))
+        cut, _fraction, _mode = pick_threshold_from_scores(nsb, self.nsb_fraction, "gt")       # a quantile undershoots on quantized scores
         fractions = {"nsb": float((nsb > cut).mean())}
         for code in sorted(set(particles) - {PARTICLES["nsb"]}):
             fractions[NAMES[code]] = float((scores[particles == code] > cut).mean())

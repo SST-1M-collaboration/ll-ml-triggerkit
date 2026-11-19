@@ -251,16 +251,16 @@ class AsyncFileOpenerProcess:
                 break
             except queue.Empty:
                 if not self._proc.is_alive():
+                    try:
+                        item = self._queue.get(timeout=1)       # what it put just before it ended can still be on its way through the pipe
+                        break
+                    except queue.Empty:
+                        pass
                     self._finished = True
-                    warnings.warn(
-                        f"AsyncFileOpenerProcess for {self.filepath!r} died "
-                        "without signaling completion (likely OOM-killed or "
-                        "crashed); treating as end of stream instead of "
-                        "hanging forever.",
-                        RuntimeWarning,
-                        stacklevel=2,
-                    )
-                    raise StopIteration
+                    msg = (f"AsyncFileOpenerProcess for {self.filepath!r} died without signaling completion (likely OOM-killed or crashed): "
+                           "the data from this file is incomplete.")
+                    warnings.warn(msg, RuntimeWarning, stacklevel=2)
+                    raise FileReadError(msg)        # not a clean end of file: the reader records the file as skipped, so the statistics do not count its unread events
                 # still alive, just slow (large/slow file) -- keep waiting.
 
         if isinstance(item, tuple) and len(item) == 2 and item[0] == _ERROR_TAG:
@@ -274,7 +274,7 @@ class AsyncFileOpenerProcess:
         if item is self._sentinel:
             # make sure background process has terminated
             if self._proc.is_alive():
-                self._proc.join()
+                self._proc.join(timeout=30)                  # bounded: a child that does not end after its last item is ended by close()
             self._finished = True
             raise StopIteration
 

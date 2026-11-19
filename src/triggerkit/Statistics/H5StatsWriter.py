@@ -3,7 +3,7 @@
 Every piece of information is stored ONCE. What describes an event (its type, energy, n_pe, ...) lives in ``/events``, one row per
 physical event as it was read from the files; what a chain made of it (a score) lives in ``/scores``, one row per (fold, event). A
 fold is a way of presenting the same events to the chain (rotated camera, rolled NSB, another condition...); it changes the scores, not
-the events.
+the events. The layout::
 
     attrs      format="stats_v2", camera_name, trigger_chain_json (what the chain was, threshold included), window_sec (what one event
                spans: samples x sampling period), has_score (bool), uuid (the identifier of this run), n_events, n_scores
@@ -13,7 +13,10 @@ the events.
     /conditions  condition names ("medium", "low"), indexed by /events/condition and /folds/condition
     /sources     one row per (condition, type): condition u1, particle u1, written i8, simulated i8, simulated_given u1, rate_hz f8
                  (``written``: events recorded in the files, ``simulated``: showers simulated for ALL of them; ``rate_hz``: the rate of
-                 the events of a source that only holds what a trigger fired on, NaN otherwise)
+                 the events of a source that only holds what a trigger fired on, NaN otherwise). The files that were not read to their end
+                 under ``ignore_errors`` are taken out: what was not read of them is not counted
+    /skipped_files  (only when there are some) one row per such file: condition u1, particle u1, file, events_read i8 (0: it could not
+                 be opened), reason
     /events      one row per event:  particle u1 (0 NSB, 1 gamma, 2 proton, 3 muon), condition u1, file u2,
                  event_id i8, tel_id i4, n_pe f4, energy f4, xcore ... f4 (whatever the caller gives)
     /folds       one row per fold:   name, condition u1; /folds/config/<key>: the build config as strings
@@ -82,6 +85,7 @@ class H5StatsWriter:
         self.files = []
         self.conditions = []
         self.sources = []        # (condition index, particle code, written, simulated, given)
+        self.skipped = []        # (condition index, particle code, path, events read, reason)
         self.folds = []          # {"name", "condition", "config"}
         self._events = {}        # column name -> extendable dataset
         self._scores = {}
@@ -119,6 +123,14 @@ class H5StatsWriter:
             raise ValueError(f"source ({condition!r}, {particle!r}) is already described")
         self.sources.append((cond, PARTICLE_CODES[particle], int(written), int(simulated), bool(simulated_given),
                              float('nan') if rate_hz is None else float(rate_hz)))
+
+    def add_skipped_file(self, condition, particle, path, *, events_read, reason):
+        """A file of a type that was not read to its end (it could not be opened: ``events_read=0``, or the reader failed after
+        ``events_read`` events); its unread part is not in the denominators of :meth:`add_source`."""
+        if particle not in PARTICLE_CODES:
+            raise ValueError(f"particle must be one of {tuple(PARTICLE_CODES)}, got {particle!r}")
+        cond = NO_CONDITION if condition is None else self.condition_index(condition)
+        self.skipped.append((cond, PARTICLE_CODES[particle], str(path), int(events_read), str(reason)))
 
     def begin_fold(self, name, config=None, condition=None, budget=None):
         """Start describing a fold; returns its index (used by :meth:`append_scores`).
@@ -280,6 +292,13 @@ class H5StatsWriter:
                                    ("written", np.int64, cols[2]), ("simulated", np.int64, cols[3]),
                                    ("simulated_given", np.uint8, cols[4]), ("rate_hz", np.float64, cols[5])):
             src.create_dataset(key, data=np.array(values, dtype=dtype))
+        if self.skipped:
+            sk = f.create_group("skipped_files")
+            cols = list(zip(*self.skipped))
+            for key, dtype, values in (("condition", np.uint8, cols[0]), ("particle", np.uint8, cols[1]), ("events_read", np.int64, cols[3])):
+                sk.create_dataset(key, data=np.array(values, dtype=dtype))
+            for key, values in (("file", cols[2]), ("reason", cols[4])):
+                sk.create_dataset(key, data=np.array(values, dtype=object), dtype=_STRING)
 
         grp = f.create_group("folds")
         grp.attrs["n_folds"] = len(self.folds)

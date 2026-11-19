@@ -140,6 +140,8 @@ class FileOpenerCTAOHDF5:
     def _open(self):
         """Open file and prepare iterator."""
         if self._file is None:
+            if not self.src:                   # closed by the end of a previous pass: a second iteration reads the file again (it gave 0 events, silently)
+                self.src = h5py.File(self.filepath, "r")
             # Reuse the handle opened in __init__ (self.src) instead of opening
             # a second h5py.File on the same path -- everything below (calib
             # tables, h5_event_iterator) already reads through self.src; the
@@ -172,11 +174,9 @@ class FileOpenerCTAOHDF5:
                 """
                 # lazy-build an index from event_id -> shower row
                 if not hasattr(self, "_shower_index"):
-                    shower_ds = self.src["simulation/event/subarray/shower"]
-                    # create a dict: event_id -> full row
-                    self._shower_index = {
-                        int(row["event_id"]): row for row in shower_ds
-                    }
+                    # one bulk read (a row-by-row walk of the h5py dataset took 19 s for 200 000 events, at every opening of the file)
+                    showers = self.src["simulation/event/subarray/shower"][()]
+                    self._shower_index = {int(event_id): showers[i] for i, event_id in enumerate(showers["event_id"])}       # event_id -> its row
 
                 # reset event index for each telescope
                 self.current_event_index = [0] * len(self.lst_tel)
@@ -436,15 +436,18 @@ class FileOpenerCTAOHDF5:
             self._iterator = None
 
     def __iter__(self):
+        self._exhausted = False             # a new iteration reads the file again from its first event
         self._open()
         return self
 
     def __next__(self):
-        self.i_readed_events += 1
-
-        # check if the iterator is initialized
+        # check if the iterator is initialized; after the last event, next() keeps raising StopIteration (as an iterator must) instead of
+        # opening the file again and starting over: only a new iter() does that
         if self._iterator is None:
+            if getattr(self, "_exhausted", False):
+                raise StopIteration
             self._open()
+        self.i_readed_events += 1
         try:
             (
                 list_tel_ids,
@@ -470,5 +473,7 @@ class FileOpenerCTAOHDF5:
                 self.i_readed_events - 1,
             )
         except StopIteration:
+            self.i_readed_events -= 1
+            self._exhausted = True
             self._close()
             raise

@@ -94,7 +94,7 @@ def test_compute_statistics_raises_a_catchable_error_and_cleans_up(files, tmp_pa
     with pytest.raises(FileReadError):
         chain.compute_statistics(base_name="e", folder=str(tmp_path), batch_size=16, tel_id_only=1,
                                  ignore_errors=False, overwrite=True)
-    assert not list(tmp_path.glob("*.h5"))                 # partial statistics file removed
+    assert not list(tmp_path.glob("*.h5*"))                # neither a statistics file nor its .partial left
     # ... while ignore_errors=True keeps every readable event
     res = chain.compute_statistics(base_name="e", folder=str(tmp_path), batch_size=16, tel_id_only=1,
                                    ignore_errors=True, overwrite=True)

@@ -10,4 +10,6 @@ API reference
    triggerkit.cascade
    triggerkit.training
    triggerkit.Statistics.stats_file
+   triggerkit.Statistics.H5StatsWriter
+   triggerkit.Statistics.metrics
    triggerkit.camera

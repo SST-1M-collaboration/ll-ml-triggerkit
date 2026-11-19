@@ -1,5 +1,7 @@
 """Cinematic export: 3D shower development, light rays, then the camera played sample by sample
 (true signal / recorded ADC / TDSCAN score) with the curves of the tracked pixel and of its triplet."""
+import os
+
 import numpy as np
 from matplotlib.figure import Figure
 from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -92,9 +94,16 @@ def render(ed, out, pixel=None, thr=8.109374, thr_alt=6.999999, sps=5, progress=
             if score is not None:
                 pc3.set_array(np.clip(score[cam.pix2patch, s_], 0, None)); pc3.set_edgecolor(np.where(score[cam.pix2patch, s_] > thr, "#ff5a4f", "none"))
     wr = FFMpegWriter(fps=30, codec="libx264", extra_args=["-pix_fmt", "yuv420p", "-crf", "17", "-preset", "medium"])
+    stopped = False
     with wr.saving(fig, out, dpi=100):
         for k in range(NF):
-            if cancelled(): return False
+            if cancelled():
+                stopped = True
+                break
             frame(k); wr.grab_frame()
             if progress: progress(k + 1, NF)
+    if stopped:                                  # cancelled: no truncated mp4 left at the chosen path (removed once ffmpeg has closed it)
+        if os.path.exists(out):
+            os.remove(out)
+        return False
     return True

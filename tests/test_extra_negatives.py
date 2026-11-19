@@ -44,6 +44,27 @@ def test_protons_are_negatives_with_their_own_code_and_weight(tree):
     assert 2 in set(read(val, "particle")["particle"])                                          # the protons have a validation split too
 
 
+def test_a_positive_type_is_labelled_like_a_gamma(tree):
+    ds = dataset(tree, train_on=("gamma", "nsb", "proton", "muon"), positive_types=("muon",), negative_weights={"proton": 0.25}, npe_weighting=NpeWeighting(30, 50, below="negative"))
+    train, _ = ds.train_val_datasets()
+    got = read(train, "particle", "particle_weight", "npe_channels")
+    particle = got["particle"]
+    assert set(particle) == {0, 1, 2, 3}
+    np.testing.assert_array_equal(got["label"], np.isin(particle, (1, 3)).astype(int))          # gammas and muons = 1, protons and NSB = 0
+    np.testing.assert_allclose(got["particle_weight"][particle != 2], 1.0)                      # a positive is never down-weighted
+    np.testing.assert_allclose(got["particle_weight"][particle == 2], 0.25)
+    assert (got["npe_channels"][particle == 3][:, 0] == 1).all()                                # the muons are gammas for the weighting
+
+
+def test_positive_types_are_checked(tree):
+    with pytest.raises(ValueError, match="positive_types"):
+        dataset(tree, positive_types=("muon",))                                                  # muon is not in train_on
+    with pytest.raises(ValueError, match="positive_types"):
+        dataset(tree, positive_types=("gamma",))
+    with pytest.raises(ValueError, match="negative weight"):
+        dataset(tree, train_on=("gamma", "nsb", "muon"), positive_types=("muon",), negative_weights={"muon": 0.5})
+
+
 def test_the_extra_files_are_split_like_the_gamma_files(tree):
     ds = dataset(tree, train_on=("gamma", "nsb", "proton", "muon"))
     split = ds.split_extra_files()
@@ -104,9 +125,10 @@ def test_rates_are_taken_at_the_cut_that_keeps_a_fraction_of_the_nsb(capsys):
     cb.set_model(model)
     logs = {}
     cb.on_epoch_end(0, logs)
-    cut = np.quantile(nsb, 0.95)
+    from triggerkit.Statistics.metrics import pick_threshold_from_scores
+    cut, _, _ = pick_threshold_from_scores(nsb.astype(np.float32), 0.05, "gt")          # the achievable cut closest to 5 % (the rule of the statistics), not a quantile
     assert logs["val_cut"] == pytest.approx(cut)
-    assert logs["val_nsb_at_nsb"] == pytest.approx(0.05, abs=0.002)
+    assert logs["val_nsb_at_nsb"] == pytest.approx(0.05, abs=1e-9)
     assert logs["val_gamma_at_nsb"] == pytest.approx(float((gamma > cut).mean()), abs=1e-9)
     assert 0.2 < logs["val_proton_at_nsb"] < 0.35 and logs["val_muon_at_nsb"] > 0.95
     assert "PARTICLES epoch=1" in capsys.readouterr().out

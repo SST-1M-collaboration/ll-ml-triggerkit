@@ -17,6 +17,19 @@ from triggerkit.models.boards import CameraBoardSplitter
 from triggerkit.models.grid import GridTransform
 
 
+def _check_time_window(layer, n_samples):
+    """``time_skip`` and ``time_window`` must fit in the ``n_samples`` the layer is given (when that is known): a slice past the end would
+    keep fewer samples than asked without a word (or none, and the scores would be NaN)."""
+    if n_samples is None:
+        return
+    n_samples = int(n_samples)
+    end = layer.time_skip + (layer.time_window if layer.time_window is not None else 1)
+    if layer.time_skip < 0 or end > n_samples:
+        what = (f"time_skip={layer.time_skip} + time_window={layer.time_window}" if layer.time_window is not None
+                else f"time_skip={layer.time_skip}")
+        raise ValueError(f"{type(layer).__name__}: {what} does not fit in the {n_samples} samples it is given")
+
+
 @keras.utils.register_keras_serializable(package="triggerkit")
 class ScatterToGrid(keras.layers.Layer):
     """Scatter a ``(B, P, S)`` waveform onto a ``(B, T, H, W, 1)`` grid volume.
@@ -25,6 +38,8 @@ class ScatterToGrid(keras.layers.Layer):
     ``time_window`` is ``None`` the full remaining span is kept. The scatter is a
     constant ``(P, H*W)`` matmul (one-hot per pixel), exactly the trick the hex
     CNN sandbox used, kept inside the graph so adapter + CNN train/save as one.
+
+    A window that does not fit in the samples given raises ``ValueError`` (instead of keeping fewer samples): when the model is built if the number of samples is known, else at the first batch.
 
     Two ways to build it:
 
@@ -91,6 +106,7 @@ class ScatterToGrid(keras.layers.Layer):
                 "ScatterToGrid is unbound: no camera geometry. Put it in a "
                 "SequentialBody / build_chain (which calls bind_geometry with "
                 "chain.geom), or construct it via ScatterToGrid.from_geometry().")
+        _check_time_window(self, x.shape[-1])
         x = tf.cast(x, tf.float32)                       # (B, P, S)
         t0 = self.time_skip
         t1 = None if self.time_window is None else t0 + self.time_window
@@ -100,6 +116,7 @@ class ScatterToGrid(keras.layers.Layer):
         return tf.reshape(g, [-1, tf.shape(g)[1], self.H, self.W, 1])
 
     def compute_output_shape(self, input_shape):
+        _check_time_window(self, input_shape[-1])                  # when the number of samples is known, a window that does not fit is refused when the model is BUILT, not at its first batch
         T = self.time_window
         if T is None and input_shape[-1] is not None:
             T = input_shape[-1] - self.time_skip
@@ -199,6 +216,8 @@ class ScatterToBoards(keras.layers.Layer):
     board grid holds the board's own patches AND its overlap patches, exactly what the
     FPGA board receives. Undo the folding with :class:`UnfoldBoards`.
 
+    A window that does not fit in the samples given raises ``ValueError`` (instead of keeping fewer samples): when the model is built if the number of samples is known, else at the first batch.
+
     Like :class:`ScatterToGrid`, it is built either *unbound* (``ScatterToBoards(time_window=32)``,
     geometry bound later by ``SequentialBody`` / ``build_chain``) or *bound* up front with
     :meth:`from_geometry`.
@@ -248,6 +267,7 @@ class ScatterToBoards(keras.layers.Layer):
                 "ScatterToBoards is unbound: no camera geometry. Put it in a SequentialBody / "
                 "build_chain (which calls bind_geometry with chain.geom), or construct it via "
                 "ScatterToBoards.from_geometry().")
+        _check_time_window(self, x.shape[-1])
         x = tf.cast(x, tf.float32)                                  # (B, P, S)
         t1 = None if self.time_window is None else self.time_skip + self.time_window
         x = tf.transpose(x[:, :, self.time_skip:t1], [0, 2, 1])     # (B, T, P)
@@ -255,6 +275,7 @@ class ScatterToBoards(keras.layers.Layer):
         return tf.reshape(g, [-1, tf.shape(g)[2], self.H, self.W, 1])
 
     def compute_output_shape(self, input_shape):
+        _check_time_window(self, input_shape[-1])
         T = self.time_window
         if T is None and input_shape[-1] is not None:
             T = input_shape[-1] - self.time_skip

@@ -15,11 +15,11 @@ validated with (TensorFlow 2.20, Keras 3.12, HGQ2 0.1.9, hls4ml 1.3.0).
 
 ``pip`` works too (it ignores the lock, so the versions may differ): ``pip install -e .`` or ``pip install -e '.[qat]'``.
 
-The commands ``triggerkit-convert``, ``triggerkit-merge`` and ``triggerkit-viewer`` are created when the package is installed. After an update
+The commands ``triggerkit-convert``, ``triggerkit-merge``, ``triggerkit-viewer`` and ``triggerkit-night-report`` are created when the package is installed. After an update
 that adds one, install again (``pip install -e .``), or run the module: ``python -m triggerkit.tools.convert``,
-``python -m triggerkit.tools.merge``, ``python -m triggerkit.viewer``.
+``python -m triggerkit.tools.merge``, ``python -m triggerkit.viewer``, ``python -m triggerkit.realdata.report``.
 
-The converters and ``triggerkit-merge`` also run in the sst1mpipe 0.9.0 environment (Python 3.10, no TensorFlow), where the package CANNOT be installed (it requires Python 3.12): there, put the source on the path and run the module, ``PYTHONPATH=/path/to/ll-ml-triggerkit/src python -m triggerkit.tools.convert ...`` and ``python -m triggerkit.tools.merge ...``.
+The converters, ``triggerkit-merge`` and ``python -m triggerkit.realdata.report`` (see :doc:`night_report`) also run in the sst1mpipe 0.9.0 environment (Python 3.10, no TensorFlow), where the package CANNOT be installed (it requires Python 3.12): there, put the source on the path and run the module, ``PYTHONPATH=/path/to/ll-ml-triggerkit/src python -m triggerkit.tools.convert ...`` and ``python -m triggerkit.tools.merge ...``.
 The ``triggerkit-*`` commands of this documentation are those, typed with the package installed.
 
 On a GPU machine, add the CUDA libraries of TensorFlow inside the environment: ``pip install "tensorflow[and-cuda]==2.20.0"``.
@@ -38,12 +38,17 @@ Tests
 
 Some tests need a data file and are skipped without it: ``TRIGGERKIT_TEST_SIMTEL=FILE.simtel.gz`` (a simulation),
 ``TRIGGERKIT_TEST_FITS=FILE.fits.fz`` (a real file; needs protozfits), ``TRIGGERKIT_TEST_HDF5`` (a production HDF5 made from that simtel file).
-The window tests of the viewer (``tests/test_viewer_app.py``) need PyQt5 and pyqtgraph.
+The window tests of the viewer (``tests/test_viewer_app.py``) need PyQt5 and pyqtgraph. ``tests/test_hexcnn_mask.py`` needs ``keras_hexagdly`` (the hexagonal
+convolutions) and is skipped without it. The CI installs only the package, eventio and pytest: it runs neither these tests nor the ones that need a data file
+(the end-to-end conversions and merges), which have to be run by hand with the files.
 
 Building this documentation
 ---------------------------
 
+The API pages import triggerkit: install the package (``pip install -e .``) or give its sources with ``PYTHONPATH=src``, as the CI does, with the packages
+the imported modules need.
+
 .. code-block:: bash
 
-   pip install -r docs/requirements.txt
-   sphinx-build -b html docs docs/_build/html
+   pip install -r docs/requirements.txt numpy h5py scipy matplotlib astropy hdf5plugin
+   PYTHONPATH=src sphinx-build -b html docs docs/_build/html

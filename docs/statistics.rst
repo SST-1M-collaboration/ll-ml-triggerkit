@@ -23,7 +23,10 @@ What goes into a file
    One row per fold, its configuration (``shower_deg``, ``nsb_kind``, time shifts, ...) and its budget of events per type.
 ``/sources``
    The denominators: for each (condition, type), the events ``written`` in the files and the showers ``simulated`` for all of them, and the
-   ``rate_hz`` of a NSB that only holds what a trigger fired on.
+   ``rate_hz`` of a NSB that only holds what a trigger fired on. What was not read of a file skipped under ``ignore_errors`` is not counted.
+``/skipped_files``
+   Only when there are some: the files that were not read to their end under ``ignore_errors=True``, with the events read from each (0: it could
+   not be opened) and why (``StatsFile.skipped_files()``).
 ``/description``
    What the run tests (a free text), its UUID, date and time, machine, software versions and git commit.
 
@@ -51,7 +54,7 @@ Complete examples (patch7, the TDSCAN, a CNN, a cascade) are in :doc:`statistics
                             nsb_roll_copies=0, nsb_skip_original_events=False, ignore_errors=False,
                             folds=folds, window=Fixed(16, 50), description="what this run tests")
 
-* ``sim`` is a :class:`triggerkit.data.Simulation` (see :doc:`dataset`): the files of each type and their totals.
+* ``sim`` is a :class:`~triggerkit.data.simulation.Simulation` (see :doc:`dataset`): the files of each type and their totals.
 * ``window`` is what the chain is given of each event. It must have the chain's number of samples (``num_samples``). ``Fixed(16, 50)`` gives samples
   16 to 65 of the 82 of the production, the 50 samples the TDSCAN looks at. The time an event stands for in the NSB rate is that window: 50 x 4 ns.
 * Keep ``nsb_roll_copies=0`` and ``nsb_skip_original_events=False`` with folds: each NSB event is then read exactly once and the fold's own pixel
@@ -59,6 +62,15 @@ Complete examples (patch7, the TDSCAN, a CNN, a cascade) are in :doc:`statistics
 * ``description`` is stored in the file; the run's UUID is in ``chain.last_stats_uuid``, the file in ``chain.last_stats_path``.
 * ``overwrite=True`` replaces an existing file, ``False`` aborts, ``None`` asks on the terminal (and raises ``FileExistsError`` in a batch job).
 * Ctrl+C stops after the current batch and deletes the partial file.
+* ``ignore_errors`` (default ``True``) decides what a file that cannot be read does. The denominators are counted file by file before the events are
+  read: with ``ignore_errors=False`` a file that cannot be opened stops the run there, before the events of its group of folds are read (before any event at all when the folds share one set of files); with ``True`` it is left out of the
+  read and of the denominators. A file the reader fails on part way is skipped from there on, and only the part read is counted: ``k`` of its ``n``
+  events and ``k / n`` of its simulated showers (a total given by hand, ``n_simulated``, is scaled by the mean of these fractions over the files,
+  which assumes the files hold the same number of showers each). These files are listed in ``/skipped_files``, with a warning.
+* Files with copies of the showers. A file written by ``triggerkit-convert --rotations`` holds each shower in several orientations: the showers simulated of its run table are counted once per orientation (and a
+  total given by hand is multiplied the same way), so *triggered / simulated* stays an efficiency; files that disagree on the number of orientations are refused for a hand-given total. A file made by
+  ``triggerkit-merge --loop-gammas`` (each gamma used several times on different noise) is refused for an efficiency, since it has no coherent simulated total; counting the events of such a file warns.
+* ``compute_statistics`` refuses to run when every file of a requested type is unreadable (zeros would read as measured), and when two groups of folds read the same type under the same condition (give each its own ``condition``).
 
 How the events are read
 ~~~~~~~~~~~~~~~~~~~~~~~
@@ -180,10 +192,12 @@ time. ``compute_statistics`` does this with three arguments:
   is cut around it. ``n_simulated`` must be given by hand (the files hold triggered events only). ``made_by`` is checked against the upstream chain
   (threshold, observe window, trigger time): a mismatch raises.
 * An event the upstream chain does not fire on is read and counted, but it never reaches the chain: its score is ``GATED_OUT_SCORE`` (-1e30) and
-  ``passed_gate`` is 0 in ``/scores``. The efficiency of the whole cascade is therefore still a share of the simulated showers.
+  ``passed_gate`` is 0 in ``/scores``. The efficiency of the whole cascade is therefore still a share of the simulated showers. Such an event never fires,
+  whatever the threshold, ``-inf`` included (``StatsFile``, ``StatPlotter`` and :func:`triggerkit.Statistics.metrics.fires` apply the same rule; so does a
+  NaN score).
 * The time an event stands for is the upstream window (200 ns). For a NSB with ``rate_hz`` the reader turns the fraction of events that still fire into a rate:
-  *fraction x rate_hz*. **That rate is the rate after the cascade**: a threshold of ``-inf`` returns the TDSCAN's own rate (49.4 kHz), the cascade can
-  only go lower, so ask for a lower target (5, 7, 10 kHz).
+  *fraction x rate_hz*. **That rate is the rate after the cascade**: a threshold of ``-inf`` returns the TDSCAN's own rate (49.4 kHz here; for a triggerless
+  NSB aligned on the fly, the fraction of its windows the TDSCAN fires on / 200 ns), the cascade can only go lower, so ask for a lower target (5, 7, 10 kHz).
 
 Pitfalls
 --------

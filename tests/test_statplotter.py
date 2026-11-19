@@ -10,7 +10,7 @@ from triggerkit.Statistics.StatPlotter import StatPlotter, _FOLD_UNSET
 CHAIN = [("threshold", {"threshold": 2.0, "binary": True, "comparison": "gt"})]
 
 
-def write_stats(path, comparison="gt", folds=("a", "b"), n=400, seed=0, with_score=True, chain=None):
+def write_stats(path, comparison="gt", folds=("a", "b"), n=400, seed=0, with_score=True, chain=None, simulated=None):
     rng = np.random.default_rng(seed)
     chain = chain or [("threshold", {"threshold": 2.0, "binary": True, "comparison": comparison})]
     w = H5StatsWriter(str(path), trigger_chain=chain, camera_name="DigiCam")
@@ -25,6 +25,8 @@ def write_stats(path, comparison="gt", folds=("a", "b"), n=400, seed=0, with_sco
             w.append_scores(idx, rows, score=score)
         else:
             w.append_scores(idx, rows, decision=(score >= 2 if comparison == "ge" else score > 2).astype(np.uint8))
+    if simulated is not None:
+        w.add_source(None, "gamma", written=n, simulated=simulated)
     w.close(window_sec=2e-7)
 
 
@@ -75,16 +77,31 @@ def test_histogram_uses_stored_decision_column(tmp_path):
     assert all_h.sum() == 400 and 0 < trig_h.sum() < 400
 
 
-def test_effective_area_points_sit_at_bin_centres_and_warn_on_sample_size(tmp_path, capsys):
-    write_stats(tmp_path / "s.h5", folds=("all",), n=400)
+def test_effective_area_points_sit_at_bin_centres_and_the_thrown_showers_come_from_the_file(tmp_path, capsys):
+    write_stats(tmp_path / "s.h5", folds=("all",), n=400, simulated=12_000)
     sp = plotter(tmp_path)
-    x, expected, base_all, base_trig = sp._prepare_effective_area_state(
-        emin_tev=0.1, emax_tev=100.0, nbins=10, expected_N=60_000)
+    x, expected, base_all, base_trig = sp._prepare_effective_area_state(emin_tev=0.1, emax_tev=100.0, nbins=10)
     edges = sp._ea_bins
     assert len(edges) == 11 and len(x) == 10                              # nbins bins
     np.testing.assert_allclose(x, np.sqrt(edges[:-1] * edges[1:]))
+    assert expected.sum() == pytest.approx(12_000)                        # the showers simulated (/sources), not a constant
+    assert "expected_N" not in capsys.readouterr().out
+
+
+def test_effective_area_warns_when_the_given_thrown_count_is_not_the_file_s(tmp_path, capsys):
+    write_stats(tmp_path / "s.h5", folds=("all",), n=400, simulated=12_000)
+    sp = plotter(tmp_path)
+    _, expected, _, _ = sp._prepare_effective_area_state(emin_tev=0.1, emax_tev=100.0, nbins=10, expected_N=60_000)
+    assert expected.sum() == pytest.approx(60_000)
     out = capsys.readouterr().out
-    assert "expected_N=60000" in out and "400 gamma events" in out        # sample != thrown -> warned
+    assert "expected_N=60000" in out and "12000" in out
+
+
+def test_effective_area_without_the_thrown_count_is_refused_not_normalised_by_a_constant(tmp_path):
+    write_stats(tmp_path / "s.h5", folds=("all",), n=400)                 # no /sources row for the gammas
+    sp = plotter(tmp_path)
+    with pytest.raises(ValueError, match="simulated"):
+        sp._prepare_effective_area_state(emin_tev=0.1, emax_tev=100.0, nbins=10)
 
 
 def test_default_base_config_matches_current_digitalsum_modes():

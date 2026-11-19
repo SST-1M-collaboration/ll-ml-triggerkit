@@ -23,11 +23,13 @@ def _version(name):
 
 
 def _git_commit():
-    """Commit of the triggerkit checkout this code runs from, ``""`` if it is not one (an installed copy) or git is missing."""
+    """Commit of the triggerkit checkout this code runs from, ``""`` if it is not one (an installed copy) or git is missing; ``+dirty`` when a tracked file of the
+    package (``src/triggerkit``, not only ``Statistics``) is modified."""
     here = os.path.dirname(os.path.abspath(__file__))
+    package = os.path.dirname(here)                     # src/triggerkit: a change to the chain, a stage or the reader changes the results as much as one here
     try:
         out = subprocess.run(["git", "-C", here, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=5)
-        dirty = subprocess.run(["git", "-C", here, "status", "--porcelain", "--untracked-files=no", here], capture_output=True, text=True, timeout=5)
+        dirty = subprocess.run(["git", "-C", here, "status", "--porcelain", "--untracked-files=no", package], capture_output=True, text=True, timeout=5)
     except (OSError, subprocess.SubprocessError):
         return ""
     if out.returncode != 0:

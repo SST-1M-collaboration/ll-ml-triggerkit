@@ -32,7 +32,7 @@ from triggerkit.Stages.MovingAverage import TemporalMovingAverage
 from triggerkit.Stages.Shift import Shift
 from triggerkit.Stages.ScoreQuantizer import ScoreQuantizer
 
-from triggerkit.Stages.TrainableThreshold import TrainableThreshold
+from triggerkit.Stages.TrainableThreshold import CHAIN_LOCK, TrainableThreshold, chain_fired
 from triggerkit.Stages.OrMerge import OrMerge
 from triggerkit.Stages.FADC import FADC, FADCList
 from triggerkit.FileIO.paths import normalize_files
@@ -573,7 +573,7 @@ class TriggerChain:
         n_pe_max_val = 350,
         n_pe_min_train = None,
         n_pe_min_val = None,
-        tel_id_only = 2,
+        tel_id_only = 1,
         max_gamma_samples_train=None,
         max_gamma_samples_val=None,
         max_nsb_samples_train=None,
@@ -799,7 +799,7 @@ class TriggerChain:
         n_pe_max_val = 350,
         n_pe_min_train = None,
         n_pe_min_val = None,
-        tel_id_only = 2,
+        tel_id_only = 1,
         max_gamma_samples_train=None,
         max_gamma_samples_val=None,
         max_nsb_samples_train=None,
@@ -1147,7 +1147,7 @@ class TriggerChain:
   # give the overall efficiency and nsb rate
   def compute_statistics(self, base_name="gamma", folder="",
                          batch_size=4096,
-                         tel_id_only=2,
+                         tel_id_only=1,
                          nsb_roll_copies=0,
                          nsb_skip_original_events=False,
                          ignore_errors=True,
@@ -1165,6 +1165,9 @@ class TriggerChain:
 
     Every event is read once and written once (``/events``); each fold then scores it (``/scores``): see
     :mod:`triggerkit.Statistics.H5StatsWriter` for the layout and :class:`triggerkit.Statistics.stats_file.StatsFile` to read it.
+
+    ``ignore_errors`` (default True): a file that cannot be opened is left out of the read and of the denominators; a file the reader fails on part way counts only what was read
+    (``/skipped_files``, ``StatsFile.skipped_files()``, and a warning). With False the first unreadable file raises ``FileReadError`` before its group of folds is read.
 
     ``folds`` is a list of :class:`triggerkit.augment.Fold` (rotations, rolled NSB, other conditions: ``make_rotation_folds``,
     ``make_condition_folds``). Each one reads the :class:`~triggerkit.data.simulation.Simulation` it carries (default: ``sim``) and the
@@ -1191,7 +1194,7 @@ class TriggerChain:
     """
     from triggerkit.alignment import window_length, plan_sources
     from triggerkit.data.real_noise import RealNoise
-    from triggerkit.data.simulation import PARTICLES, Simulation, count_written
+    from triggerkit.data.simulation import PARTICLES, Simulation, denominators_by_file, kept_denominators
     from triggerkit.Statistics.H5StatsWriter import GATED_OUT_SCORE, PARTICLE_CODES
     PARTICLE_NAMES = {code: name for name, code in PARTICLE_CODES.items()}
     if nsb_skip_original_events and int(nsb_roll_copies) <= 0:
@@ -1358,17 +1361,17 @@ class TriggerChain:
 
     # --- One-time setup (shared by every fold) -------------------------------
     # Use the last TrainableThreshold layer when several thresholds exist -- but only when it is the chain's decision point. In an OR
-    # chain several branches each end in a threshold and an OrMerge combines them, so no single threshold's score is the trigger; we
-    # then derive the decision from the model output (the OR probability) via the p>0.5 fallback below.
+    # chain several branches each end in a threshold and an OrMerge combines them, so no single threshold's score is the trigger; the
+    # decision is then the OR of the branches' own threshold decisions (chain_fired in run_model).
     is_or_chain = isinstance(self.model.layers[-1], OrMerge)
     threshold_layer = None if is_or_chain else self._get_last_trainable_threshold_layer()
     if is_or_chain:
-        print("OR chain detected: trigger = OR of branches (model output > 0.5); "
+        print("OR chain detected: trigger = OR of the branches' threshold decisions; "
               "per-branch pre-threshold scores are not logged.")
     if threshold_layer is not None:
         try:
             tau = float(threshold_layer.tau.numpy())
-            print(f"Using tau={tau:.6f} from layer '{threshold_layer.name}' (trigger = p_trig>0.5)")
+            print(f"Using tau={tau:.6f} from layer '{threshold_layer.name}' (trigger = its comparison of the score with tau)")
         except Exception:
             tau = None
     else:
@@ -1389,9 +1392,12 @@ class TriggerChain:
 
     def run_model(wf, ped):
         """The chain on a batch: ``(pre-threshold score or None, hard decision uint8)`` per event."""
+        with CHAIN_LOCK:                                # the scores are attributes of the layers, written by this call
+            return _run_model_locked(wf, ped)
+
+    def _run_model_locked(wf, ped):
         inp = (wf, ped) if expects_baseline else wf
-        p = self.model(inp, training=False)
-        p = tf.reshape(tf.cast(p, tf.float32), (-1,))
+        out = self.model(inp, training=False)
         pre_threshold_score_np = None
         trigger_ref_np = None
         if threshold_layer is not None:
@@ -1405,7 +1411,7 @@ class TriggerChain:
                     else:
                         trigger_ref_np = (pre_threshold_score_np > float(tau)).astype(np.uint8)
         if trigger_ref_np is None:
-            trigger_ref_np = (p.numpy() > 0.5).astype(np.uint8)
+            trigger_ref_np = chain_fired(self.model, out).astype(np.uint8)       # an OR chain: one of its branches' thresholds passed (no threshold: output > 0.5)
         return pre_threshold_score_np, trigger_ref_np
 
     trigger_chain_info = self.generate_chain_list()
@@ -1471,6 +1477,20 @@ class TriggerChain:
                 groups[key] = []
                 group_order.append(key)
             groups[key].append(entry)
+        # /sources holds ONE row of denominators per (condition, type): two groups of folds that read different files of a type under the same condition (or
+        # both with none) would only fail when the second group writes its row, after every event was read. Refused now. (Two groups that read different
+        # types, e.g. gamma + NSB and protons, both without a condition, write different rows: allowed.)
+        seen_sources = {}
+        for key in group_order:
+            files_of = dict(key)
+            read = [p for p in PARTICLES if any(p in e for _, _, e in groups[key])]
+            for condition in {f.condition for f, _, _ in groups[key]}:
+                for p in read:
+                    if (condition, p) in seen_sources and seen_sources[(condition, p)] != key:
+                        # two groups that read the same files of a type read them TWICE (duplicated events), and /sources can describe the source only once
+                        raise ValueError(f"two groups of folds read {p} under the same condition {condition!r} (the same files or different ones): give each set of files its own condition "
+                                         "(Fold(..., condition=...)); the statistics file keeps one set of denominators per condition and type")
+                    seen_sources[(condition, p)] = key
 
         def new_accum(budget):
             return {"read": {}, "trig": {}, "budget": dict(budget), "score_chunks": {0: [], 1: []}, "roc_auc": float("nan")}
@@ -1479,8 +1499,9 @@ class TriggerChain:
             entries = groups[group_key]
             group_sim = entries[0][1]
             nsb_made_by = (getattr(group_sim["nsb"], "made_by", None) or {}) if "nsb" in group_sim else {}
-            # the time one NSB event stands for in the log: a NSB made by a trigger at rate_hz is one event per 1 / rate_hz
-            group_nsb_window = 1.0 / nsb_made_by["rate_hz"] if window is not None and nsb_made_by.get("rate_hz") else stats_window_sec
+            # the time one NSB event stands for in the log: a NSB made by a trigger at rate_hz is one event per 1 / rate_hz, with or without a window
+            # (the rule of StatsFile.nsb_window_sec, which reads the same rate_hz from /sources: the returned rate and the file's agree)
+            group_nsb_window = 1.0 / nsb_made_by["rate_hz"] if nsb_made_by.get("rate_hz") else stats_window_sec
             names_in_group = [f.name for f, _, _ in entries]
             conditions = {f.condition for f, _, _ in entries}
             if len(conditions) > 1:
@@ -1494,6 +1515,26 @@ class TriggerChain:
             for p in read_types:
                 budgets = [e[p] for _, _, e in entries if p in e]
                 caps[p] = None if any(b is None for b in budgets) else max(budgets)
+
+            # The denominators are counted file by file BEFORE the read: a file that cannot be opened stops the run now (ignore_errors=False) or is
+            # left out of the read and of the denominators (ignore_errors=True), instead of failing at the end, once every event was read
+            by_file, read_files = {}, {}
+            for p in read_types:
+                source = group_sim[p]
+                if isinstance(source, RealNoise):            # a pool of real events, counted as a whole (loaded here: a file that cannot be read fails now)
+                    source.written()
+                    by_file[p], read_files[p] = None, list(group_sim.files(p))
+                    continue
+                by_file[p] = denominators_by_file(source, tel_id_only if p != "nsb" else None, ignore_errors=ignore_errors)
+                for path, reason in by_file[p]["failed"]:
+                    warnings.warn(f"ignore_errors=True: {p} file {path!r} cannot be opened ({reason}): it is not read and not counted in the denominators",
+                                  RuntimeWarning, stacklevel=2)
+                    writer.add_skipped_file(condition, p, path, events_read=0, reason=reason)
+                read_files[p] = [path for path, _, _ in by_file[p]["rows"]]
+                if not read_files[p]:                          # nothing readable for a type that was asked for: zeros would read as measured efficiencies and rates
+                    from triggerkit.FileIO.AsyncFileOpener import FileReadError
+                    raise FileReadError(f"none of the {len(by_file[p]['failed'])} {p} file(s) can be opened ({by_file[p]['failed'][0][1] if by_file[p]['failed'] else 'no file'}): nothing to count for this type")
+
             cfg = SimTelTFDatasetConfig(
                 max_gamma_samples_total=caps.get("gamma"),
                 max_nsb_samples_total=caps.get("nsb"),
@@ -1505,7 +1546,7 @@ class TriggerChain:
             print(f"\n=== group [{', '.join(names_in_group)}] "
                   f"({len(entries)} fold(s) sharing one read pass; budget {caps}) ===")
             for p in read_types:
-                files = group_sim.files(p)
+                files = read_files[p]
                 print(f"    source: {p}={len(files)} file(s)" + (f" [{files[0]}, ...]" if files else ""))
 
             # Register every fold of the group up front and precompute its own reindex once
@@ -1520,9 +1561,9 @@ class TriggerChain:
                 fold_setup.append((f, fold_idx, reindex, si, ni, f.shower_time_shift, f.nsb_time_shift, f_events))
 
             stats_dataset = SimTelTFDataset(
-                gamma_files=group_sim.files("gamma") if "gamma" in read_types else [],
-                nsb_files=group_sim.files("nsb") if "nsb" in read_types else [],
-                extra_files={PARTICLES[p]: group_sim.files(p) for p in ("proton", "muon") if p in read_types},
+                gamma_files=read_files.get("gamma", []),
+                nsb_files=read_files.get("nsb", []),
+                extra_files={PARTICLES[p]: read_files[p] for p in ("proton", "muon") if p in read_types},
                 opener_cls=AsyncFileOpenerProcess,
                 config=cfg
             )
@@ -1660,21 +1701,32 @@ class TriggerChain:
             if stop_flags["interrupted"]:
                 break
 
-            # Denominators of the types this group read: events recorded in the files, showers simulated for them
+            # Denominators of the types this group read: events recorded in the files, showers simulated for them, without what was not read of
+            # the files the reader skipped (ignore_errors)
             for p in read_types:
-                files = group_sim.files(p)
                 source = group_sim[p]
                 given = source.n_simulated is not None
-                try:
-                    simulated = source.simulated()
-                except (KeyError, ValueError) as exc:
-                    warnings.warn(f"no simulated total for {p!r} ({exc}): its efficiency per simulated shower is not available.",
-                                  RuntimeWarning, stacklevel=2)
-                    continue
                 made_by = getattr(source, "made_by", None) or {}
-                writer.add_source(condition, p,
-                                  written=source.written(tel_id_only if p != "nsb" else None),
-                                  simulated=simulated, simulated_given=given, rate_hz=made_by.get("rate_hz"))
+                if by_file[p] is None:
+                    written, simulated = source.written(), source.simulated()
+                else:
+                    skipped = {}
+                    for path in read_files[p]:
+                        skip = stats_dataset.skipped_files.get(path)
+                        if skip is not None:
+                            skipped[path] = skip["events"]
+                            writer.add_skipped_file(condition, p, path, events_read=skip["events"], reason=skip["reason"])
+                    if skipped:
+                        warnings.warn(f"{len(skipped)} {p} file(s) were not read to their end (ignore_errors=True): what was not read of them is taken "
+                                      "out of the denominators (listed in the statistics file, StatsFile.skipped_files())", RuntimeWarning, stacklevel=2)
+                    written, simulated = kept_denominators(source, by_file[p], skipped)
+                    if simulated is None:
+                        warnings.warn(f"no simulated total for {p!r} ({by_file[p]['simulated_error']}): its efficiency per simulated shower is not available.",
+                                      RuntimeWarning, stacklevel=2)
+                        if made_by.get("rate_hz"):             # a NSB a trigger fired on: its rate still needs its row (simulated 0 = unknown), or the file would say 1 / window_sec while the run used 1 / rate_hz
+                            writer.add_source(condition, p, written=written, simulated=0, simulated_given=False, rate_hz=made_by["rate_hz"])
+                        continue
+                writer.add_source(condition, p, written=written, simulated=simulated, simulated_given=given, rate_hz=made_by.get("rate_hz"))
 
             for f, fold_idx, *_ in fold_setup:
                 st = accum[f.name]
@@ -1805,8 +1857,8 @@ class TriggerChain:
   def find_threshold_for_target_rate(self, target_rate_hz, tolerance_hz=2, N_event_esimate_threshold=25_000, batch_size=4096, nsb_skip_original_events=True, nsb_roll_copies=1):
     """Estimate the tau giving ``target_rate_hz`` on NSB events (does NOT assign it).
 
-    Reads telescope 1 (``gamma_tel_id_only=1``, the one telescope of the converted files), whatever ``tel_id_only`` the training and the statistics use (their default is 2): pass
-    files of that telescope.
+    Reads telescope 1 (``gamma_tel_id_only=1``, the one telescope of the converted files), which is also the default ``tel_id_only`` of the training and the statistics: with another ``tel_id_only`` there, the tau found here is for another telescope than the one they read;
+    pass files of telescope 1.
 
     Returns ``(tau, predicted_rate_hz)``. Despite its name, ``tolerance_hz`` is a
     PERCENTAGE of the target rate (2 -> +-2 %), kept for backward compatibility.

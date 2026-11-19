@@ -25,7 +25,7 @@ import hdf5plugin  # noqa: F401  (registers the compression filters)
 import numpy as np
 
 from triggerkit.Statistics.H5StatsWriter import ALL, FORMAT, NO_CONDITION, NOT_READ, PARTICLE_CODES
-from triggerkit.Statistics.metrics import pick_threshold_from_scores, wilson
+from triggerkit.Statistics.metrics import fires, pick_threshold_from_scores, wilson
 
 PARTICLE_NAMES = {code: name for name, code in PARTICLE_CODES.items()}
 
@@ -50,6 +50,8 @@ class StatsFile:
             self._fold_config = {k: [_s(x) for x in f["folds/config"][k][()]] for k in f["folds/config"]} if "config" in f["folds"] else {}
             self._fold_budget = {k: f["folds/budget"][k][()] for k in f["folds/budget"]} if "budget" in f["folds"] else {}
             self._sources = {k: f["sources"][k][()] for k in f["sources"]}
+            sk = f["skipped_files"] if "skipped_files" in f else None
+            self._skipped = {k: sk[k][()] for k in sk} if sk is not None else {}
             self.event_columns: List[str] = list(f["events"]) if "events" in f else []
             self.score_columns: List[str] = [c for c in f["scores"] if c not in ("fold", "event", "score", "decision")] if "scores" in f else []
             self.n_events = int(self.attrs.get("n_events", 0))
@@ -143,6 +145,16 @@ class StatsFile:
                      written=int(w), simulated=int(sim), simulated_given=bool(g), rate_hz=None if np.isnan(rate) else float(rate))
                 for c, p, w, sim, g, rate in zip(s["condition"], s["particle"], s["written"], s["simulated"], s["simulated_given"], rates)]
 
+    def skipped_files(self) -> List[Dict[str, Any]]:
+        """The files that were not read to their end (``ignore_errors``): one dict per file with ``condition``, ``particle``, ``file``,
+        ``events_read`` (0: it could not be opened) and ``reason``. What was not read of them is not in :meth:`sources`."""
+        s = self._skipped
+        if not s:
+            return []
+        return [dict(condition=None if int(c) == NO_CONDITION else self.conditions[int(c)], particle=PARTICLE_NAMES[int(p)], file=_s(path),
+                     events_read=int(n), reason=_s(reason))
+                for c, p, path, n, reason in zip(s["condition"], s["particle"], s["file"], s["events_read"], s["reason"])]
+
     def source(self, condition: Optional[str], particle) -> Optional[Dict[str, Any]]:
         """The row of ``/sources`` of a type under a condition (``None`` is the condition of a fold that has none)."""
         name = particle if isinstance(particle, str) else PARTICLE_NAMES[int(particle)]
@@ -220,9 +232,7 @@ class StatsFile:
         thr = self.reference_threshold if threshold is None else float(threshold)
         if thr is None:
             raise ValueError("this chain was described with no threshold: give one (threshold=...)")
-        comparison = comparison or self.comparison
-        with np.errstate(invalid="ignore"):
-            return (view["score"] >= thr) if comparison == "ge" else (view["score"] > thr)
+        return fires(view["score"], thr, comparison or self.comparison)          # a NaN or gated-out event never fires, whatever the threshold (-inf too)
 
     def counts(self, fold, threshold: Optional[float] = None) -> Dict[str, Dict[str, int]]:
         """``{particle: {"read": n, "triggered": k}}`` of a fold at a threshold."""
@@ -289,13 +299,14 @@ class StatsFile:
         w = self.nsb_window_sec(fold)
         return p / w, lo / w, hi / w
 
-    def threshold_for_nsb_rate(self, fold, rate_hz: float, comparison: Optional[str] = None):
-        """``(threshold, rate)``: the score threshold whose NSB rate is the closest to ``rate_hz`` for this fold (see ``metrics``)."""
+    def threshold_for_nsb_rate(self, fold, rate_hz: float):
+        """``(threshold, rate)``: the score threshold whose NSB rate is the closest to ``rate_hz`` for this fold (see ``metrics``), with the chain's
+        comparison, the one every other reader of this file uses."""
         if not self.has_score:
             raise ValueError("this file's chain has no score: no threshold can be chosen")
         view = self.fold(fold, columns=["particle"], decide=False)
         nsb = view["score"][view["particle"] == PARTICLE_CODES["nsb"]]
         window = self.nsb_window_sec(fold)
         fraction = float(np.clip(rate_hz * window, 0.0, 1.0))
-        threshold, predicted, _mode = pick_threshold_from_scores(nsb, fraction, comparison or self.comparison)
+        threshold, predicted, _mode = pick_threshold_from_scores(nsb, fraction, self.comparison)
         return threshold, (None if predicted is None else predicted / window)

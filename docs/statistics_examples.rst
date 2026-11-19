@@ -8,7 +8,7 @@ folds below, so that the files compare fold by fold. The patch7, TDSCAN and casc
 The data
 --------
 
-A :class:`~triggerkit.data.Simulation` gathers the files of each event type. The totals simulated (the denominators of the efficiency) are read from the run
+A :class:`~triggerkit.data.simulation.Simulation` gathers the files of each event type. The totals simulated (the denominators of the efficiency) are read from the run
 table of each file, unless they are given by hand.
 
 .. code-block:: python

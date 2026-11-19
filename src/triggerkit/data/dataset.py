@@ -24,9 +24,10 @@ Design points agreed for the package refactor:
   reader BEFORE the shuffle, so the shuffle buffer holds the window and not the whole datacube; the cut is the one of
   :meth:`triggerkit.alignment.SourcePlan.static_cut`. A source aligned on the fly by an upstream chain, or ``gated_by``, cuts after the batches instead. In both
   cases the batch carries ``features["window_start"]`` and ``features["t_trig"]``.
-* Full batches only: every batch has exactly ``batch_size`` events (XLA compiles one static shape), so the last, shorter batch of a pass is dropped: up to ``batch_size - 1`` events of a
-  pass are not seen, and with ``gated_by`` or a window that drops events (the survivors are re-batched) the same holds for the survivors. Compare counts with ``compute_statistics``,
-  which reads every event, not with the batches of a dataset.
+* Batch sizes: with a ``window`` or ``gated_by``, every batch has exactly ``batch_size`` events (XLA compiles one static shape), so the last, shorter batch of a pass is dropped:
+  up to ``batch_size - 1`` events of a pass are not seen, and with ``gated_by`` or a window that drops events (the survivors are re-batched) the same holds for the survivors.
+  Without a window and without ``gated_by`` (the default) the last batch of a pass is kept, shorter (a second shape to compile under XLA). Compare counts with
+  ``compute_statistics``, which reads every event, not with the batches of a dataset.
 * NSB and validation: the gamma files (and the extra types) are split between training and validation, the NSB is NOT: ``max_nsb_samples_train`` and ``max_nsb_samples_val`` both
   read the FIRST events of the same NSB files, so the validation NSB events are all among the training ones (measured: 30 of 30, and 100 of 100 without caps). The roll of the
   NSB rows differs between the two (another seed), the events do not. The NSB side of a validation metric is therefore not independent of the training.
@@ -36,7 +37,7 @@ Design points agreed for the package refactor:
   a gate that would need a shorter, trigger-aligned window (CNN) is refused.
 * ``split="board"``: the trigger runs on 3 FPGA boards (B1X, B2X, B3X), so the label
   becomes one 0/1 per board, shape ``(B, 3)``: a board is positive when the event is a
-  gamma AND the true p.e. summed over the board's OWN patches (not its overlap, which
+  gamma (or a ``positive_types`` event, label 1) AND the true p.e. summed over the board's OWN patches (not its overlap, which
   belongs to a neighbour) reaches ``board_n_pe_min``. NSB is negative on every board.
   Needs ``true_image`` (added to ``targets``); pair with
   :class:`~triggerkit.models.layers.ScatterToBoards` on the model side.
@@ -46,7 +47,10 @@ Design points agreed for the package refactor:
   changed; the loss and the metrics read the channels (see ``triggerkit.training.npe_weighting``).
 * ``gamma_rotations``: camera rotations (degrees, multiples of 120: this camera is 3-fold symmetric) the TRAINING gammas are randomly given, one per
   gamma and per pass: ``(0, 120, 240)`` triples what the model sees over the epochs. It is a pixel permutation of the waveform, the pedestal and the true
-  image (so the board labels, computed afterwards, follow the rotated camera). The NSB and the other showers are not rotated; the validation is not.
+  image (so the board labels, computed afterwards, follow the rotated camera), of the 432 patches or of the 1296 pixels of a raw r0. The NSB and the other
+  showers are not rotated, except on a real noise (``RealNoise``), where every row is (the gammas carry the real noise: turning only them would let a model
+  tell the classes apart by the turned features of the real camera); the validation is not. The scalar truth of the batch (``azimuth``, ``xcore``, ``ycore``) is NOT turned on the fly: a regression target
+  on them would be wrong for a rotated row (``triggerkit-convert --rotations`` and ``triggerkit-merge --rotations`` turn the truth when they write a file).
 """
 
 import warnings
@@ -59,6 +63,7 @@ from triggerkit.cascade import Full
 from triggerkit.camera import sst1m
 from triggerkit.data.simulation import PARTICLES, Simulation, Watch
 from triggerkit.FileIO.paths import normalize_files
+from triggerkit.Stages.TrainableThreshold import CHAIN_LOCK, chain_fired
 from triggerkit.FileIO.FileOpenerCTAO import (
     AsyncFileOpenerProcess,
     SimTelTFDataset,
@@ -93,35 +98,46 @@ class TriggerDataset:
     Parameters
     ----------
     gamma_files, nsb_files : sequence of str
-        Input files. Gammas are label 1, NSB label 0. A single NSB file is fine
+        Input files. Gammas are label 1 (as are the ``positive_types``), NSB label 0 (as are the extra negative types). A single NSB file is fine
         (it gets roll-augmented). ``gamma_files`` can also be a :class:`~triggerkit.data.simulation.Simulation`
         (then ``nsb_files`` is left out): its ``gamma`` and ``nsb`` sources are the training data, its ``proton`` /
         ``muon`` sources can be evaluated through ``watch``.
     train_on : tuple of str
-        The sources the training reads: ``"gamma"`` and ``"nsb"`` always, plus ``"proton"`` and / or ``"muon"``. The binary label stays
-        gamma = 1 against everything else = 0; protons and muons are extra NEGATIVES, with ``features["particle"]`` (their code) and
-        ``features["particle_weight"]`` (their ``negative_weights``, 1 for gammas and NSB) so the loss can count them less, or not at all. Their
+        The sources the training reads: ``"gamma"`` and ``"nsb"`` always, plus ``"proton"`` and / or ``"muon"``. The binary label is
+        gamma = 1 against everything else = 0; protons and muons are extra NEGATIVES (unless named in ``positive_types``: then label 1), with ``features["particle"]`` (their code) and
+        ``features["particle_weight"]`` (their ``negative_weights``, 1 for gammas, NSB and positive types) so the loss can count them less, or not at all. Their
         files are split between training and validation like the gamma files (``percent_validation`` / ``n_folds``).
+    positive_types : tuple of str
+        Extra types of ``train_on`` that are POSITIVES (label 1, like the gammas) instead of negatives: ``("muon",)`` trains the trigger to fire on the muons as well as the
+        gammas. Their n_pe is weighted by ``npe_weighting`` like a gamma's, they are never down-weighted, and ``negative_weights`` does not apply to them. ``features["particle"]``
+        still says which type an event is (the label no longer does).
+    split_nsb : bool
+        Split the NSB FILES between training and validation like the gamma files (``percent_validation`` / ``n_folds``), instead of sharing them (the default: the validation NSB events are then
+        training ones). On a :class:`~triggerkit.data.real_noise.RealNoise` the merged showers of each split also meet only the noise of that split's files, so a validation shower never sits
+        on a noise event the training saw. Needs several NSB files (with one, the split is empty: a warning, and the file is shared).
     negative_weights : dict {particle: weight} or None
         Weight of the events of the extra types as negatives (default 1). With ``npe_weighting`` it multiplies their negative weight in
         ``features["npe_channels"]``; without it, use ``features["particle_weight"]`` as the sample weight.
     max_extra_samples_train, max_extra_samples_val : int or None
         Cap on the events read per extra type.
     watch : sequence of str or Watch, or None
-        Sources evaluated, not learned from (``"proton"``, ``"muon"``, or ``"gamma"``): :meth:`watch_datasets` gives one
+        Sources evaluated, not learned from (``"proton"``, ``"muon"``, or ``"gamma"``; a type the training reads is watched on its validation files):
+        :meth:`watch_datasets` gives one
         ``tf.data`` per entry, read like the validation gammas (not shuffled, no NSB), every batch carrying ``features["particle"]``.
     watch_max : int or None
         Cap on the events READ per watched source (``None``: all). A capped source is only a sample of the written events: a
         statistic that divides by the simulated total has to scale it by the same fraction (the statistics step does).
     batch_size : int
     tel_id_only : int or None
-        Keep only this telescope id for gammas.
+        Keep only this telescope id for the showers (gamma, proton, muon); not applied to the NSB. Default 1, the one telescope of the converted SST-1M
+        files; ``None`` keeps every telescope. A file with no event of that telescope is read for nothing, with a warning.
     n_pe_{min,max}_{train,val} : float or None
-        Per-split gamma ``n_pe`` window.
+        Per-split ``n_pe`` window of the SHOWERS (gammas, and also the extra types, protons / muons, trained or watched); not applied to the NSB. STRICT: ``min < n_pe < max`` (an event at exactly ``min`` or ``max`` is dropped), unlike
+        the inclusive window of an :class:`~triggerkit.training.npe_weighting.NpeWeighting`.
     max_{gamma,nsb}_samples_{train,val} : int or None
         Per-split global caps.
     load_ram : bool
-        Cache the whole split in RAM (faster, memory-hungry). Training only.
+        Cache the whole split in RAM (faster, memory-hungry), for the training AND the validation split.
     waveform_level : {"r0", "r1"}
     percent_validation : float
         Fraction of gamma files held out for validation when ``n_folds == 1``.
@@ -156,7 +172,8 @@ class TriggerDataset:
         ``Fixed(16, 50)``), and how its trigger time is read. The events it does not fire on are dropped, in both splits, at every epoch
         (like ``gated_by``); a NSB that says it was made by a trigger (``made_by``) is checked against it.
     gamma_rotations : tuple of int
-        Rotations in degrees (multiples of 120) drawn at random for each training gamma, e.g. ``(0, 120, 240)``; ``(0,)``: none.
+        Rotations in degrees (multiples of 120) drawn at random for each training gamma (each training row on a ``RealNoise``), e.g. ``(0, 120, 240)``;
+        ``(0,)``: none. Training only; the truth features ``azimuth`` / ``xcore`` / ``ycore`` are not turned.
     nsb_roll : bool
         Give each NSB window a random circular rotation of its pixel index (the default, as ``train_chain`` always did): it multiplies a triggerless NSB and
         blurs its pedestal. ``False`` for a NSB a trigger fired on, whose fluctuation sits where that trigger looked: a rotation would move it away from there.
@@ -170,12 +187,14 @@ class TriggerDataset:
         *,
         train_on=("gamma", "nsb"),
         negative_weights=None,
+        positive_types=(),
+        split_nsb=False,
         max_extra_samples_train=None,
         max_extra_samples_val=None,
         watch=None,
         watch_max=None,
         batch_size=4096,
-        tel_id_only=2,
+        tel_id_only=1,
         n_pe_min_train=None,
         n_pe_max_train=None,
         n_pe_min_val=None,
@@ -228,7 +247,14 @@ class TriggerDataset:
         for p in self.extra_types:
             if p not in self.simulation:
                 raise ValueError(f"train_on has {p!r} but the Simulation has no such source.")
+        positive_types = tuple(positive_types)
+        if set(positive_types) - set(self.extra_types) or len(set(positive_types)) != len(positive_types):
+            raise ValueError(f"positive_types={positive_types!r}: only the extra types of train_on {self.extra_types} can be positives (once each).")
+        self.positive_types = positive_types
         negative_weights = dict(negative_weights or {})
+        both = set(negative_weights) & set(positive_types)
+        if both:
+            raise ValueError(f"negative_weights for {sorted(both)}, which are positive_types: a positive has no negative weight.")
         bad = set(negative_weights) - set(self.extra_types)
         if bad:
             raise ValueError(f"negative_weights for {sorted(bad)}: only the extra types of train_on {self.extra_types} have one.")
@@ -236,6 +262,7 @@ class TriggerDataset:
             if not float(w) >= 0.0:
                 raise ValueError(f"negative_weights[{p!r}] must be >= 0, got {w}")
         self.negative_weights = {p: float(negative_weights.get(p, 1.0)) for p in self.extra_types}
+        self.split_nsb = bool(split_nsb)
         self.max_extra_samples_train, self.max_extra_samples_val = max_extra_samples_train, max_extra_samples_val
         self.watch = [Watch(item) if isinstance(item, str) else item for item in (watch or ())]
         for item in self.watch:
@@ -319,14 +346,17 @@ class TriggerDataset:
         self.gamma_rotations = tuple(int(r) % 360 for r in gamma_rotations)
         if not self.gamma_rotations or len(set(self.gamma_rotations)) != len(self.gamma_rotations):
             raise ValueError(f"gamma_rotations={tuple(gamma_rotations)!r}: give each rotation once, e.g. (0, 120, 240).")
-        self._rotation_index = None
+        self._rotation_index = self._pixel_rotation_index = None
         if self.gamma_rotations != (0,):
             from triggerkit.augment import rotation_index
             from triggerkit.models.boards import patch_geometry
 
             geometry = patch_geometry()          # raises for an angle that is not an exact symmetry of the camera
             self._rotation_index = np.stack([np.arange(len(geometry.pix_x)) if r == 0 else rotation_index(geometry, r)
-                                             for r in self.gamma_rotations]).astype(np.int64)         # (R, P)
+                                             for r in self.gamma_rotations]).astype(np.int64)         # (R, 432)
+            pixels = self._pixel_geometry()      # the same rotations of the 1296 pixels, for a raw r0 (the patch of a turned pixel is the turned patch)
+            self._pixel_rotation_index = np.stack([np.arange(sst1m.N_PIXELS) if r == 0 else rotation_index(pixels, r)
+                                                   for r in self.gamma_rotations]).astype(np.int64)   # (R, 1296)
 
     # ------------------------------------------------------------------ #
     #: Targets the streaming reader can emit today.
@@ -382,6 +412,13 @@ class TriggerDataset:
         """
         return self._split(self.gamma_files, "gamma")
 
+    def split_nsb_files(self):
+        """``(train_nsb_files, val_nsb_files)``: the NSB files split like the gamma files with ``split_nsb=True``, else all of them for both (shared)."""
+        if not self.split_nsb:
+            return list(self.nsb_files), list(self.nsb_files)
+        train, val = self._split(self.nsb_files, "nsb")
+        return (train, val) if val else (list(self.nsb_files), list(self.nsb_files))          # one file: nothing to split (warned by _split), shared
+
     def split_extra_files(self):
         """``{particle: (train_files, val_files)}`` of the extra training types, split like the gamma files."""
         return {p: self._split(self.simulation.files(p), p) for p in self.extra_types}
@@ -421,7 +458,7 @@ class TriggerDataset:
             emit_true_image=("true_image" in self.targets),
             emit_peak_time=("peak_time" in self.targets),
             emit_true_signal=("true_signal" in self.targets),
-            real_noise=self._real_noise(),
+            real_noise=self._real_noise_for(training),
             include_event_features=True,
             event_feature_keys=self.event_feature_keys,
             nsb_skip_original_events=False,
@@ -461,6 +498,13 @@ class TriggerDataset:
         if self.nsb_roll:
             warnings.warn("RealNoise with nsb_roll=True: the NSB rows are rolled on the pixel axis but the gammas are merged on UNROLLED real noise, so the two classes differ "
                           "by the broken neighbour correlations of the rolled rows, which a model can learn. Pass nsb_roll=False.", UserWarning, stacklevel=3)
+
+    def _real_noise_for(self, training):
+        """The :class:`~triggerkit.data.real_noise.RealNoise` of the split (only the files of that split with ``split_nsb``), or ``None``."""
+        real_noise = self._real_noise()
+        if real_noise is None or not self.split_nsb:
+            return real_noise
+        return real_noise.subset(self.split_nsb_files()[0 if training else 1])
 
     def _real_noise(self):
         """The :class:`~triggerkit.data.real_noise.RealNoise` that is the NSB source of this dataset, or ``None``."""
@@ -510,6 +554,7 @@ class TriggerDataset:
         else:
             self._check_files(shower_files, true_signal="true_signal_r0_alpha" if "true_signal" in self.targets else None, level=self.waveform_level)
             self._check_files(self.nsb_files or [], level=self.waveform_level)
+        nsb_files = self.split_nsb_files()[0 if training else 1]
         config = self._config(training=training)
         # a window that does not depend on the event (no source aligned on a trigger) is cut by the reader, before the shuffle: its buffer then holds
         # 50 samples of an event and not 82. The gates need the whole datacube, so with them the cut stays after.
@@ -518,7 +563,7 @@ class TriggerDataset:
             config.crop = {PARTICLES[particle]: plan for particle, plan in self._plans.items()}
         ds = SimTelTFDataset(
             gamma_files=gamma_files,
-            nsb_files=self.nsb_files,
+            nsb_files=nsb_files,
             opener_cls=self.opener_cls,
             config=config,
             extra_files={PARTICLES[p]: files for p, files in (extra_files or {}).items() if files},
@@ -657,32 +702,66 @@ class TriggerDataset:
         """True when a source is aligned on a trigger: the upstream chain can refuse an event, so the batches have to be rebuilt."""
         return any(plan.mode == "on_the_fly" for plan in plans.values())
 
+    @staticmethod
+    def _pixel_geometry():
+        """The 1296-pixel SST-1M camera geometry (the input of the FADC stage), to turn a raw r0."""
+        import astropy.units as u
+        from ctapipe.instrument import CameraGeometry
+
+        x, y = sst1m.pixel_positions().T
+        return CameraGeometry(name="DigiCam pixels", pix_id=np.arange(len(x)), pix_x=x * u.m, pix_y=y * u.m, pix_area=np.ones(len(x)) * u.m ** 2,
+                              pix_type="hexagonal")
+
     def _rotate_gammas(self, ds):
-        """Give each gamma of the batch a random one of the ``gamma_rotations``: the same pixel permutation of its waveform, pedestal and maps."""
-        table = tf.constant(self._rotation_index)                                  # (R, P)
+        """Give each gamma of the batch a random one of the ``gamma_rotations``: the same pixel permutation of its waveform, pedestal and maps.
+
+        Each array is turned with the table of its own size on the pixel axis: 432 patches, or the 1296 pixels of a raw r0 (its pedestal too; the true image and
+        the true signal stay per patch). On a REAL noise (:class:`~triggerkit.data.real_noise.RealNoise`) every row is turned, NSB and other showers too: the
+        merged gammas carry the real noise, and turning only them would put the features of the real camera (dead pixels, stars, the pedestal pattern) at turned
+        places in the gammas and at their own places in the NSB, a difference between the classes a model can learn."""
+        n_rotations = int(self._rotation_index.shape[0])
+        # one more row, the identity, for the rows that are not turned: the row 0 of the tables is the FIRST rotation asked for, not 0 degrees
+        # (gamma_rotations=(120, 240) turned the NSB by 120 degrees)
+        patches = tf.constant(np.vstack([self._rotation_index, np.arange(sst1m.N_PATCHES)[None, :]]))            # (R + 1, 432)
+        pixels = tf.constant(np.vstack([self._pixel_rotation_index, np.arange(sst1m.N_PIXELS)[None, :]]))        # (R + 1, 1296)
+        every_row = self._real_noise() is not None
         generator = tf.random.Generator.from_seed(int(self.seed) + 4711)             # seeded: two runs with the same seed give the same rotations (a bare tf.random.uniform did not)
 
+        def turn(x, choice, axis):
+            size = x.shape[axis]
+            if size is not None:                                                                  # known when the graph is built
+                if size not in (sst1m.N_PATCHES, sst1m.N_PIXELS):
+                    raise ValueError(f"gamma_rotations: an array of {size} pixels on axis {axis} ({x.shape}), the rotations are known for {sst1m.N_PATCHES} "
+                                     f"patches and {sst1m.N_PIXELS} pixels")
+                perm = tf.gather(pixels if size == sst1m.N_PIXELS else patches, choice)      # (B, P): out[p] = in[perm[p]], the fold plumbing's convention
+            else:
+                size = tf.shape(x)[axis]
+                tf.debugging.Assert(tf.logical_or(tf.equal(size, sst1m.N_PATCHES), tf.equal(size, sst1m.N_PIXELS)),
+                                    ["gamma_rotations: the pixel axis is neither 432 patches nor 1296 pixels:", tf.shape(x)])
+                perm = tf.cond(tf.equal(size, sst1m.N_PIXELS), lambda: tf.gather(pixels, choice), lambda: tf.gather(patches, choice))
+            return tf.gather(x, perm, axis=axis, batch_dims=1)
+
         def rotate(features, label):
-            gamma = tf.equal(features["particle"], PARTICLES["gamma"])
-            choice = tf.where(gamma, generator.uniform(tf.shape(features["particle"]), 0, table.shape[0], dtype=tf.int32), 0)
-            perm = tf.gather(table, choice)                                        # (B, P): out[p] = in[perm[p]], the fold plumbing's convention
+            draw = generator.uniform(tf.shape(features["particle"]), 0, n_rotations, dtype=tf.int32)
+            choice = draw if every_row else tf.where(tf.equal(features["particle"], PARTICLES["gamma"]), draw, n_rotations)
             out = dict(features)
-            out["waveform"] = tf.gather(features["waveform"], perm, axis=2, batch_dims=1)          # (B, 1, P, T)
+            out["waveform"] = turn(features["waveform"], choice, 2)                              # (B, 1, P, T)
             for key in ("pedestal", "true_image", "peak_time", "true_signal"):
                 if key in features:
-                    out[key] = tf.gather(features[key], perm, axis=1, batch_dims=1)                # (B, P), (B, P, T) for the true signal
+                    out[key] = turn(features[key], choice, 1)                                     # (B, P), (B, P, T) for the true signal
             return out, label
 
         return ds.map(rotate, num_parallel_calls=1)            # sequential: the generator is stateful, parallel calls would draw in a nondeterministic order
 
     def _binary_label(self, ds):
-        """gamma = 1 against everything else = 0, and ``features["particle_weight"]`` (the negative weight of the extra types)."""
+        """gamma (and the ``positive_types``) = 1 against everything else = 0, and ``features["particle_weight"]`` (the negative weight of the extra types)."""
         table = tf.constant([self.negative_weights.get(name, 1.0) for name in PARTICLES], dtype=tf.float32)
+        positive_table = tf.constant([name == "gamma" or name in self.positive_types for name in PARTICLES])
 
         def to_binary(features, label):
-            weight = tf.gather(table, features["particle"])
-            weight = tf.where(label == 1, 1.0, weight)               # a gamma is never down-weighted
-            return {**features, "particle_weight": weight}, tf.cast(tf.equal(label, 1), label.dtype)
+            positive = tf.gather(positive_table, features["particle"])
+            weight = tf.where(positive, 1.0, tf.gather(table, features["particle"]))      # a gamma (or a positive type) is never down-weighted
+            return {**features, "particle_weight": weight}, tf.cast(positive, label.dtype)
 
         return ds.map(to_binary, num_parallel_calls=tf.data.AUTOTUNE)
 
@@ -736,10 +815,10 @@ class TriggerDataset:
             rows = np.flatnonzero(keep)
             if rows.size == 0:
                 break
-            out = gate.model(gate.pack_model_inputs(tf.convert_to_tensor(wf[rows]),
-                                                    tf.convert_to_tensor(ped[rows])), training=False)
-            out = tf.reshape(tf.cast(out, tf.float32), (rows.size, -1))
-            fired = tf.reduce_max(out, axis=1).numpy() > 0.5
+            with CHAIN_LOCK:                                # the train and the validation streams share the gate: the call and the decision on its score are one step
+                out = gate.model(gate.pack_model_inputs(tf.convert_to_tensor(wf[rows]),
+                                                        tf.convert_to_tensor(ped[rows])), training=False)
+                fired = chain_fired(gate.model, out)        # the gate's threshold comparison of its score, not a soft output against 0.5
             keep[rows[~fired]] = False
         return keep
 
@@ -768,14 +847,21 @@ class TriggerDataset:
         """``{name: tf.data}`` of the watched sources: ``(features, label)`` batches, ``features["particle"]`` = the type code.
 
         Read like the validation gammas (the validation n_pe window and telescope, no shuffling, no NSB, no roll); the label is the
-        reader's (1) and means nothing here, use ``particle``. Not gated, not weighted: they are not learned from.
+        reader's (1) and means nothing here, use ``particle``. Not gated, not weighted: they are not learned from. A type the training
+        also reads (``"gamma"``, or a type of ``train_on``) is watched on its VALIDATION files only, never on the files the model learns from.
+        On a :class:`~triggerkit.data.real_noise.RealNoise` the watched showers are merged onto it like the trained ones (their files need the same conversion); its files and the window are checked like those of ``train_val_datasets`` (a file without the signal or a window that does not fit the real samples is refused here).
         """
         out = {}
+        real_noise = self._real_noise()
+        if real_noise is not None and self.watch:
+            self._check_real_noise(real_noise)                  # as train_val_datasets: a window that does not fit the real samples is refused now, not inside the reader
         for item in self.watch:
-            source = self.simulation[item.particle]
+            files = self._watch_files(item.particle)
+            if real_noise is not None:
+                self._check_files(files, true_signal="true_signal_r0" if real_noise.signal == "true-signal" else None, raw=real_noise.signal == "r0", level=self.waveform_level)
             config = self._config(training=False)
             config.max_gamma_samples_total = self.watch_max
-            ds = SimTelTFDataset(gamma_files=source.files, nsb_files=[], opener_cls=self.opener_cls, config=config).dataset()
+            ds = SimTelTFDataset(gamma_files=files, nsb_files=[], opener_cls=self.opener_cls, config=config).dataset()
             code = PARTICLES[item.particle]
 
             def to_particle(features, label, code=code):
@@ -787,6 +873,19 @@ class TriggerDataset:
                 ds = self._align_watch(ds, plans[item.particle])
             out[item.label] = ds
         return out
+
+    def _watch_files(self, particle):
+        """The files a watched type is read from: all of them, or its validation files when the training reads that type too."""
+        if particle == "gamma":
+            files = self.split_files()[1]
+        elif particle in self.extra_types:
+            files = self.split_extra_files()[particle][1]
+        else:
+            return list(self.simulation[particle].files)
+        if not files:
+            raise ValueError(f"watch: {particle!r} is also a training type and has no validation file (percent_validation / n_folds): watching it would "
+                             "measure the model on the events it learns from")
+        return list(files)
 
     def _align_watch(self, ds, plan):
         """A watched source brought to its window: cut / aligned like the training sources, the batches keep the events that pass."""

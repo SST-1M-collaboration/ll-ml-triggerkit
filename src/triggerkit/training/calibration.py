@@ -49,6 +49,7 @@ def _default_calib_config():
 
 def _score_distributions(chain, score_tensor, gamma_files, config):
     """Run a forward pass and split pre-threshold scores into gamma / NSB."""
+    chain._require_full_datacube()                      # before any file is opened
     gamma_files = normalize_files(gamma_files, name="gamma_files", require_nonempty=True)
     pre_threshold_model = tf.keras.Model(inputs=chain.model_inputs(), outputs=score_tensor)
     pack_inputs = chain.pack_model_inputs
@@ -62,8 +63,7 @@ def _score_distributions(chain, score_tensor, gamma_files, config):
 
     scores_g, scores_n = [], []
     for feat, lbl in iterate_batches(ds):
-        wf = tf.reshape(tf.cast(feat["waveform"], tf.uint16),
-                        (-1, chain.num_pixels, chain.num_samples))
+        wf = chain._reshape_waveform(tf.cast(feat["waveform"], tf.uint16))          # refuses a chain shorter than the files (a bare reshape mixed the samples silently)
         ped = tf.reshape(tf.cast(feat["pedestal"], tf.int32), (-1, chain.num_pixels))
         scores = pre_threshold_model(pack_inputs(wf, ped), training=False).numpy()
         # (B,) or (B, F) multi-filter scores -> one value per event (best filter)

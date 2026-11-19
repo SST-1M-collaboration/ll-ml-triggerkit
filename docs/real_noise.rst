@@ -23,7 +23,7 @@ them.
        gamma=sorted(glob.glob("simulation/gammas/*.hdf5")),
        nsb=RealNoise(sorted(glob.glob("real/*.hdf5")), signal="true-signal", seed=1337),
    )
-   dataset = TriggerDataset(sim, batch_size=64, tel_id_only=1, window=Full(), targets=("class", "true_signal"))
+   dataset = TriggerDataset(sim, batch_size=64, tel_id_only=1, window=Full(), nsb_roll=False, targets=("class", "true_signal"))
    train, val = dataset.train_val_datasets()
 
 From converted files to merged events: the two cases
@@ -69,7 +69,8 @@ What a batch holds
   bias. The recorded events of other types (triggered by the camera) are not used.
 * **Gamma rows** (label 1): ``waveform`` is the merged event, the 50 samples of the real data: the signal added to the RAW pixels of one pedestal event, then the FADC of that event. With ``targets=("class", "true_signal")`` the ``true_signal`` of the batch is
   the gamma alone in that window, as ``triggerkit-merge --true-signal`` writes it. Use ``window=Full()`` (the 50 samples), or a ``Fixed`` window inside them.
-* The other features of a gamma (``n_pe``, energy, core, ``true_image``) are those of the simulation.
+* The other features of a gamma (``n_pe``, energy, core, ``true_image``) are those of the simulation; ``peak_time`` of a merged row is the argmax of the merged waveform, not the simulation's.
+* Every SHOWER type the training reads or watches (``proton`` and ``muon`` as well as ``gamma``, with ``train_on`` / ``watch``) is merged the same way, on the same pool, and keeps its own label and ``features["particle"]``: a merged proton is a row of label 0, a muon one of label 0 or 1 (``positive_types``). Their files must also be converted with ``--true-signal`` (or ``--waveform r0`` for ``signal="r0"``).
 
 Where the signal comes from
 ---------------------------
@@ -138,10 +139,14 @@ Things to keep in mind
 * **One telescope.** The pair depends on the gamma's file and event number only, so a gamma seen by two telescopes gets the same noise for both, and the real noise is that of one
   camera: use ``tel_id_only``.
 * **Window.** The merged events have the samples of the real data (50). A window of the dataset that needs more (``Fixed(16, 50)``) is refused at once, with the number of samples; so is a ``target_sample`` outside it. A gamma whose whole pulse leaves the window (a large ``max_shift``) is skipped.
-* **float16 target.** ``features["true_signal"]`` is a float16: whole numbers above 2048 are rounded to 2 ADC.
+* **float16 rounding.** ``features["true_signal"]`` is a float32 in the batch but its values were stored as float16: whole numbers above 2048 are rounded to 2 ADC.
+* **Watched sources.** ``watch_datasets()`` merges the watched showers on the real noise as well.
 * **NSB roll.** The default ``nsb_roll=True`` of ``TriggerDataset`` rolls the pixels of the NSB rows only, never of the merged gammas: a model could learn the broken neighbour
   correlations. A warning is given; pass ``nsb_roll=False``.
-* **Validation.** The NSB pool is shared between training and validation, as for every NSB (see :doc:`dataset`).
+* **Rotations.** With ``gamma_rotations`` every training row is turned on a real noise, the NSB rows and the other showers too, not only the gammas: the merged
+  gammas carry the real noise, and turning only them would put the dead pixels, stars and pedestal pattern of the real camera at turned places in the gammas
+  and at their own places in the NSB.
+* **Validation.** By default the NSB pool is shared between training and validation, as for every NSB (see :doc:`dataset`): the validation showers then sit on noise events the training saw. ``TriggerDataset(split_nsb=True)`` splits the real files like the gamma files, and each split's showers meet only the noise of its own files.
 * **Same name.** Two gamma files with the same file name and the same event numbers get the same noise.
 * **Old files.** A simulation whose ``true_signal`` table has no ``true_signal_r0`` column, or a real file without a raw ``r0``, or an ``r0`` of 432 patches (the layout before ``r0`` meant the raw pixels), is refused at once, with the command to convert it again.
 

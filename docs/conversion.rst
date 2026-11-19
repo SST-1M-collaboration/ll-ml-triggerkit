@@ -28,12 +28,12 @@ per patch, for the events the telescope triggered on.
    **The name of a waveform table says what it holds.** ``r0`` is the RAW waveform, 1296 pixels x T samples, ``uint16`` ADC, with the ``pedestal`` of the event; the FADC
    (pedestal subtraction, sum of the 3 pixels of each patch, clip to 0-255) is applied when it is read. ``r0alpha`` is the FADC output, 432 patches x T, ``uint8``. The loader
    takes ``r0alpha`` when the file has it and the FADC of ``r0`` otherwise. For a simulation both give exactly the same events; for real data they do not: the ``r0alpha`` is what the FPGA recorded and
-   the FADC of ``r0`` is our own (the ``emulated_traces``), identical on 82.6 % of the samples of a test file (the FPGA updates its baseline all the time, the file holds a snapshot). A file converted before this layout (an ``r0`` of 432 patches) is
+   the FADC of ``r0`` is our own (the ``emulated_traces``), identical at sample 6 for almost every patch (every patch of the first 50 events of 2026-09-22 file 0296, 98.4 % of those of 2026-09-23 file 0000) and on 82.5 % of all the samples of a file of the 2026-10-26 session (97.7 % on one of 2026-09-23) (the FPGA updates its baseline all the time, the file holds a snapshot). A file converted before this layout (an ``r0`` of 432 patches) is
    refused with a message to convert it again. ``--stack-stages`` keeps its own ``r0`` (the stack of three, written for the readers of ``np.stack``) and is not read by the loader.
 
 .. warning::
    ``r1`` is an exact copy of ``r0alpha``. On 150 gammas the file takes 33.4 kB per event, 15.4 kB for the alpha and 15.5 kB for ``r1``: ``r1`` doubles
-   the size for nothing for our use. It is only written with ``r0alpha`` (``--waveform r0`` has no ``r1``).
+   the size for nothing for our use. It is written with ``r0alpha`` and ``both``, not with ``--waveform r0``.
 
 Options
 -------
@@ -54,6 +54,11 @@ An option of the other kind of input is an error, not ignored.
      - both
      - the file to write (overwritten). It is written as ``FILE.hdf5.partial`` and renamed when the conversion is finished: a failing
        conversion leaves nothing under the final name
+   * - ``--to-process-list LIST`` and ``--output-dir DIR``
+     - both
+     - instead of ``--to-process-file`` and ``--output-hdf5-file``: ``LIST`` is a text file with one file to convert per line (``#`` for comments; simulations and / or real files), ``DIR`` the folder of the
+       results, one ``DIR/<name>.hdf5`` per input (``gamma_1.simtel.gz`` gives ``gamma_1.hdf5``). A file already converted is skipped (an output that is not an HDF5 file with a waveform table is converted again), so the command can be run again after a failure; a file listed twice is converted once; a file that
+       fails is reported and the others go on (exit code 1 at the end); two inputs that would give the same name are refused. The options apply to every file and are checked against all of them before anything is converted: a simulation-only option (``--true-signal``, ``--rotations`` ...) with a real file in the list, or the reverse, stops the run at once, so a list of both kinds works only with the common options. A listed path that does not exist, or an empty list, is an error before any conversion. ``#`` is for whole lines (no comment after a path); empty lines are ignored
    * - ``--max-events N``
      - both
      - stop after N written events (testing)
@@ -77,6 +82,13 @@ An option of the other kind of input is an error, not ignored.
    * - ``--true-signal``
      - simulation
      - also write the noise-free signal: ``true_signal_r0`` (per pixel), ``true_signal_r0_alpha``, ``true_signal_fadc`` and ``pe_count`` (per patch) per sample (table ``true_signal``)
+   * - ``--rotations 0 120 240``
+     - simulation
+     - the orientations in which every event is written, among 0, 120 and 240 degrees (default ``0``). The camera is 3-fold symmetric, so a copy turned about the optical axis is another valid event: every
+       per-pixel and per-patch array of every per-event table is turned **and the truth of the shower with it** (``true_az``, ``true_alt``, ``true_core_x``, ``true_core_y``; the energy, the heights and the depth do not
+       change, the impact distance is unchanged by construction). The copies are **rows of the same tables**: a classic reader needs nothing new. Their ids are ``event_id + 1e9`` (120) and ``+ 2e9`` (240);
+       ``simulation/event/subarray/rotation`` (``event_id``, ``source_event_id``, ``rotation``) says which is which. The events are not new showers: the number of simulated showers does not change, so
+       an efficiency read on such a file is too high by the number of orientations: **for training, not for statistics**. One telescope per file (otherwise the conversion fails at the end and leaves nothing). ``0`` is the event as it is; without it (``--rotations 120``) the original events are replaced by the turned ones (the file does not grow). ``--max-events`` counts simulated events, not copies
    * - ``--pedestal-only``
      - real
      - convert only the pedestal events (``event_type`` with the bit 0x8: random triggers, real NSB) and skip the others; every table then holds those events only, in the same order. The real noise of
@@ -111,6 +123,9 @@ The extra tables
    Per patch ``n_pe`` and ``arrival`` in samples relative to ``readout_time``, without the constant of the production. Only events with at
    least 9 p.e. have a list.
 
+``--rotations`` -> ``simulation/event/subarray/rotation``
+   ``event_id``, ``source_event_id``, ``rotation`` (0, 120 or 240), one row per event of the file; written only when a rotation other than 0 is asked.
+
 ``--waveform r0`` or ``both`` -> ``r0/event/telescope/tel_001``
    ``waveform`` ``(1296, T)`` ``uint16``: the raw ADC of the pixels (in ``pixels_indices`` order for real data); ``pedestal`` ``(1296,)`` ``float32``: the pedestal the FADC subtracts
    (simulation: the camera monitoring of the file; real data: the recorded baseline divided by 16, floored). ``triplet_sums(waveform, pedestal)`` is exactly the alpha
@@ -132,7 +147,7 @@ Cost
 
 Per event, zlib: ``r0alpha`` alone about 15 kB (simulation) / 13 kB (real); ``--waveform r0`` about 119 kB (simulation) / 78 kB (real); ``--stages`` about +109 kB / +74 kB;
 ``--true-signal`` about +2 kB (the pixel table is sparse) and 0.03 s, its rows streamed to a temporary file next to the output; ``--stack-stages`` makes
-``r0`` and ``r1`` 91 kB per event each instead of 15. A real file of 11 982 events takes 21 s and 160 MB with ``--no-emulated``.
+``r0`` and ``r1`` 91 kB per event each instead of 15. A real file of 11 982 events takes 21 s and 160 MB with ``--no-emulated``. ``--rotations 0 120 240`` makes the file three times as big.
 
 Environments
 ------------
@@ -155,5 +170,6 @@ Examples
    triggerkit-convert --to-process-file SST1M2_20261026_0012.fits.fz --output-hdf5-file noise.hdf5 --no-emulated --waveform r0 --pedestal-only      # the real noise of RealNoise, 70 MB
    triggerkit-convert --to-process-file gamma.simtel.gz --output-hdf5-file gamma.hdf5 --true-signal --waveform both
    triggerkit-convert --to-process-file gamma.simtel.gz --output-hdf5-file gamma_stack.hdf5 --stack-stages --max-events 100
+   triggerkit-convert --to-process-list files.txt --output-dir converted/ --true-signal --rotations 0 120 240
 
 ``python -m triggerkit.tools.convert_simtel`` and ``python -m triggerkit.tools.convert_real`` run one converter alone, with a shorter help.

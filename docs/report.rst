@@ -3,7 +3,7 @@ Reports
 
 A report compares several statistics files: efficiency against the number of photoelectrons and against the energy, rate against threshold, ROC curve,
 effective area, the cross-validation folds, ... It is made by :class:`triggerkit.Statistics.StatPlotter.StatPlotter` (matplotlib), as a PDF, a Markdown
-file (always written, next to the plots) and, if asked, an HTML page. Every figure is also saved as a PNG and an SVG in the output folder.
+file (always written, next to the plots) and an HTML page (``generate_html``, on by default). Every figure is also saved as a PNG and an SVG in the output folder.
 
 .. code-block:: python
 
@@ -44,6 +44,12 @@ What the pieces are
    the condition whose folds are drawn in the cross-validation sections (here ``"medium"``).
 ``generate_pdf``, ``generate_html``, ``save_svg``, ``vector_plots``
    the output formats.
+``effective_area_expected_N``, ``effective_area_emin_tev``, ``effective_area_emax_tev``, ``effective_area_expected_slope``, ``effective_area_a_gen_m2``
+   the effective area is ``A_gen x triggered / thrown`` per energy bin, the thrown showers being spread as ``E^-slope`` over ``[emin, emax]``: these must be the
+   generation range, spectral index and area of the simulation (defaults 0.2 to 800 TeV, slope 2). The number of showers thrown is read from the statistics file
+   (``/sources``: the gamma showers simulated for the events of the fold, see :meth:`~triggerkit.Statistics.stats_file.StatsFile.simulated`);
+   ``effective_area_expected_N`` replaces it (with a warning when they differ by more than 5 %). A file that does not say how many showers were simulated, with
+   no ``effective_area_expected_N``, gets no effective area (listed in the skipped plots).
 
 Sections of the report
 ----------------------

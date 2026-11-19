@@ -1,6 +1,6 @@
 """Real SST-1M (DigiCam) file ``SST1M2_YYYYMMDD_NNNN.fits.fz`` -> HDF5 that the triggerkit loader reads like a simulated one (432 patches, 8 bit).
 
-    triggerkit-convert --to-process-file FILE.fits.fz --output-hdf5-file FILE.hdf5 [--max-events N] [--no-emulated] [--waveform r0alpha|r0|both] [--pedestal-only]
+    triggerkit-convert --to-process-file FILE.fits.fz --output-hdf5-file FILE.hdf5 [--max-events N] [--no-emulated] [--waveform r0alpha|r0|both] [--stages] [--stack-stages] [--pedestal-only]
 
 (``triggerkit-convert`` picks this converter for a ``.fits.fz`` file and :mod:`triggerkit.tools.convert_simtel` for a ``.simtel.gz`` one; this module also runs alone: ``PYTHONPATH=/path/to/ll-ml-triggerkit/src python /path/to/ll-ml-triggerkit/src/triggerkit/tools/convert_real.py --to-process-file ...`` or ``python -m triggerkit.tools.convert_real``; by its path it needs that ``PYTHONPATH`` or the package installed, which is the case in the sst1mpipe 0.9.0 environment (Python 3.10), where the package cannot be installed.)
 
@@ -21,8 +21,8 @@ What is written, for each event of the file:
 * with ``--stages``, ``r0_stages/event/telescope/tel_001``: ``alpha`` (the recorded traces), ``beta`` (patch7 sums) and ``gamma`` (TDSCAN score x 128), the last two computed offline from the recorded
   traces and BEFORE any threshold (:mod:`triggerkit.tools.stages_table`; the FPGA only records its thresholded outputs, these reproduce its decisions, see ``validate_vs_fpga.py``);
 * ``real/event/emulated_traces/tel_001`` (unless ``--no-emulated``): our FADC computed from the raw pixels and the recorded baselines
-  (:func:`emulated_traces`), same shape and order, to compare with the recorded one. They are identical at ``BASELINE_SAMPLE`` and within a few
-  ADC elsewhere, because the FPGA updates its baseline all the time while the file holds a snapshot.
+  (:func:`emulated_traces`), same shape and order, to compare with the recorded one. They are identical at ``BASELINE_SAMPLE`` for almost every patch (every patch of
+  the first 50 events of 2026-09-22 file 0296, 98.4 % of those of 2026-09-23 file 0000) and within a few ADC elsewhere, because the FPGA updates its baseline all the time while the file holds a snapshot.
 * ``real/event/telescope/tel_001``: ``event_id`` (the camera ``eventNumber``), ``event_type`` (the camera trigger bit mask), ``time_s`` and
   ``time_ns`` (``local_time_sec``, ``local_time_nanosec``), ``run_id``, ``tel_id`` (22 for SST1M2), ``patch7_fired`` / ``tdscan_fired`` (the FPGA output
   has at least one 1; the TDSCAN output is the ``trigger_output_muon`` field).
@@ -306,7 +306,7 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Convert a real SST-1M .fits.fz file to an HDF5 file the triggerkit loader reads.")
     parser.add_argument("--to-process-file", required=True)
     parser.add_argument("--output-hdf5-file", required=True)
-    parser.add_argument("--max-events", type=int, default=None, help="stop after this many events (testing)")
+    parser.add_argument("--max-events", type=int, default=None, help="stop after this many WRITTEN events (testing)")
     parser.add_argument("--stack-stages", "--stack_stages", dest="stack_stages", action="store_true", help="write the r0 waveform as np.stack([alpha, beta, gamma]), (3, 432, T) int16, beta and gamma BEFORE any threshold: what a reader that expects the stack of the first scripts needs (the loader of this package does not read such a file)")
     parser.add_argument("--stages", action="store_true", help="also write alpha (the recorded FADC traces), beta (patch7 sums) and gamma (TDSCAN score x 128), both BEFORE any threshold")
     parser.add_argument("--no-emulated", action="store_true", help="do not write our FADC computed from the raw pixels (halves the file)")

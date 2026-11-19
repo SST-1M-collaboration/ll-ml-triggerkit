@@ -5,6 +5,10 @@ split never saw and rank by the metric that matters -- gamma efficiency at the
 target NSB rate -- with a bootstrap stability tiebreak. Also keeps the older
 history-based picker for reference. Split out of the sandbox's ``train_utils.py``;
 behaviour unchanged.
+
+"Held-out" is true for the GAMMAS only (the files given here). The NSB is the chain's own NSB file (``chain.simtel_nsb_path``, its first events), the one the
+training read too, with other pixel rolls: the threshold at the target rate is set on NSB events the model saw. Give the chain a NSB no training read for a
+selection independent on both sides.
 """
 
 import numpy as np
@@ -99,6 +103,7 @@ def collect_multi_filter_scores(chain, score_outputs, gamma_files, config=None, 
 
     ``n_pe_min``: keep only the gammas with at least this many true p.e. (the metric zone of ``NpeWeighting``); the NSB is untouched.
     """
+    chain._require_full_datacube()                      # before any file is opened
     config = config or _selection_config()
     gamma_files = normalize_files(gamma_files, name="gamma_files", require_nonempty=True)
     single = not isinstance(score_outputs, (list, tuple))
@@ -117,8 +122,7 @@ def collect_multi_filter_scores(chain, score_outputs, gamma_files, config=None, 
     g_chunks = [[] for _ in outputs]
     n_chunks = [[] for _ in outputs]
     for feat, lbl in iterate_batches(ds):
-        wf = tf.reshape(tf.cast(feat["waveform"], tf.uint16),
-                        (-1, chain.num_pixels, chain.num_samples))
+        wf = chain._reshape_waveform(tf.cast(feat["waveform"], tf.uint16))          # refuses a chain shorter than the files (a bare reshape mixed the samples silently)
         ped = tf.reshape(tf.cast(feat["pedestal"], tf.int32), (-1, chain.num_pixels))
         preds = score_model(pack_inputs(wf, ped), training=False)
         if single:
@@ -166,7 +170,7 @@ def select_best_filter(chain, score_tensor, selection_gamma_files,
     """Pick the filter that generalizes best, on held-out data, at the target rate.
 
     Scores all F filters once on ``selection_gamma_files`` (use files the training
-    /early-stopping split never saw), then ranks each filter by its gamma
+    /early-stopping split never saw; the NSB is the chain's, read by the training too: see the module docstring), then ranks each filter by its gamma
     efficiency when its threshold is set to the target NSB rate -- the actual
     operating point, not threshold-free AUC. Among filters within ``tie_margin`` of
     the best efficiency, a bootstrap over events breaks the tie in favour of the

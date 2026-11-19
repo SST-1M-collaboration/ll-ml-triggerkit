@@ -240,7 +240,8 @@ def test_a_converted_pedestal_file_gives_the_same_merge_as_the_fits_file_in_orde
     tables = pytest.importorskip("tables")
     pytest.importorskip("protozfits")
     converted = str(tmp_path / "ped.hdf5")
-    convert_real.convert(FITS, converted, max_events=1500, emulated=False, progress_every=0, waveform="r0", pedestal_only=True)
+    # every pedestal event of the file: the seed draws among all of them (with only the first 1500, a file that has more gave other pairs)
+    convert_real.convert(FITS, converted, emulated=False, progress_every=0, waveform="r0", pedestal_only=True)
 
     def run(name, real, **kw):
         out = str(tmp_path / f"{name}.hdf5")
@@ -271,3 +272,48 @@ def test_reading_the_fits_pedestals_ahead_in_several_processes_changes_nothing_b
     several, alpha_several = run("several", 3)
     assert np.array_equal(one["real_event_id"], several["real_event_id"]) and np.array_equal(one["real_row"], several["real_row"])      # the same pairs, in the same order
     assert np.array_equal(alpha_one, alpha_several)
+
+
+def test_looping_the_gammas_with_a_seed_needs_a_limit(tmp_path):
+    with pytest.raises(ValueError, match="never ends"):
+        merge.merge(["a.simtel.gz"], ["b.hdf5"], str(tmp_path / "o.hdf5"), seed=1, loop_gammas=True)
+    with pytest.raises(SystemExit):
+        merge.main(["--simtel", "a", "--real", "b", "--output-hdf5-file", str(tmp_path / "o.hdf5"), "--seed", "1", "--loop-gammas"])
+
+
+@pytest.mark.skipif(not (SIMTEL and FITS), reason="TRIGGERKIT_TEST_SIMTEL and TRIGGERKIT_TEST_FITS are not set (a simtel file and a real file)")
+def test_the_gammas_start_again_on_new_pedestals_until_the_pedestals_run_out(tmp_path, monkeypatch):
+    """5 gammas and 12 pedestal events: the gammas are used 5 + 5 + 2 times, every merged event on its own noise event, and running out of pedestals in a later pass is the end, not an error."""
+    import itertools
+
+    tables = pytest.importorskip("tables")
+    original = merge.simulated_gammas
+    monkeypatch.setattr(merge, "simulated_gammas", lambda *a, **k: itertools.islice(original(*a, **k), 5))
+    pedestals = str(tmp_path / "ped.hdf5")
+    convert_real.convert(FITS, pedestals, max_events=12, progress_every=0, emulated=False, waveform="r0", pedestal_only=True)
+    out = str(tmp_path / "m.hdf5")
+    assert merge.merge([SIMTEL], [pedestals], out, signal="true-signal", progress_every=0, loop_gammas=True) == 12
+    with tables.open_file(out) as h5:
+        info = h5.get_node("/merge/event/telescope/tel_001")[:]
+    first = list(info["sim_event_id"][:5])
+    assert list(info["sim_event_id"]) == first + first + first[:2] and len(set(info["real_event_id"])) == 12
+    monkeypatch.setattr(merge, "simulated_gammas", lambda *a, **k: itertools.islice(original(*a, **k), 20))
+    with pytest.raises(RuntimeError, match="only 12 pedestal"):                    # a first pass that cannot finish is still the error
+        merge.merge([SIMTEL], [pedestals], str(tmp_path / "e.hdf5"), signal="true-signal", progress_every=0, loop_gammas=True)
+
+
+@pytest.mark.skipif(not (SIMTEL and FITS), reason="TRIGGERKIT_TEST_SIMTEL and TRIGGERKIT_TEST_FITS are not set (a simtel file and a real file)")
+def test_a_gamma_is_written_in_all_its_orientations_or_not_at_all_when_the_pedestals_run_out(tmp_path, monkeypatch):
+    """3 gammas x 2 orientations = 6 events per pass and 15 pedestal events: two passes, then the third gamma cannot get its two pedestals and is dropped (14 events, every gamma complete)."""
+    import itertools
+
+    tables = pytest.importorskip("tables")
+    original = merge.simulated_gammas
+    monkeypatch.setattr(merge, "simulated_gammas", lambda *a, **k: itertools.islice(original(*a, **k), 3))
+    pedestals = str(tmp_path / "ped.hdf5")
+    convert_real.convert(FITS, pedestals, max_events=15, progress_every=0, emulated=False, waveform="r0", pedestal_only=True)
+    out = str(tmp_path / "m.hdf5")
+    assert merge.merge([SIMTEL], [pedestals], out, signal="true-signal", progress_every=0, loop_gammas=True, rotations=(0, 120)) == 14
+    with tables.open_file(out) as h5:
+        info = h5.get_node("/merge/event/telescope/tel_001")[:]
+    assert list(info["rotation"]) == [0, 120] * 7 and all(info["sim_event_id"][2 * k] == info["sim_event_id"][2 * k + 1] for k in range(7)) and len(set(info["real_event_id"])) == 14

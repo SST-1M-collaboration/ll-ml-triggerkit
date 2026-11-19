@@ -31,6 +31,10 @@ def generate_lin_space_edges(start, stop, num_bit):
     -- the default edge placement to hand to :class:`TDSCANBody` as ``edges_func``.
     Pass ``edges_func=None`` (or ``edges_num_bit=0`` / ``stop <= start``) to skip
     the quantizer entirely.
+
+    The levels are TRUNCATED to integers (``astype(int)``), not rounded: ``(0, 122, 4)`` gives 60 where the exact level is 61. The deployed ``(16, 128, 4)`` is exact
+    (all its levels are integers); other ranges and bit widths (3 or 5 bits, ``(0, 255, 4)``, ...) have some levels one below the rounded value. Kept as it is
+    so that the quantization sweeps made with it stay reproducible; pass your own ``edges_func`` for rounded levels.
     """
     return np.linspace(start, stop, num=2 ** num_bit - 1).astype(int).tolist()
 

@@ -12,6 +12,8 @@ definition of ``train_utils.PairwiseAUCMetric``.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 from scipy.stats import norm
 
@@ -113,6 +115,28 @@ def normalize_comparison(comparison) -> str:
     return _COMPARISON_ALIASES.get(str(comparison).strip().lower(), "gt")
 
 
+def fires(scores, threshold, comparison="gt"):
+    """Boolean decision of ``score > threshold`` (``>=`` with ``comparison="ge"``), for ANY threshold, ``-inf`` included: a NaN score never fires, and
+    neither does an event an upstream trigger did not fire on (``GATED_OUT_SCORE``), whose score is otherwise above ``-inf`` and every threshold below
+    ``-1e30``. The same rule as :func:`threshold_candidates`.
+
+    Scores and threshold are compared in float32, the type of the stored scores, like :func:`count_fired`: a score given as float64 (an exact
+    ``-1e30``, below the float32 ``GATED_OUT_SCORE``) is gated out all the same."""
+    scores = np.asarray(scores, dtype=np.float32)
+    threshold = np.asarray(threshold, dtype=np.float32)
+    with np.errstate(invalid="ignore"):
+        above = (scores >= threshold) if normalize_comparison(comparison) == "ge" else (scores > threshold)
+        return above & (scores > np.float32(GATED_OUT_SCORE))
+
+
+def count_fired(scores, thresholds, comparison="gt"):
+    """Number of ``scores`` that :func:`fires` at each of ``thresholds`` (an array), from one sort: a NaN or gated-out score is never counted."""
+    scores = np.asarray(scores, dtype=np.float32).reshape(-1)
+    usable = np.sort(scores[~np.isnan(scores) & (scores > np.float32(GATED_OUT_SCORE))])
+    side = "left" if normalize_comparison(comparison) == "ge" else "right"
+    return usable.size - np.searchsorted(usable, np.asarray(thresholds, dtype=np.float32), side=side)
+
+
 def threshold_candidates(scores, comparison="gt"):
     """All distinct achievable operating points of a ``score > tau`` / ``>=`` rule.
 
@@ -158,7 +182,7 @@ def pick_threshold_from_scores(scores, desired_fraction, comparison="gt"):
     Returns ``(tau, achieved_fraction, mode)`` where ``mode`` is
     ``"score > bin"`` / ``"score >= bin"``, or ``(None, None, None)`` for empty
     input. On an exact tie between a strict and an include-ties candidate the
-    lower tau (include-ties) wins, so a quantized score never undershoots.
+    include-ties one wins (its tau sits just below a score value, e.g. 7.9999995 for ``score >= 8``, not at the lower strict one, 7.0), so a quantized score never undershoots.
     """
     scores = np.asarray(scores, dtype=np.float32).reshape(-1)
     if scores.size == 0:
@@ -189,10 +213,15 @@ def trigger_rate_curve(scores, window_sec, comparison="gt"):
 
 
 def wilson(passed, total, level=0.68):
+    """``(efficiency, error_low, error_high)`` of ``passed`` out of ``total`` (Wilson score interval, as TEfficiency). NaN for ``total == 0``, and NaN with a warning for ``passed > total``
+    (or a negative count): that is not an efficiency but a denominator that is too small (copies of the same showers, a wrong ``n_simulated``)."""
     #implementation as of: https://root.cern.ch/doc/master/TEfficiency_8cxx_source.html#l03837
     alpha = (1.0 - level) / 2.0
     if total == 0:
         return np.nan,np.nan,np.nan
+    if passed > total or passed < 0 or total < 0:                    # more triggered than simulated: the denominator is wrong (copies of showers, a wrong n_simulated), never an efficiency
+        warnings.warn(f"wilson: {passed} passed of {total}: not an efficiency (a denominator that is too small: copies of the same showers, a wrong n_simulated); returning NaN", RuntimeWarning, stacklevel=2)
+        return np.nan, np.nan, np.nan
 
     average = passed / total
     kappa = norm.ppf(1.0 - alpha)

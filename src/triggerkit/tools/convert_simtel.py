@@ -1,17 +1,17 @@
 """simtel.gz -> HDF5 for ctapipe, with the FADC stage of the SST-1M trigger applied (432 patch triplets, 8 bit).
 
-    triggerkit-convert --to-process-file FILE.simtel.gz --output-hdf5-file FILE.hdf5 [--max-events N] [--photoelectron-times]
+    triggerkit-convert --to-process-file FILE.simtel.gz --output-hdf5-file FILE.hdf5 [--max-events N] [--waveform r0alpha|r0|both] [--stages] [--stack-stages] [--photoelectron-times] [--true-signal] [--rotations DEG [DEG ...]]
 
 (``triggerkit-convert`` picks this converter for a ``.simtel.gz`` file and :mod:`triggerkit.tools.convert_real` for a ``.fits.fz`` one; this module also runs alone.)
 
-(same two options as ``python-reference/convert_to_hdf5.py``). This module runs alone too: ``PYTHONPATH=/path/to/ll-ml-triggerkit/src python /path/to/ll-ml-triggerkit/src/triggerkit/tools/convert_simtel.py --to-process-file ...`` (or ``python -m triggerkit.tools.convert_simtel``); by its path it needs that ``PYTHONPATH`` or the package installed. The file holds, for each event the telescope triggered on: the FADC output as the ``r0alpha`` table (and R1)
+This module runs alone too: ``PYTHONPATH=/path/to/ll-ml-triggerkit/src python /path/to/ll-ml-triggerkit/src/triggerkit/tools/convert_simtel.py --to-process-file ...`` (or ``python -m triggerkit.tools.convert_simtel``); by its path it needs that ``PYTHONPATH`` or the package installed. The file holds, for each event the telescope triggered on: the FADC output as the ``r0alpha`` table (and R1)
 waveforms (432 x T, uint8; T is the number of samples of the simtel file), a DL1 image (the waveform summed over time) and its peak time (the ARGMAX
 of that noisy waveform, not the true arrival time), and the true image compressed to the 432 patches.
 
 ``--waveform`` chooses which waveform tables are written (:mod:`triggerkit.FileIO.layout`: the name of the table says what it holds): ``r0alpha`` (default), the FADC output,
 ``(432, T)`` uint8, as before; ``r0``, the RAW waveform ``/r0/event/telescope/tel_001``, ``waveform`` ``(1296, T)`` uint16 and ``pedestal`` ``(1296,)`` float32 (the pedestal the FADC
-subtracts: ``r0alpha`` is exactly ``triplet_sums(waveform, pedestal)``); ``both``. Only ``r0alpha`` also writes the R1 table (the same alpha). About 15 kB per event for ``r0alpha``, about
-119 kB more for ``r0`` (zlib, 82 samples, measured on 60 gammas: the raw pixels hold the NSB and compress poorly). The tables are told apart by their name, so a file written before this layout (an ``r0`` of 432 patches) is refused by the loader.
+subtracts: ``r0alpha`` is exactly ``triplet_sums(waveform, pedestal)``); ``both``. ``r1`` (the same alpha) is written with ``r0alpha``, ``both`` and ``--stack-stages``, not with ``--waveform r0``. About 15 kB per event for ``r0alpha``, about
+119 kB for ``r0`` alone (it replaces ``r0alpha`` and ``r1``; with ``both`` it comes on top) (zlib, 82 samples, measured on 60 gammas: the raw pixels hold the NSB and compress poorly). The tables are told apart by their name, so a file written before this layout (an ``r0`` of 432 patches) is refused by the loader.
 
 ``--photoelectron-times`` adds ONE table, ``/simulation/event/telescope/pe_arrival/tel_001`` (the other tables stay identical, byte for byte, to a run without it), read
 with eventio next to ctapipe (ctapipe does not expose the block). One row per written event:
@@ -37,7 +37,12 @@ training (patch x sample): threshold any of them. It is a statistical equivalent
 it costs about 0.03 s per event (150 events: 6.7 s -> 11.2 s, a pass over the first events for the timing calibration included). The rows are streamed to a temporary file (:mod:`triggerkit.tools.side_tables`).
 The loader reads ``true_signal_r0_alpha`` as ``features["true_signal"]`` and ``true_signal_r0`` for :class:`triggerkit.data.RealNoise`.
 
-This is a port of ``convert_to_hdf5.py`` that keeps its output bit for bit; the FADC itself is :mod:`triggerkit.camera.fadc` (numpy, no TensorFlow).
+``--rotations 0 120 240`` writes every event again turned by 120 / 240 degrees about the optical axis, with the truth of the shower (``true_az``, ``true_alt``, ``true_core_x``, ``true_core_y``) turned too, as extra
+rows of the same tables (ids ``id + 1e9`` / ``+ 2e9``; table ``/simulation/event/subarray/rotation``, written only when a rotation other than 0 is asked): :mod:`triggerkit.tools.rotated_copies`, a post-processing of the
+finished file, one telescope per file. ``0`` keeps the original events; without it (``--rotations 120``) the originals are replaced by the turned events (no copy: the file does not grow). ``--max-events`` counts the events of the
+simulation, not the copies, and :func:`convert` returns the number written INCLUDING the copies. The events are not new showers: for training, not for an efficiency.
+
+This is a port of ``convert_to_hdf5.py``: the same numbers (the FADC output, the DL1 image, the truth), the waveform table being named ``r0alpha`` instead of ``r0`` (see ``--waveform``); the FADC itself is :mod:`triggerkit.camera.fadc` (numpy, no TensorFlow).
 Things that look odd and are on purpose:
 
 * events the telescope did not trigger on are skipped (ctapipe 0.26 also yields the non-triggered showers; the HDF5 productions never held them);
@@ -64,8 +69,8 @@ from ctapipe.instrument import CameraDescription, CameraGeometry, CameraReadout
 from ctapipe.io import DataWriter, EventSource
 
 from triggerkit.FileIO import layout
-from triggerkit.camera import fadc, simtel_blocks, sst1m
-from triggerkit.tools import side_tables, stages_table
+from triggerkit.camera import fadc, rotation, simtel_blocks, sst1m
+from triggerkit.tools import rotated_copies, side_tables, stages_table
 
 WAVEFORMS = ("r0alpha", "r0", "both")
 PATCH_AREA_M2 = 15.0
@@ -237,13 +242,17 @@ def _check_complete(path):
         raise RuntimeError(f"{path} is truncated or corrupt ({type(error).__name__}: {error}): nothing converted") from error
 
 
-def convert(simtel_file, output_file, max_events=None, progress_every=25, photoelectron_times=False, true_signal=False, stages=False, stack_stages=False, waveform="r0alpha"):
-    """Convert ``simtel_file`` to ``output_file`` (overwritten). ``max_events``: stop after that many WRITTEN events (default: all). Returns the number written.
+def convert(simtel_file, output_file, max_events=None, progress_every=25, photoelectron_times=False, true_signal=False, stages=False, stack_stages=False, waveform="r0alpha", rotations=(0,)):
+    """Convert ``simtel_file`` to ``output_file`` (overwritten). ``max_events``: stop after that many WRITTEN events (default: all). Returns the number written (with ``rotations``, the copies included).
 
     The compressed input is checked to its end first (:func:`_check_complete`). The output is written as ``<output>.partial`` and renamed when the conversion has finished, so a
     conversion that fails leaves no file under the final name (a restartable job that skips existing outputs would otherwise keep a truncated one).
 
-    ``waveform`` : ``"r0alpha"`` (the FADC output, 432 patches), ``"r0"`` (the raw pixels and their pedestal) or ``"both"``: see the module docstring. ``stack_stages`` needs ``"r0alpha"``."""
+    ``waveform`` : ``"r0alpha"`` (the FADC output, 432 patches), ``"r0"`` (the raw pixels and their pedestal) or ``"both"``: see the module docstring. ``stack_stages`` needs ``"r0alpha"``.
+
+    ``rotations``: the orientations in which every event is written, among 0, 120 and 240 degrees (:mod:`triggerkit.tools.rotated_copies`): the copies are rows of the same tables, turned
+    with their truth; ``max_events`` counts the events of the simulation, not the copies."""
+    rotations = rotation.check_rotations(rotations)
     if max_events is not None and max_events < 1:
         raise ValueError(f"max_events must be at least 1 (or None for the whole file), got {max_events}")
     if waveform not in WAVEFORMS:
@@ -253,17 +262,18 @@ def convert(simtel_file, output_file, max_events=None, progress_every=25, photoe
     _check_complete(simtel_file)
     partial = output_file + ".partial"
     try:
-        written = _convert(simtel_file, partial, max_events, progress_every, photoelectron_times, true_signal, stages, stack_stages, waveform)
+        written = _convert(simtel_file, partial, max_events, progress_every, photoelectron_times, true_signal, stages, stack_stages, waveform, rotations)
+        rotated_copies.add_rotations(partial, rotations)
         os.replace(partial, output_file)
     except BaseException:
         for leftover in (partial, partial + ".stages.tmp", partial + ".r0.tmp", partial + ".true_signal.tmp"):
             if os.path.exists(leftover):
                 os.remove(leftover)
         raise
-    return written
+    return written * len(rotations)
 
 
-def _convert(simtel_file, output_file, max_events, progress_every, photoelectron_times, true_signal, stages, stack_stages, waveform="r0alpha"):
+def _convert(simtel_file, output_file, max_events, progress_every, photoelectron_times, true_signal, stages, stack_stages, waveform="r0alpha", rotations=(0,)):
     pe_rows = {}
     stage_file = stages_table.StagesSideFile(output_file) if stages else None
     raw_file = side_tables.SideTables(output_file, "r0") if waveform in ("r0", "both") else None
@@ -272,6 +282,8 @@ def _convert(simtel_file, output_file, max_events, progress_every, photoelectron
     eventio_source = _eventio_events(simtel_file, photoelectrons=photoelectron_times, true_signal=true_signal)
     source = EventSource(simtel_file)
     tel_ids = source.subarray.tel_ids
+    if tuple(rotations) != (0,) and len(tel_ids) != 1:
+        raise ValueError(f"--rotations needs a file with ONE telescope (the scene is turned about its optical axis), this one has {len(tel_ids)}: refused before the conversion")
     wrapped = _SourceWithSubarray(source, patch_subarray(source))
     own_triplets = sst1m.patch_triplets()
     written = 0
@@ -317,12 +329,15 @@ def _convert(simtel_file, output_file, max_events, progress_every, photoelectron
                 if simulated.true_image is not None:
                     simulated.true_image = simulated.true_image[own_triplets].sum(axis=1).astype(np.int32)
                     simulated.true_image_sum = int(simulated.true_image.sum())
+            # the telescopes ctapipe writes a waveform row for: eventio also sees those ctapipe skips (not in tels_with_trigger, no true image), and a row
+            # for them would put their true_signal / pe_arrival tables one row ahead of their r0 from that event on
+            written_tels = {tel_id: blocks for tel_id, blocks in telescopes.items() if tel_id in event.r0.tel}
             if photoelectron_times:
-                for tel_id, blocks in telescopes.items():
+                for tel_id, blocks in written_tels.items():
                     n_pe, arrival = _pe_arrival(blocks.readout_time, blocks.pixel_id, blocks.time)
                     pe_rows.setdefault(tel_id, []).append((event_id, blocks.readout_time, n_pe, arrival))
             if true_signal:
-                for tel_id, blocks in telescopes.items():
+                for tel_id, blocks in written_tels.items():
                     n_samples = blocks.n_samples
                     signal_file.append(TRUE_SIGNAL_GROUP, f"tel_{tel_id:03d}", _true_signal_description(n_samples), _true_signal_row(event_id, blocks.true_signal, n_samples),
                                        title=TRUE_SIGNAL_TITLE)
@@ -334,6 +349,8 @@ def _convert(simtel_file, output_file, max_events, progress_every, photoelectron
                 print(f"Processed {written} events...")
             if max_events is not None and written >= max_events:
                 break
+    if written == 0:
+        raise RuntimeError(f"{simtel_file}: no event the telescope triggered on (or none with a waveform): nothing to convert")
     _use_waveforms(output_file, waveform, stack_stages)
     if stage_file is not None:
         stage_file.merge_into(output_file)
@@ -353,15 +370,16 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Convert a simtel.gz file to an HDF5 file with the FADC stage applied.")
     parser.add_argument("--to-process-file", required=True)
     parser.add_argument("--output-hdf5-file", required=True)
-    parser.add_argument("--max-events", type=int, default=None, help="stop after this many written events (testing)")
+    parser.add_argument("--max-events", type=int, default=None, help="stop after this many events of the simulation (the copies of --rotations are not counted; testing)")
     parser.add_argument("--photoelectron-times", action="store_true", help="also write the arrival of the shower photoelectrons per patch")
     parser.add_argument("--stack-stages", "--stack_stages", dest="stack_stages", action="store_true", help="write the r0 and r1 waveform as np.stack([alpha, beta, gamma]), (3, 432, T) int16, beta and gamma BEFORE any threshold: what a reader that expects the stack of the first scripts needs (the loader of this package does not read such a file)")
     parser.add_argument("--stages", action="store_true", help="also write alpha (FADC), beta (patch7 sums) and gamma (TDSCAN score x 128), both BEFORE any threshold")
     parser.add_argument("--true-signal", action="store_true", help="also write true_signal_r0 (per pixel), true_signal_r0_alpha, true_signal_fadc and pe_count (per patch) per sample (slower: about 0.03 s per event)")
+    parser.add_argument("--rotations", type=int, nargs="+", action="extend", default=None, choices=rotation.ROTATIONS, help="the orientations (degrees) in which every event is written, among 0, 120 and 240 (default 0); the copies are turned with their truth, as rows of the same tables; not for an efficiency")
     parser.add_argument("--waveform", choices=WAVEFORMS, default="r0alpha", help="which waveform to write: r0alpha (the FADC output, 432 patches, default), r0 (the raw 1296 pixels and their pedestal) or both")
     args = parser.parse_args(argv)
     n = convert(args.to_process_file, args.output_hdf5_file, max_events=args.max_events, photoelectron_times=args.photoelectron_times, true_signal=args.true_signal, stages=args.stages, stack_stages=args.stack_stages,
-                waveform=args.waveform)
+                waveform=args.waveform, rotations=args.rotations or [0])
     print(f"{n} events written to {args.output_hdf5_file}")
 
 

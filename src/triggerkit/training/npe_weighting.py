@@ -7,9 +7,9 @@ helping the analysis. ``NpeWeighting`` says which n_pe range the training should
   ``n_high`` (``shape="hard"``) or any function you give (``shape=callable``);
 * what a gamma below the range is: ``below="ignore"`` (it keeps the label 1 but its weight is w: the model is free to do what it wants) or
   ``below="negative"`` (it counts as a negative with the weight 1 - w, so the model is pushed to reject it);
-* the zone of the METRICS: the gammas with ``n_pe >= n_cut`` (default: the middle of the ramp). A hard cut, only used to count.
+* the zone of the METRICS: the gammas with ``n_pe >= n_cut`` (default: the middle of the ramp). A hard LOWER bound, only used to count; ``n_max`` (default none) adds an upper bound, which a window such as 50-200 needs (``n_cut=50, n_max=200``) so that the metrics count what the loss fires on.
 
-The NSB is never touched: label 0, weight 1, so the noise rate stays under control.
+The NSB is never touched: label 0, weight 1, so the noise rate stays under control. "Gamma" here is every event of label 1 (the ``positive_types`` of the dataset too) and "NSB" every event of label 0 (extra negative types such as protons too, which keep their ``negative_weights``).
 
 A sample is described by four numbers, the "channels" (last axis, size 4): ``[label, positive weight, negative weight, in zone]``.
 ``TriggerDataset(npe_weighting=...)`` adds them to the features as ``features["npe_channels"]``. A loss or a metric reads them:
@@ -43,9 +43,12 @@ class NpeWeighting:
         What a gamma that is not (fully) in the range is: ignored, or a negative with the weight ``1 - w``.
     n_cut : float or None
         Lower bound of the metric zone (hard). ``None``: the middle of the ramp ``(n_low + n_high) / 2`` (the step for ``"hard"``).
+    n_max : float or None
+        Upper bound of the metric zone (hard, inclusive). ``None``: none. A weight window such as 50-200 (a callable ``shape``) needs ``n_cut=50, n_max=200`` for the metrics to count the
+        events the loss was asked to fire on: without ``n_max`` a gamma above 200 p.e. has weight 0 in the loss but is counted by the metrics.
     """
 
-    def __init__(self, n_low=30.0, n_high=50.0, shape="ramp", below="ignore", n_cut=None):
+    def __init__(self, n_low=30.0, n_high=50.0, shape="ramp", below="ignore", n_cut=None, n_max=None):
         if not callable(shape) and shape not in _SHAPES:
             raise ValueError(f"shape must be one of {_SHAPES} or a callable, got {shape!r}")
         if below not in _BELOW:
@@ -57,21 +60,25 @@ class NpeWeighting:
         if n_cut is None:
             n_cut = self.n_high if shape == "hard" else 0.5 * (self.n_low + self.n_high)
         self.n_cut = float(n_cut)
+        self.n_max = None if n_max is None else float(n_max)
+        if self.n_max is not None and not self.n_max >= self.n_cut:
+            raise ValueError(f"n_max must be >= n_cut, got n_cut={self.n_cut}, n_max={self.n_max}")
 
     def __repr__(self):
         shape = self.shape if not callable(self.shape) else getattr(self.shape, "__name__", "callable")
-        return (f"NpeWeighting(n_low={self.n_low}, n_high={self.n_high}, shape={shape!r}, below={self.below!r}, n_cut={self.n_cut})")
+        return (f"NpeWeighting(n_low={self.n_low}, n_high={self.n_high}, shape={shape!r}, below={self.below!r}, n_cut={self.n_cut}, n_max={self.n_max})")
 
     def get_config(self):
         """Plain-data description (a callable shape is not serialisable: it is stored by name only)."""
         shape = self.shape if not callable(self.shape) else getattr(self.shape, "__name__", "callable")
-        return dict(n_low=self.n_low, n_high=self.n_high, shape=shape, below=self.below, n_cut=self.n_cut)
+        return dict(n_low=self.n_low, n_high=self.n_high, shape=shape, below=self.below, n_cut=self.n_cut, n_max=self.n_max)
 
     def weight(self, n_pe):
         """w(n_pe) in [0, 1] (float32 tensor, same shape as ``n_pe``)."""
         n_pe = tf.cast(n_pe, tf.float32)
         if callable(self.shape):
-            return tf.clip_by_value(tf.cast(self.shape(n_pe), tf.float32), 0.0, 1.0)
+            w = tf.cast(self.shape(n_pe), tf.float32)
+            return tf.clip_by_value(tf.where(tf.math.is_nan(w), 0.0, w), 0.0, 1.0)             # a NaN weight of the callable is no weight, not a NaN loss
         if self.shape == "hard":
             return tf.cast(n_pe >= self.n_high, tf.float32)
         return tf.clip_by_value((n_pe - self.n_low) / (self.n_high - self.n_low), 0.0, 1.0)
@@ -88,6 +95,8 @@ class NpeWeighting:
         below = (1.0 - w) if self.below == "negative" else 0.0
         neg = tf.where(gamma > 0.5, tf.where(tf.math.is_nan(tf.cast(n_pe, tf.float32)), 0.0, below), 1.0)          # an unknown n_pe is no negative either
         in_zone = gamma * tf.cast(tf.cast(n_pe, tf.float32) >= self.n_cut, tf.float32)
+        if self.n_max is not None:
+            in_zone *= tf.cast(tf.cast(n_pe, tf.float32) <= self.n_max, tf.float32)
         return tf.stack([gamma, pos, neg, in_zone], axis=-1)
 
 

@@ -1,6 +1,7 @@
 """Sphinx configuration of the ll-ml-triggerkit documentation.
 
-Build:  pip install -r docs/requirements.txt && sphinx-build -b html docs docs/_build/html
+Build:  pip install -r docs/requirements.txt numpy h5py scipy matplotlib astropy hdf5plugin && PYTHONPATH=src sphinx-build -b html docs docs/_build/html
+(the API pages import triggerkit: without PYTHONPATH=src or the package installed, "No module named 'triggerkit'")
 """
 project = "ll-ml-triggerkit"
 author = "Tanguy Dietrich"

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import os
 import json
+import warnings
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
@@ -50,6 +51,8 @@ from triggerkit.Statistics.folds import read_folds_group, auc_standard_error, fo
 #: name of the score column of a fold view (the "metric" the plots ask for to get the pre-threshold scores)
 PRE_THRESHOLD_SCORE_DATASET = "score"
 from triggerkit.Statistics.metrics import (  # noqa: F401  (wilson is re-exported: callers import it from here)
+    count_fired,
+    fires,
     normalize_comparison,
     pick_threshold_from_scores,
     roc_auc_mann_whitney,
@@ -72,16 +75,15 @@ ConfigType = List[Tuple[str, Dict[str, Any]]]
 _FOLD_UNSET = object()
 
 
-# Default effective-area generation setup for the current SST-1M production:
+# Effective-area generation setup of the current SST-1M production (the defaults below are the energy range, the slope and the area; the number thrown is NOT a default any more: it is
+# read from /sources (StatsFile.simulated) or given with effective_area_expected_N):
 #   NSHOW = 3000
 #   CSCAT reuse count = 20
-#   total thrown = 60000
 #   ESLOPE = -2.0  -> dN/dE ~ E^-2
 #   ERANGE = 200 GeV -> 800000 GeV
 #   A_GEN = 2705489.3277890724 m^2
 EA_DEFAULT_EMIN_TEV = 0.2
 EA_DEFAULT_EMAX_TEV = 800.0
-EA_DEFAULT_TOTAL_THROWN = 60_000
 EA_DEFAULT_SLOPE = 2.0
 EA_DEFAULT_A_GEN_M2 = 2_705_489.3277890724
 
@@ -187,7 +189,10 @@ def compute_ratio_with_errors(model_base, model):
 
     # --- compute ratio + propagated errors ---
     for i in range(len(eff1)):
-        if eff2[i] > 0 and eff1[i] > 0:
+        if eff1[i] > 0 and eff2[i] == 0:
+            # a measured zero of the compared model is a ratio of 0, not a missing point; its upper error is the one of eff2 alone
+            ratio[i], err_low[i], err_high[i] = 0.0, 0.0, err2_high[i] / eff1[i]
+        elif eff2[i] > 0 and eff1[i] > 0:
             r = eff2[i] / eff1[i]
 
             # relative errors
@@ -267,7 +272,7 @@ class StatPlotter:
                         path = os.path.join(folder, fn)
                         try:
                             self.all_results.append((fn, self._load_h5_meta(path)))
-                        except (OSError, BlockingIOError, RuntimeError, ValueError) as exc:
+                        except (OSError, BlockingIOError, RuntimeError, ValueError, KeyError) as exc:      # KeyError: a file without a column the plots need (n_pe)
                             # Skip files that are unreadable (e.g. being written by a
                             # concurrent job, truncated, or corrupt) instead of failing
                             # the whole session.
@@ -523,10 +528,8 @@ class StatPlotter:
         threshold: float,
         comparison: Optional[str] = "gt",
     ) -> np.ndarray:
-        scores = np.asarray(scores, dtype=np.float32)
-        if cls._normalize_threshold_comparison(comparison) == "ge":
-            return scores >= float(threshold)
-        return scores > float(threshold)
+        # a NaN or gated-out event never fires, whatever the threshold (-inf too): the rule of StatsFile and of the threshold candidates
+        return fires(np.asarray(scores, dtype=np.float32), float(threshold), cls._normalize_threshold_comparison(comparison))
 
     def _warn_once(self, key: str, message: str) -> None:
         if key in self._warned_messages:
@@ -834,19 +837,23 @@ class StatPlotter:
         kind: str,
         drop_gated_out: bool = False,
     ) -> np.ndarray:
-        """The finite values of ``metric`` (an event column, or ``"score"``) for one event type of the selected fold.
+        """The values of ``metric`` (an event column, or ``"score"``) for one event type of the selected fold.
 
-        The events an upstream trigger did not fire on (aligned statistics) carry the lowest score, ``GATED_OUT_SCORE``: they are part of
-        every rate, threshold and AUC, so they are kept; ``drop_gated_out=True`` leaves them out, for a histogram of the scores that
-        would otherwise be one huge bin at the left.
+        An event column keeps its finite values. The scores are ALL kept, as ``StatsFile`` and the thresholds of ``metrics`` count them: a NaN score never
+        fires and stays in the denominator of a rate, +inf always fires, and the events an upstream trigger did not fire on (aligned statistics) carry
+        ``GATED_OUT_SCORE``, never fire and are part of every rate and threshold. Count them with :func:`~triggerkit.Statistics.metrics.fires` /
+        :func:`~triggerkit.Statistics.metrics.count_fired`, never with a plain comparison or a search in the sorted scores (a NaN sorts last, above
+        every threshold). ``drop_gated_out=True`` keeps only the finite scores above ``GATED_OUT_SCORE``, for a histogram of the scores (they would
+        otherwise be one huge bin at the left).
         """
         view = self._view(result, kind, None if metric == "score" else [metric])
         if metric not in view:
             raise KeyError(f"Metric '{metric}' not found in {result['_path']} (has {sorted(view)}).")
         x = np.asarray(view[metric]).reshape(-1)
-        keep = np.isfinite(x)      # NaN and +-inf events are left out here (for a plot), whereas the thresholds of ``metrics`` keep a NaN in the denominator (it never fires): a fold with NaN scores gives a slightly different rate here
-        if drop_gated_out and metric == PRE_THRESHOLD_SCORE_DATASET:
-            keep &= x > GATED_OUT_SCORE
+        if metric == PRE_THRESHOLD_SCORE_DATASET:
+            keep = (np.isfinite(x) & (x > GATED_OUT_SCORE)) if drop_gated_out else np.ones(x.shape, dtype=bool)
+        else:
+            keep = np.isfinite(x)
         return x[keep].astype(np.float32, copy=False)
 
     @classmethod
@@ -1137,9 +1144,9 @@ class StatPlotter:
         err_low = np.asarray(err_low, dtype=np.float64)
         err_high = np.asarray(err_high, dtype=np.float64)
 
-        efficiency = np.nan_to_num(efficiency, nan=0.0, posinf=0.0, neginf=0.0)
-        err_low = np.clip(np.nan_to_num(err_low, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
-        err_high = np.clip(np.nan_to_num(err_high, nan=0.0, posinf=0.0, neginf=0.0), 0.0, None)
+        # a bin with no event has no efficiency: NaN (not drawn), not a measured 0 +- 0 (the rule of StatsFile.efficiency)
+        err_low = np.clip(err_low, 0.0, None)
+        err_high = np.clip(err_high, 0.0, None)
         eff_err = np.vstack([err_low, err_high])
         return efficiency, eff_err
 
@@ -2782,10 +2789,16 @@ class StatPlotter:
         """What an efficiency of ``particle`` is divided by: the showers SIMULATED in the selected fold (all folds if none), and whether it is that."""
         sf = self._stats(result["_path"])
         folds = [self._fold_filter] if self._fold_filter is not None else list(sf.fold_names)
+        folds = [f for f in folds if sf.read_counts(f).get(particle, 0) > 0]      # a fold that read none of them adds no shower to the total
         try:
             return float(sum(sf.simulated(f, particle) for f in folds)), True
         except KeyError:
             return float(n_read), False          # no total in the file: the events it holds
+
+    def _gamma_simulated_total(self, result: Dict[str, Any]) -> Optional[float]:
+        """The gamma showers simulated for the events of ``result`` (selected fold, all folds if none), ``None`` if the file does not say (0.0 if no selected fold read any gamma)."""
+        total, from_file = self._particle_total(result, "gamma", 0)
+        return total if from_file else None
 
     def _particle_efficiency_at(self, result: Dict[str, Any], particle: str, thresholds: np.ndarray):
         """Triggered / simulated showers of ``particle`` at each threshold (None if the fold has none of them)."""
@@ -2793,9 +2806,7 @@ class StatPlotter:
         if scores.size == 0:
             return None
         total, _ = self._particle_total(result, particle, scores.size)
-        scores = np.sort(scores)
-        side = "left" if result.get("threshold_comparison", "gt") == "ge" else "right"
-        return (scores.size - np.searchsorted(scores, np.asarray(thresholds, dtype=np.float32), side=side)) / max(total, 1.0)
+        return count_fired(scores, thresholds, result.get("threshold_comparison", "gt")) / max(total, 1.0)
 
     def _render_particle_efficiency_vs_rate(self, plot_items, target_rate_hz, full_path, show) -> bool:
         """Efficiency of every event type against the NSB rate, all on ONE axes: the colour is the trigger, the line style the particle."""
@@ -2820,8 +2831,9 @@ class StatPlotter:
                     if eff is None:
                         continue
                     ax.plot(rates[keep], eff[keep], linestyle=linestyle, color=color, lw=1.6)
-                    if tau is not None:
-                        rate_tau = float(np.interp(tau, thresholds, rates))
+                    finite = np.isfinite(thresholds) & (np.abs(thresholds) < np.finfo(np.float32).max)      # a +inf score gives a +inf threshold (or its float32 neighbour of the include-ties candidate), which np.interp turns into NaN
+                    if tau is not None and np.isfinite(tau) and finite.any():
+                        rate_tau = float(np.interp(tau, thresholds[finite], rates[finite]))
                         ax.plot([rate_tau], [self._particle_efficiency_at(result, particle, np.array([tau]))[0]], "o", color=color, ms=5)
                     if particle not in particles_seen:
                         particles_seen.append(particle)
@@ -3383,21 +3395,25 @@ class StatPlotter:
             if effective_area_expected_N is not None:
                 ea_common_kwargs["expected_N"] = effective_area_expected_N
 
-            add_combined_plot(
-                "Effective Area Counts",
-                "effective_area_counts.png",
-                "effective_area_counts",
-                location="upper left",
-                **ea_common_kwargs,
-            )
-            add_combined_plot(
-                "Effective Area",
-                "effective_area.png",
-                "effective_area",
-                location="upper left",
-                A_gen_m2=effective_area_a_gen_m2,
-                **ea_common_kwargs,
-            )
+            if effective_area_expected_N is None and self._gamma_simulated_total(self.base_config_result) is None:
+                skipped_configs.append("Effective Area: not drawn (the stats file does not say how many gamma showers were simulated: "
+                                       "give effective_area_expected_N)")
+            else:
+                add_combined_plot(
+                    "Effective Area Counts",
+                    "effective_area_counts.png",
+                    "effective_area_counts",
+                    location="upper left",
+                    **ea_common_kwargs,
+                )
+                add_combined_plot(
+                    "Effective Area",
+                    "effective_area.png",
+                    "effective_area",
+                    location="upper left",
+                    A_gen_m2=effective_area_a_gen_m2,
+                    **ea_common_kwargs,
+                )
             add_combined_plot(
                 "Absolute Efficiency vs Npe",
                 "absolute_efficiency_npe.png",
@@ -5046,15 +5062,16 @@ class StatPlotter:
             thresholds = thresholds[idx]
             rates_hz = rates_hz[idx]
 
-        total = int(gamma_scores.size)
-        efficiency = np.full(thresholds.shape, np.nan, dtype=np.float64)
-        if total > 0:
-            gamma_scores = np.sort(gamma_scores.astype(np.float32, copy=False))
-            # score > tau  -> count strictly above ("right"); score >= tau -> "left"
-            side = "left" if result.get("threshold_comparison", "gt") == "ge" else "right"
-            passed = total - np.searchsorted(gamma_scores, thresholds, side=side)
-            efficiency = passed.astype(np.float64) / float(total)
+        comparison = result.get("threshold_comparison", "gt")
 
+        def efficiency_of(scores):
+            # triggered / events, at each threshold; a NaN or gated-out gamma never fires and stays in the denominator
+            if scores.size == 0:
+                return np.full(thresholds.shape, np.nan, dtype=np.float64)
+            return count_fired(scores, thresholds, comparison).astype(np.float64) / float(scores.size)
+
+        total = int(gamma_scores.size)
+        efficiency = efficiency_of(gamma_scores)
         curves: List[Dict[str, Any]] = [{
             "bin_range": None,
             "bin_label": "All gamma events",
@@ -5062,9 +5079,30 @@ class StatPlotter:
             "efficiency": efficiency,
         }]
 
+        # one more curve per bin of ``metric`` (the gammas whose metric is in [lo, hi), the last bin closed); the curve of all the gammas does not
+        # need the metric: a file without that column, or fewer than two bin edges, gives it alone (with a warning)
+        try:
+            edges = self._get_efficiency_vs_rate_metric_bins(result, metric, metric_bins)
+            view = self._view(result, "gamma", [metric])
+            if metric not in view:
+                raise KeyError(f"metric {metric!r} not found in {result['_path']} (has {sorted(view)})")
+        except (KeyError, ValueError) as exc:
+            self._warn_once(f"eff-rate-bins-{metric}", f"Efficiency vs trigger rate: no curve per {metric} bin ({exc}), only the curve of all the gammas.")
+            edges, view = np.empty((0,), dtype=np.float64), None
+        values = np.asarray(view[metric], dtype=np.float64).reshape(-1) if view is not None else np.empty((0,))
+        scores = np.asarray(view[PRE_THRESHOLD_SCORE_DATASET], dtype=np.float32).reshape(-1) if view is not None else np.empty((0,), np.float32)
+        for i, (lo, hi) in enumerate(zip(edges[:-1], edges[1:])):
+            in_bin = (values >= lo) & ((values <= hi) if i == len(edges) - 2 else (values < hi))
+            curves.append({
+                "bin_range": (float(lo), float(hi)),
+                "bin_label": self._format_efficiency_vs_rate_bin_label(metric, float(lo), float(hi)),
+                "total": int(in_bin.sum()),
+                "efficiency": efficiency_of(scores[in_bin]),
+            })
+
         return {
             "metric": metric,
-            "bin_edges": None,
+            "bin_edges": edges,
             "thresholds": thresholds,
             "rates_hz": rates_hz,
             "curves": curves,
@@ -5420,6 +5458,8 @@ class StatPlotter:
             thresholds = thresholds[idx]
             rates_hz = rates_hz[idx]
 
+        finite = np.isfinite(thresholds) & (np.abs(thresholds) < np.finfo(np.float32).max)        # a +inf NSB score (a diverged model) gives a +inf threshold, or its float32 neighbour: it would make every point 0
+        thresholds, rates_hz = thresholds[finite], rates_hz[finite]
         max_threshold = float(np.max(thresholds)) if thresholds.size else 0.0
         if not np.isfinite(max_threshold) or max_threshold <= 0.0:
             print(f"Config {to_compare_config}: max threshold is {max_threshold}, cannot normalize.")
@@ -5806,20 +5846,33 @@ class StatPlotter:
         use_base_thrown: bool,
         use_theoretical_thrown: bool,
     ) -> np.ndarray:
+        # computed for the curve being drawn: its own file and the fold selected for it (a report selects a fold per curve after the plot was
+        # initialised), so that N_trig and N_thrown always count the same fold(s)
+        if not hasattr(self, "_ea_bins"):
+            raise RuntimeError("Internal error: no effective-area binning. Call initPlotEffectiveArea first.")
         if use_theoretical_thrown:
-            thrown = getattr(self, "_ea_expected_thrown_hist", None)
-            if thrown is None:
-                raise RuntimeError("Internal error: missing cached expected thrown histogram. Re-run initPlotEffectiveArea.")
-            return np.asarray(thrown, dtype=np.float64)
+            return self._powerlaw_expected_counts(self._ea_bins, N=self._ea_thrown_total(result), slope=self._ea_slope)
 
-        if use_base_thrown:
-            thrown = getattr(self, "_ea_base_all_hist", None)
-            if thrown is None:
-                raise RuntimeError("Internal error: missing cached base thrown histogram. Re-run initPlotEffectiveArea.")
-            return np.asarray(thrown, dtype=np.float64)
-
-        thrown, _ = self._histogram_stream(result, "energy", kind="gamma", bins=self._ea_bins)
+        source = self.base_config_result if use_base_thrown else result
+        thrown, _ = self._histogram_stream(source, "energy", kind="gamma", bins=self._ea_bins)
         return thrown.astype(np.float64)
+
+    def _ea_thrown_total(self, result: Dict[str, Any]) -> int:
+        """The gamma showers thrown for the events of ``result`` in the selected fold(s): the ``expected_N`` given to the plot, else the file's."""
+        n_simulated = self._gamma_simulated_total(result)
+        given = getattr(self, "_ea_expected_N", None)
+        if given is None:
+            if n_simulated is None:
+                raise ValueError(
+                    "Effective area: the stats file says nothing about the gamma showers simulated (no gamma row in /sources): give their number "
+                    "(effective_area_expected_N / expected_N)")
+            return int(round(n_simulated))
+        if n_simulated is not None and abs(n_simulated - int(given)) > 0.05 * int(given):
+            self._warn_once(
+                "ea-expected-n",
+                f"Effective area: normalising with expected_N={int(given)} thrown showers, but the stats file says {int(n_simulated)} gamma "
+                "showers were simulated for the events it holds: Aeff is scaled by their ratio.")
+        return int(given)
 
     def _prepare_effective_area_state(
         self,
@@ -5830,9 +5883,13 @@ class StatPlotter:
         use_base_thrown: bool = True,
         use_theoretical_thrown: bool = True,
         plot_errors: bool = True,
-        expected_N: int = EA_DEFAULT_TOTAL_THROWN,
+        expected_N: Optional[int] = None,
         expected_slope: float = EA_DEFAULT_SLOPE,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        if (float(emin_tev), float(emax_tev), float(expected_slope), float(A_gen_m2)) != (EA_DEFAULT_EMIN_TEV, EA_DEFAULT_EMAX_TEV, EA_DEFAULT_SLOPE, EA_DEFAULT_A_GEN_M2):
+            warnings.warn(f"effective area: emin={emin_tev} TeV, emax={emax_tev} TeV, slope={expected_slope}, A_gen={A_gen_m2} m2 are not the generation setup of the current production "
+                          f"({EA_DEFAULT_EMIN_TEV}-{EA_DEFAULT_EMAX_TEV} TeV, E^-{EA_DEFAULT_SLOPE}, {EA_DEFAULT_A_GEN_M2:.6g} m2): the showers thrown are spread over [emin, emax] and A_gen multiplies the "
+                          "efficiency, so the area is only right if these ARE the generation range, slope and area of your simulation", RuntimeWarning, stacklevel=2)
         # nbins bins -> nbins+1 edges; points are drawn at the geometric bin centre
         self._ea_bins = np.logspace(np.log10(emin_tev), np.log10(emax_tev), nbins + 1)
         self._ea_A_gen_m2 = float(A_gen_m2)
@@ -5843,26 +5900,13 @@ class StatPlotter:
         bins = self._ea_bins
         x_values = np.sqrt(bins[:-1] * bins[1:])
 
-        if use_theoretical_thrown:
-            # Aeff = A_gen * N_trig / N_thrown(theory): N_trig comes from the
-            # events in the stats file, N_thrown from `expected_N`. If the file
-            # is a sub-sample (max_gamma_events, fold budgets, one telescope...)
-            # the two no longer describe the same events and Aeff is off by a
-            # constant factor -- say so instead of plotting it silently.
-            n_file = self.base_config_result.get("num_events_gamma", 0)
-            if n_file and abs(n_file - int(expected_N)) > 0.05 * int(expected_N):
-                self._warn_once(
-                    "ea-expected-n",
-                    f"Effective area: normalising with expected_N={int(expected_N)} thrown "
-                    f"events, but the base stats file holds {n_file} gamma events. If the "
-                    "file is a sub-sample of the simulation, Aeff is scaled wrongly -- pass "
-                    "the real generated count (effective_area_expected_N / expected_N).")
-
-        expected_thrown = self._powerlaw_expected_counts(
-            bins,
-            N=int(expected_N),
-            slope=float(expected_slope),
-        )
+        # Aeff = A_gen * N_trig / N_thrown(theory): N_trig comes from the events in the stats file, N_thrown from the showers SIMULATED for the gammas
+        # the selected fold(s) read (``/sources``, scaled by the fold budgets, see StatsFile.simulated), spread as E^-slope over [emin, emax], which
+        # must therefore be the generation range of the simulation. ``expected_N`` given by hand replaces the file's count (a warning if they differ).
+        # Each curve takes its N_thrown from its own file and fold (_effective_area_denominator_hist); this one is the base's, in the fold selected now.
+        self._ea_expected_N = None if expected_N is None else int(expected_N)
+        self._ea_slope = float(expected_slope)
+        expected_thrown = self._powerlaw_expected_counts(bins, N=self._ea_thrown_total(self.base_config_result), slope=self._ea_slope)
         base_strategy = self._resolve_trigger_strategy(
             self.base_config_result,
             target_rate_hz=self.target_rate_hz,
@@ -5878,8 +5922,6 @@ class StatPlotter:
         base_all = base_all.astype(np.float64)
         base_trig = base_trig.astype(np.float64)
 
-        self._ea_expected_thrown_hist = expected_thrown
-        self._ea_base_all_hist = base_all
         return x_values, expected_thrown, base_all, base_trig
 
     def initPlotEffectiveAreaCounts(
@@ -5889,7 +5931,7 @@ class StatPlotter:
         emax_tev: float = EA_DEFAULT_EMAX_TEV,
         nbins: int = 25,
         show_expected_powerlaw: bool = True,
-        expected_N: int = EA_DEFAULT_TOTAL_THROWN,
+        expected_N: Optional[int] = None,
         expected_slope: float = EA_DEFAULT_SLOPE,
         x_range=None,
         y_range_counts=None,
@@ -5939,7 +5981,7 @@ class StatPlotter:
         use_base_thrown: bool = True,
         use_theoretical_thrown: bool = True,
         plot_errors: bool = True,
-        expected_N: int = EA_DEFAULT_TOTAL_THROWN,
+        expected_N: Optional[int] = None,
         expected_slope: float = EA_DEFAULT_SLOPE,
         x_range=None,
         y_range_aeff=None,

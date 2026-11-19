@@ -9,14 +9,18 @@ Which events are learned from
 ``TriggerDataset`` reads gammas (label 1) and NSB (label 0). Protons and muons are optional:
 
 ``train_on=("gamma", "nsb", "proton", "muon")``
-   the sources the training reads. Protons and muons are extra **negatives**: the binary label stays gamma = 1 against everything else = 0, and each batch carries
-   ``features["particle"]`` (the type code: 0 NSB, 1 gamma, 2 proton, 3 muon) and ``features["particle_weight"]``.
+   the sources the training reads. Protons and muons are extra **negatives** (unless ``positive_types`` says otherwise): the binary label stays gamma = 1 against everything else = 0, and each batch carries
+   ``features["particle"]`` (the type code: 0 NSB, 1 gamma, 2 proton, 3 muon) and ``features["particle_weight"]`` (the latter only when an extra type is trained).
 ``negative_weights={"proton": 0.3, "muon": 0.0}``
    the weight of an extra type as a negative (default 1). With ``npe_weighting`` it multiplies their negative weight in ``features["npe_channels"]``; without
    it, use ``features["particle_weight"]`` as the sample weight. 0 reads the type without learning from it.
+``positive_types=("muon",)``
+   extra types of ``train_on`` that are **positives** (label 1, like the gammas): the trigger is trained to fire on them. They are weighted by ``npe_weighting`` like a gamma, are
+   never down-weighted, and have no ``negative_weights``. ``features["particle"]`` still tells the types apart.
 ``watch=["proton", "muon"]``, ``watch_max=N``
    sources that are **evaluated, not learned from**. ``dataset.watch_datasets()`` gives one ``tf.data`` per entry, read like the validation gammas (no shuffle,
-   no NSB). ``watch_max`` caps the events read per source: a statistic that divides by the simulated total must scale it by the same fraction.
+   no NSB). ``watch_max`` caps the events read per source: a statistic that divides by the simulated total must scale it by the same fraction. A type the
+   training also reads (``"gamma"``, or a type of ``train_on``) is watched on its validation files only.
 
 The :class:`~triggerkit.training.ParticleRates` callback prints, every epoch, what the model does with each type at the cut that keeps a given fraction of the NSB::
 
@@ -30,9 +34,11 @@ and logs ``val_<type>_at_nsb``.
 Weighting the gammas by their photoelectrons
 --------------------------------------------
 
-See :class:`~triggerkit.training.NpeWeighting` and :doc:`dataset`. The dataset adds ``features["npe_channels"]``, ``(B, 4)`` = ``[label, positive weight,
-negative weight, in zone]``. Use :func:`~triggerkit.training.bce_target_and_weight` to turn them into the soft target and sample weight of a binary
-cross-entropy, :func:`~triggerkit.training.zone_labels` for the metrics (the gammas of the zone against the NSB).
+Here "gamma" means every event of label 1 (the ``positive_types`` too) and "NSB" every event of label 0 (protons too); the NSB side is never weighted by n_pe, protons keep ``negative_weights``. The zone of the metrics has a lower bound (``n_cut``) and an optional upper one (``n_max``): a weight window such as 50-200 needs ``n_cut=50, n_max=200`` so that the metrics count what the loss fires on.
+
+See :class:`~triggerkit.training.npe_weighting.NpeWeighting` and :doc:`dataset`. The dataset adds ``features["npe_channels"]``, ``(B, 4)`` = ``[label, positive weight,
+negative weight, in zone]``. Use :func:`~triggerkit.training.npe_weighting.bce_target_and_weight` to turn them into the soft target and sample weight of a binary
+cross-entropy, :func:`~triggerkit.training.npe_weighting.zone_labels` for the metrics (the gammas of the zone against the NSB).
 
 Maps of the true signal
 -----------------------

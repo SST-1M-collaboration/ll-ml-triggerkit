@@ -13,12 +13,12 @@ poetry install                    # core + tests (the exact locked versions)
 poetry install -E qat             # + keras-hexagdly, HGQ2 and hls4ml (fully quantized models and their export)
 poetry install -E hexcnn          # + hex CNN bodies only (keras-hexagdly)
 poetry install -E viewer          # + pyqtgraph, PyQt5: the simtel viewer (`triggerkit-viewer`)
-poetry install -E real            # + protozfits: real SST-1M files (*.fits.fz), the real-data converter and `triggerkit-merge`
+poetry install -E real            # + protozfits: real SST-1M files (*.fits.fz), the real-data converter, `triggerkit-merge` and `triggerkit-night-report`
 ```
 
 `pip` works too (it ignores the lock, so the versions may differ): `pip install -e .`, `pip install -e '.[qat]'`.
-The commands `triggerkit-convert`, `triggerkit-merge` and `triggerkit-viewer` are created when the package is installed: after an update that adds one,
-install again (`pip install -e .`), or run the module (`python -m triggerkit.tools.convert`, `python -m triggerkit.tools.merge`, `python -m triggerkit.viewer`).
+The commands `triggerkit-convert`, `triggerkit-merge`, `triggerkit-viewer` and `triggerkit-night-report` are created when the package is installed: after an update that adds one,
+install again (`pip install -e .`), or run the module (`python -m triggerkit.tools.convert`, `python -m triggerkit.tools.merge`, `python -m triggerkit.viewer`, `python -m triggerkit.realdata.report`).
 On a GPU machine, add the CUDA libraries of TensorFlow: `pip install "tensorflow[and-cuda]==2.20.0"` inside the environment.
 
 ```python
@@ -105,6 +105,8 @@ to 1785, gamma can be negative). The table keeps the name `r0` (no `r0alpha`): t
 | `--stack-stages` (or `--stack_stages`) | both | write `r0` (and `r1` for a simulation) as `np.stack([alpha, beta, gamma])`, shape `(3, 432, T)`, int16, for a reader that expects `np.stack` (the table keeps the name `r0`, needs `--waveform r0alpha`, and is not read by this package's loader) |
 | `--photoelectron-times` | simulation | also write the number of shower photoelectrons and their mean arrival per patch (table `pe_arrival`) |
 | `--true-signal` | simulation | also write the noise-free signal: `true_signal_r0` (per pixel), `true_signal_r0_alpha`, `true_signal_fadc` and `pe_count` (per patch) per sample (table `true_signal`) |
+| `--to-process-list LIST` + `--output-dir DIR` | both | instead of `--to-process-file` / `--output-hdf5-file`: a text file with one file per line (`#` for comments), one `DIR/<name>.hdf5` per input; a file already converted is skipped (an output that is not a usable HDF5 file is converted again), a failure is reported and the others go on (exit code 1) |
+| `--rotations 0 120 240` | simulation | write every event in these orientations (default 0): the arrays AND the truth (`true_az`, `true_alt`, `true_core_x`, `true_core_y`) are turned about the optical axis, as rows of the same tables (ids + 1e9 / + 2e9, table `simulation/event/subarray/rotation`); for training, not for an efficiency |
 | `--pedestal-only` | real | convert only the pedestal events (event_type bit 0x8: random triggers, real NSB), skip the others: the real noise of `RealNoise` without the rest of the night (about 70 MB instead of 940 MB with `--waveform r0`) |
 | `--no-emulated` | real | do not write our FADC computed from the raw pixels (halves the file) |
 
@@ -164,14 +166,17 @@ triggerkit-merge --simtel gamma_200000.simtel.gz --real SST1M2_20261026_0012.fit
 
 | Option | Default | What it does |
 |---|---|---|
-| `--simtel FILE...` | required | the simulated gammas, one or several simtel files; see `--signal` for what they must be |
-| `--real FILE...` | required | the real data files (`*.fits.fz`) that provide the noise |
+| `--simtel FILE...` | required (or `--simtel-list`) | the simulated gammas, one or several simtel files; see `--signal` for what they must be |
+| `--real FILE...` | required (or `--real-list`) | the real data files (`*.fits.fz`, or already converted `*.hdf5`, see `--seed`) that provide the noise |
+| `--simtel-list LIST`, `--real-list LIST` | off | the files as a text file (one path per line, `#` for comments), instead of or after `--simtel` / `--real` |
+| `--rotations 0 120 240` | `0` | write each gamma in these orientations: the signal and its truth (azimuth, altitude, core, true image) are turned, the real noise is not and every copy gets its own pedestal event; the merge table has a `rotation` column; for training, not for an efficiency; also the true-signal tables and the kept simulated alpha; needs the pointing and the telescope position of the simtel header; `--max-events` counts the copies; an efficiency read on the file would be too high by the number of orientations |
 | `--output-hdf5-file FILE.hdf5` | required | the file to write (overwritten); written as `FILE.hdf5.partial` and renamed at the end |
-| `--max-events N` | all | stop after N merged events |
+| `--loop-gammas` | off | when the gammas run out before the pedestal events, start again from the first gamma on new pedestal events until the pedestals run out or `--max-events` is reached (required with `--seed`) |
+| `--max-events N` | all | stop after N merged events (each orientation of a gamma counts) |
 | `--signal true-signal\|r0` | `true-signal` | where the signal of a gamma comes from: `true-signal` = ordinary simtel files (with their noise), the noise-free signal rebuilt from the photoelectrons, only for events with a p.e. list (>= 9 p.e.); `r0` = simtel files simulated WITHOUT noise, their raw ADC (minus the pedestal stored in the file, 0 for `FADC_PEDESTAL 0`) is the signal; a file that does not look noise-free gets a warning |
 | `--tel ID` | 1 | telescope number in the simtel files |
 | `--also-noise-alone` | off | also write, for each event, the alpha of the same real event WITHOUT the gamma, for paired comparisons (`merge/event/noise_alpha`) |
-| `--seed N` | off (in order) | pair each gamma with a pedestal event drawn AT RANDOM, reproducibly: the pool of pedestal events is shuffled with `N`, each used once before any is reused (no error when the gammas outnumber the pedestals); with FITS files the events are read ahead by 4 processes (about 18 ms per gamma instead of 40), no extra cost with real files converted by `triggerkit-convert --waveform r0 --no-emulated --pedestal-only` (`--real` takes both); `real_file` and `real_row` of the merge table say which event each gamma got |
+| `--seed N` | off (in order) | pair each merged event (each gamma, or each orientation of a gamma with `--rotations`) with a pedestal event drawn AT RANDOM, reproducibly: the pool of pedestal events is shuffled with `N`, each used once before any is reused (no error when the gammas outnumber the pedestals); with FITS files the events are read ahead by 4 processes (about 18 ms per gamma instead of 40), no extra cost with real files converted by `triggerkit-convert --waveform r0 --no-emulated --pedestal-only` (`--real` takes both); `real_file` and `real_row` of the merge table say which event each gamma got |
 | `--keep-simulated-alpha` | off | also write the `r0alpha` of the simulation AS SIMULATED (`merge/event/simulated_r0alpha`): unshifted, in its own window (the samples of the simtel file), the FADC of its raw `r0` with the pedestal stored in its file (the table `triggerkit-convert` writes); about 15 kB per event |
 | `--true-signal` | off | also write the gamma alone in the real window: `true_signal_r0_alpha`, `true_signal_fadc`, `pe_count` per patch and sample, the patch columns of `triggerkit-convert --true-signal` plus `has_pe_count` (with `--signal r0` there is no model: `pe_count` is zero and `has_pe_count` False) |
 | `--stages` | off | also write `alpha`, `beta`, `gamma` of the merged event in `r0_stages` (as `triggerkit-convert --stages`, before any threshold) |
@@ -202,13 +207,14 @@ triggerkit-merge --signal r0 --keep-simulated-alpha --seed 1234 --simtel gammas/
 Details, measurements and the content of the file: `docs/merge.rst`.
 
 **What the file contains**: `r0alpha` (the merged R0alpha, 432 patches x 50 samples, uint8; with `--stack-stages` the table is `r0`); `simulation/event/subarray/shower` (true energy, direction, core, first interaction, x_max, primary of the
-simulated gamma); `simulation/event/telescope/images` (the true image per patch); and `merge/event/telescope/tel_001`, one row per event: the simulated file and event id, the real event id, type, time
-and run, the shift in samples, the peak sample in the simulation, the model offset, `in_adc`, and `sim_pedestal` (the simulated pedestal that was subtracted: 0 for `true-signal`; for `r0` it is what
+simulated gamma; with `--rotations` its direction and core are turned); `simulation/event/telescope/images` (the true image per patch, turned with `--rotations`); and `merge/event/telescope/tel_001`, one row per event: the simulated file and event id, the real event id, type, time
+and run, `real_file` (index in `--real`) and `real_row`, the shift in samples, the peak sample in the simulation, the model offset, `in_adc`, `rotation` (degrees) and `sim_pedestal` (the simulated pedestal that was subtracted: 0 for `true-signal`; for `r0` it is what
 the simulated r0 holds, 0 if it has none). The settings and the file names are attributes of that table. No `r1` and no `dl1`. Measured on 100 gammas: 16 kB per event without option, +74 kB with `--stages`
 (90), 80 kB with `--stack-stages` instead, +2 kB for `--true-signal`, +14 kB for `--also-noise-alone`.
 
-Fixed choices, no option: the peak of each gamma lands on sample 25 of the real window, and the real events are the pedestal events of the real files, one per gamma (if the files have fewer,
-the command stops with an error and writes nothing: give more real files after `--real`).
+Fixed choices, no option: the peak of each gamma lands on sample 25 of the real window, and the real events are the pedestal events of the real files. Without `--seed` they are taken in order,
+one per merged event (per gamma and orientation with `--rotations`; if the files have fewer, the command stops with an error and writes nothing: give more real files after `--real`); with `--seed N` they are drawn at random and reused when the gammas
+outnumber them.
 
 **Several files.** `--simtel` and `--real` each take a list of files, and everything goes into one output file. The simulated gammas are taken one file after the other, and so are the pedestal
 events of the real files, each used once. One simulation file and several real files (the real files are read in the order given):
@@ -218,8 +224,8 @@ triggerkit-merge --simtel gamma_200000.simtel.gz --real SST1M2_20261026_0012.fit
 triggerkit-merge --simtel gamma_200000.simtel.gz --real SST1M2_20261026_00*.fits.fz --output-hdf5-file gamma_on_real.hdf5      # the shell expands the pattern
 ```
 
-The other way round, several simulation files and one real file. The real file must have a pedestal event per gamma (a file of 11 982 events has 871 of them, about 7 %), so stop the merge
-before they run out with `--max-events`, or the command stops with an error and writes nothing:
+The other way round, several simulation files and one real file. In order (no `--seed`) the real file must have a pedestal event per gamma (a file of 11 982 events has 871 of them, about 7 %), so stop the merge
+before they run out with `--max-events` (or give `--seed`, which reuses them), or the command stops with an error and writes nothing:
 
 ```bash
 triggerkit-merge --simtel gamma_a.simtel.gz gamma_b.simtel.gz --real SST1M2_20261026_0012.fits.fz --output-hdf5-file gamma_on_real.hdf5 --max-events 800
@@ -247,7 +253,7 @@ simulation, and that the gain of the simulated telescope is the one of the camer
 
 `triggerkit-merge` writes a file per (gammas, real files) pair. `triggerkit.data.RealNoise` does the same addition when the batches are read, so the gammas are never stored
 again for another real file: convert each real file once with `triggerkit-convert --waveform r0 --pedestal-only` (the raw pixels and their pedestal, 78 kB per event, of the pedestal events only: about 70 MB for a night; without `--pedestal-only` the whole night is written, 940 MB), the
-simulation once with `--true-signal`, and give the dataset `Simulation(gamma=..., nsb=RealNoise(real_files, signal="true-signal" | "r0", seed=..., max_shift=...))`. Each gamma
+simulation once with `--true-signal`, and give the dataset `Simulation(gamma=..., nsb=RealNoise(real_files, signal="true-signal" | "r0", seed=..., max_shift=...))`; pass `nsb_roll=False` to the dataset and use a window that fits the 50 real samples (`Full()`). Each gamma
 meets a noise event drawn from the pool with a generator seeded by `seed`, the gamma's file name and its event number (reproducible), its peak lands on sample 25 (plus an
 optional random shift). The NSB rows are the pedestal events themselves. The addition is made on the raw pixels, with the arithmetic of `triggerkit-merge` (`true_signal_r0` of the simulation, the pedestal of the real event): checked identical to `triggerkit.tools.merge.merge_pixels` for the same pairs on real data and on synthetic files (0 cell differs); about 0.37 ms per gamma (1.9 ms before the cache of `sst1m.patch_triplets`, measured on the GPU box). More in `docs/real_noise.rst`.
 
@@ -259,7 +265,7 @@ optional random shift). The NSB rows are the pedestal events themselves. The add
   - `data/ models/ training/` — dataset, pluggable bodies, training utilities (added incrementally).
   - `camera/` — the SST-1M camera tables (patches, patch7 clusters), the numpy FADC (`fadc.py`), the stages after it before any threshold (`trigger_numpy.py`: patch7 sums, TDSCAN
     scores), the true signal of a simulated event (`true_signal.py`, with its pulse and single-p.e. files in `camera/data/`) and the eventio blocks (`simtel_blocks.py`).
-  - `tools/` — `triggerkit-convert` (`convert.py`, `convert_simtel.py`, `convert_real.py`, `stages_table.py`) and `triggerkit-merge` (`merge.py`).
+  - `tools/` — `triggerkit-convert` (`convert.py`, `convert_simtel.py`, `convert_real.py`, `stages_table.py`, `side_tables.py`, `rotated_copies.py`, `file_lists.py`) and `triggerkit-merge` (`merge.py`).
   - `viewer/` — the simtel viewer (`triggerkit-viewer`).
   - Per-board trigger (B1X/B2X/B3X): `models/boards.py` (`CameraBoardSplitter`), the `ScatterToBoards` / `UnfoldBoards` / `BoardMax` layers and `TriggerDataset(split="board")`; see `examples/train_hexcnn_boards.py`.
 - `examples/` — train / evaluate / show scripts.

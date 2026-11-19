@@ -1,22 +1,35 @@
 """Synthetic gammas on REAL noise: ``triggerkit-merge`` adds the signal of simulated gammas to the pixels of real events and writes the result as a simulation-like HDF5 file.
 
-    triggerkit-merge --simtel GAMMAS.simtel.gz --real SST1M2_....fits.fz --output-hdf5-file merged.hdf5 [--signal true-signal|r0] [options]      (``--help`` lists them)
+    triggerkit-merge --simtel GAMMAS.simtel.gz --real SST1M2_....fits.fz --output-hdf5-file merged.hdf5 [--signal true-signal|r0] [--rotations 0 120 240] [options]      (``--help`` lists them;
+    ``--simtel-list`` / ``--real-list`` take the files from a text file)
 
 File lists: ``--simtel`` and ``--real`` each take any number of files, or a shell glob (``--simtel gammas/*.simtel.gz --real real/*.fits.fz``: the SHELL expands it, so leave it unquoted; the program gets the
-list, in the order the shell gives, which is the alphabetical one; a quoted pattern is not expanded here and is refused as "no such file"). The pairing is IN ORDER, never random: the k-th simulated gamma (the simtel files one after the
-other, their events in file order, only those with a photoelectron list) gets the k-th pedestal event (the real files one after the other, their pedestal events in file order). When the pedestals run out before the gammas the
-command stops with an error and writes nothing: give more real files, or ``--max-events N`` (N merged events). More pedestals than gammas is fine, the last ones are not used.
+list, in the order the shell gives, which is the alphabetical one; a quoted pattern is not expanded here and is refused as "no such file"). ``--simtel-list LIST`` and ``--real-list LIST`` take a text file with one path per
+line (``#`` for comments; a missing file is an error naming its line) instead of or after the files of ``--simtel`` / ``--real``. At least one source of simulated files and one of real files is required: the command
+refuses to run otherwise. Without ``--seed`` the pairing is IN ORDER: the k-th merged event (a simulated gamma, or one orientation of a gamma with ``--rotations``; the simtel files one after the other, their events in file
+order, only those with a photoelectron list) gets the k-th pedestal event (the real files one after the other, their pedestal events in file order). In that mode, when the pedestals run out before the events to merge the command
+stops with an error and writes nothing: give more real files, fewer ``--rotations``, ``--max-events N`` (N merged events), or ``--seed`` (which reuses them). More pedestals than events is fine, the last ones are not used, unless ``--loop-gammas`` is given: then, when the gammas run out first (17 000 gammas, 100 000 pedestals), the merge starts again
+from the first gamma, on the next pedestal events, until the pedestals run out (the normal end) or ``--max-events`` is reached (needed with ``--seed``, whose pool never runs out); the same gamma then meets
+different noise, and ``sim_event_id`` repeats in the merge table. A gamma is written in all its orientations or not at all (the last one the pedestals run out on is dropped).
 
-Random pairing: with ``--seed N`` each gamma gets a pedestal event drawn AT RANDOM instead of the next one: the whole pool of pedestal events of the real files is shuffled with that seed (a permutation, so each
-pedestal event is used once before any is used again, then it is shuffled again: no error when the gammas outnumber the pedestals, they are reused evenly). The same seed and the same real files give the same pairs
-and the same output, whatever the gammas. The table ``merge/event/telescope/tel_001`` says which real event each gamma got (``real_event_id``, ``real_file`` = index in the ``--real`` list, ``real_row`` = position in that
-file), with or without a seed.
+Random pairing: with ``--seed N`` each merged event (each gamma, or each orientation of a gamma) gets a pedestal event drawn AT RANDOM instead of the next one: the whole pool of pedestal events of the real files is shuffled with that seed (a permutation, so each
+pedestal event is used once before any is used again, then it is shuffled again: no error when the events outnumber the pedestals, they are reused evenly). The same seed and the same real files give the same pairs
+and the same output, whatever the gammas. The table ``merge/event/telescope/tel_001`` says which real event each merged event got (``real_event_id``, ``real_file`` = index in the ``--real`` list, ``real_row`` = position in that
+file: among all the events of a FITS file, among the rows of a converted file, so it differs between the two), with or without a seed.
 
 What it costs depends on the real files. ``--real`` takes FITS files (``*.fits.fz``) or files already converted with ``triggerkit-convert --waveform r0 --no-emulated --pedestal-only`` (``*.hdf5``, 70 MB for a night
 file, the pedestal events only), or a mix. A FITS file reads an event out of order by decoding a compressed block of 100 events (about 35 ms per event, against 0.5 ms in order), after a pass that reads the event types (a few
 seconds per file, the files in parallel). The draws are known in advance, so 4 reader processes (``READ_WORKERS``) read the FITS events ahead: 1000 gammas took 45.6 s with one process and 23.7 s with four, the same output (about 40 ms
 per gamma becomes 18 ms: 197 000 gammas about 130 min become 60 min, against about 40 min in order). A converted file reads it by position in about a millisecond: a seeded run costs the same as one in order (measured: 200 gammas in 1.9 s from converted files, 11.8 s from the
-FITS file, the same output). Converting the pedestals once (``--pedestal-only``) is therefore the way to use ``--seed`` on a large production. A FITS file and its converted file give the same pairs and the same alphas.
+FITS file, the same alphas). Converting the pedestals once (``--pedestal-only``) is therefore the way to use ``--seed`` on a large production. A FITS file and its converted file give the same pairs (the same
+``real_event_id``) and the same alphas; only ``real_row`` differs (see above).
+
+Recipe, real pedestals + noise-free gammas -> r0alpha, beta, gamma, without the raw r0 or the emulated traces (the merge reads the simtel files itself: only the real side is converted first)::
+
+    triggerkit-convert --to-process-file real.fits.fz --output-hdf5-file ped.hdf5 --waveform r0 --no-emulated --pedestal-only          # once per real file: the raw pixels of its pedestal events only
+    triggerkit-merge --signal r0 --stages --simtel gammas/*.simtel.gz --real ped/*.hdf5 --output-hdf5-file merged.hdf5 [--seed 1234]    # in order, or at random with --seed: r0alpha + r0_stages (alpha, beta, gamma)
+
+The merged file never holds the raw ``r0`` nor ``real/event/emulated_traces``: it has ``r0alpha`` and, with ``--stages``, ``r0_stages`` (``alpha``, ``beta`` = patch7 sums, ``gamma`` = TDSCAN score x 128, both before any threshold).
 
 Ways to run it (the same arguments each time; ``/path/to`` is the clone of ll-ml-triggerkit)::
 
@@ -26,7 +39,7 @@ Ways to run it (the same arguments each time; ``/path/to`` is the clone of ll-ml
 
 For example, from anywhere, the script by its path (S the simulated gammas, R the real file, M the merged output)::
 
-    PYTHONPATH=/chemin/ll-ml-triggerkit/src python /chemin/ll-ml-triggerkit/src/triggerkit/tools/merge.py --simtel S --real R --output-hdf5-file M.hdf5
+    PYTHONPATH=/path/to/ll-ml-triggerkit/src python /path/to/ll-ml-triggerkit/src/triggerkit/tools/merge.py --simtel S --real R --output-hdf5-file M.hdf5
 
 The script is ``src/triggerkit/tools/merge.py``. Run by its path, it needs ``PYTHONPATH=.../src`` (or the package installed): without it the import fails with "No module named 'triggerkit'". In the sst1mpipe 0.9.0
 environment (Python 3.10) the package cannot be installed: use the ``PYTHONPATH`` forms.
@@ -50,21 +63,28 @@ How the two are added (pixel by pixel, BEFORE the FADC, because the FADC is not 
    (``--stack-stages``: the stack, in ``r0``).
 
 The file holds what the loader reads for a gamma file (``r0alpha``, ``simulation/event/subarray/shower`` with the true energy, direction, core of the simulated gamma, the true image per
-patch from its photoelectrons) and ``merge/event/telescope/tel_001``: for every event the simulated event id, the real event id, type and time, the shift, the offset of the model,
-and ``in_adc``; the settings and file names are attributes of that table. ``--also-noise-alone`` adds the alpha of the real event WITHOUT the gamma (same noise, paired). ``--true-signal`` adds ``simulation/event/telescope/true_signal/tel_001``: the gamma
+patch from its photoelectrons) and ``merge/event/telescope/tel_001``: for every event the simulated file and event id, the real event id, type, time and run, the real file (index in ``--real``) and row
+(``real_file``, ``real_row``), the shift, the peak sample, the offset of the model, ``in_adc``, ``sim_pedestal`` and ``rotation`` (degrees); the settings and file names are attributes of that table. ``--also-noise-alone`` adds the alpha of the real event WITHOUT the gamma (same noise, paired). ``--true-signal`` adds ``simulation/event/telescope/true_signal/tel_001``: the gamma
 alone in the window of the real event, shifted like the signal that was added, as ``true_signal_r0_alpha`` (int16 ADC per patch: the sum of the 3 pixels, each rounded to an integer, before the clip),
 ``true_signal_fadc`` (the same after the FADC stage, uint8) and ``pe_count`` (the p.e. whose pulse starts in each sample): 3D targets for training on the merged events (the columns of
 ``triggerkit-convert --true-signal`` that a patch-level file has: there is no per-pixel ``true_signal_r0`` here). With ``--signal r0`` there is no model: ``true_signal_r0_alpha`` is the added
 signal summed per patch, ``true_signal_fadc`` its FADC, ``pe_count`` is zero and ``has_pe_count`` False.
 ``--stages`` and ``--stack-stages`` are those of ``triggerkit-convert`` (beta and gamma are computed on the merged alpha).
 
+Rotations (``--rotations 0 120 240``, default 0): every gamma is written once per angle. The SIGNAL and the TRUTH are turned about the optical axis (:mod:`triggerkit.camera.rotation`): ``true_az``, ``true_alt``,
+``true_core_x``, ``true_core_y`` (the energy, the heights and the depths do not change), the true image, the true-signal tables and the simulated alpha of ``--keep-simulated-alpha``. The REAL NOISE (and ``noise_alpha``)
+is not turned, and each copy takes the next pedestal event (in order, or the next draw of ``--seed``), so N angles need N pedestal events per gamma. The copies share ``sim_file`` / ``sim_event_id`` (group by them when
+splitting train and validation) and ``rotation`` tells which is which; ``--max-events`` counts the copies. They are not new showers: the number of simulated showers does not change, so an efficiency read on such a
+file is too high by the number of orientations (for training, not for statistics). It needs the pointing and the telescope position of the simtel header (``direction``, ``tel_pos``, ``tel_id``); without them the
+command stops with an error.
+
 Nothing is rescaled: the real raw ADC keeps the scale of the acquisition and the signal keeps the ADC scale of the simulation (``true-signal``: the FADC_AMPLITUDE, pulse and single-p.e.
 spectrum written in the simtel file; ``r0``: its own raw ADC). What it assumes, and does not check: that the gain of the simulated telescope is the one of the camera; that the pixel numbering of the simulation and of the real file are the same (the camera_config.cfg of
 both); that a window of T samples of the real file holds the gamma at sample 25 (no trigger time is involved: the TDSCAN of the test must find the gamma itself);
-the real files must have a pedestal event per simulated gamma (the command stops with an error otherwise, and writes nothing).
+without ``--seed`` the real files must have a pedestal event per merged event (per gamma and orientation with ``--rotations``: the command stops with an error otherwise, and writes nothing; ``--seed`` reuses them).
 
 Examples in the np.stack layout (``--stack-stages``: the table ``r0`` holds ``np.stack([alpha, beta, gamma])``, ``(n, 3, 432, 50)`` int16, channel 0 the alpha), the noise being in both cases the
-pedestal events of the real acquisition file (``.fits.fz``), one per gamma, in file order::
+pedestal events of the real acquisition file (``.fits.fz``), one per merged event, in file order::
 
     # 1. ordinary simtel.gz productions (with their own NSB and noise): the noise-free signal of each pixel is rebuilt from the photoelectrons (what
     #    ``triggerkit-convert --true-signal`` stores as ``true_signal_r0``, here computed on the fly and not rounded before it is added), then added to the real raw pixels
@@ -81,6 +101,8 @@ Add ``--true-signal`` for the gamma alone (``true_signal_r0_alpha`` per patch), 
 Needs, in one environment, protozfits (real data), eventio, scipy (``true-signal``), pytables and numpy: the sst1mpipe 0.9.0 environment has them all. triggerkit must be importable.
 """
 import argparse
+import contextlib
+import itertools
 import json
 import os
 import warnings
@@ -89,6 +111,8 @@ from collections import namedtuple
 import numpy as np
 
 from triggerkit.FileIO import layout
+from triggerkit.camera import rotation
+from triggerkit.tools.file_lists import join_files
 from triggerkit.camera import fadc, simtel_blocks, sst1m
 from triggerkit.tools import convert_real, stages_table
 
@@ -98,7 +122,8 @@ TARGET_SAMPLE = 25                       # the sample of the real window where t
 ADC_MAX = 4095
 NOISE_FREE_RMS = 0.5                     # ADC: above it the baseline samples of an ``r0`` file are not those of a noise-free run
 
-SimulatedGamma = namedtuple("SimulatedGamma", "file_index event_id result pixels peak n_samples true_image truth in_adc pedestal alpha", defaults=(None,))
+# geometry: (pointing azimuth, pointing altitude in degrees, (x, y, z) of the telescope in metres) from the simtel header (direction, tel_pos, tel_id), None when it lacks them (only rotations need it)
+SimulatedGamma = namedtuple("SimulatedGamma", "file_index event_id result pixels peak n_samples true_image truth in_adc pedestal alpha geometry", defaults=(None, None))
 
 
 def window_signal(pixels, shift, n_samples):
@@ -125,7 +150,9 @@ def merge_pixels(raw, baseline, flags, signal):
 def simulated_gammas(simtel_files, signal, tel, keep_alpha=False):
     """The simulated events to merge, one :class:`SimulatedGamma` each (those without a signal are skipped): ``pixels`` (1296, ns) is the signal on the time axis of the simtel
     file, ``peak`` the sample of its maximum, ``result`` the model's :class:`~triggerkit.camera.true_signal.EventSignal` (None for ``r0``). With ``keep_alpha``, ``alpha`` is the R0 alpha
-    of the simulation AS SIMULATED, ``(432, ns)`` uint8, unshifted, in its own window: the FADC of its raw r0 with the pedestal stored in its file, what ``triggerkit-convert`` writes."""
+    of the simulation AS SIMULATED, ``(432, ns)`` uint8, unshifted, in its own window: the FADC of its raw r0 with the pedestal stored in its file, what ``triggerkit-convert`` writes.
+    ``tel`` is the telescope number. ``truth`` is ``(run, energy, alt, az, core_x, core_y, h_first, x_max, depth, primary)`` as simulated (never turned here); ``geometry`` is ``(pointing azimuth, pointing altitude
+    in degrees, (x, y, z) of the telescope)`` read from the simtel header (``direction``, ``tel_pos``, ``tel_id``), or None if the header does not have them."""
     from eventio.simtel import SimTelFile
 
     for file_index, path in enumerate(simtel_files):
@@ -134,7 +161,11 @@ def simulated_gammas(simtel_files, signal, tel, keep_alpha=False):
         if signal == "true-signal":
             from triggerkit.camera.true_signal import TrueSignalModel
             model = TrueSignalModel(sim, path)
-        run = int(sim.mc_run_headers[0].get("run", 0)) if sim.mc_run_headers else 0
+        run = int((getattr(sim, "header", None) or {}).get("run", 0))          # the run header's number (the MC run header has none: it gave 0 for every file)
+        header = getattr(sim, "header", None) or {}
+        geometry = None                                                       # where the telescope points and stands: what turning the truth of a shower needs
+        if "direction" in header and "tel_pos" in header and "tel_id" in header and tel in list(header["tel_id"]):
+            geometry = (float(np.degrees(header["direction"][0])), float(np.degrees(header["direction"][1])), tuple(float(v) for v in header["tel_pos"][list(header["tel_id"]).index(tel)]))
         try:
             for event in sim:
                 telescopes = event.get("telescope_events", {})
@@ -166,7 +197,7 @@ def simulated_gammas(simtel_files, signal, tel, keep_alpha=False):
                     stored32 = simtel_blocks.pedestal_per_sample(event["camera_monitorings"][tel]).astype(np.float32)
                     alpha = fadc.triplet_sums(raw.astype(np.float32), stored32).astype(np.uint8)       # exactly the r0alpha of triggerkit-convert
                 yield SimulatedGamma(file_index, int(event["event_id"]), result, pixels, int(np.argmax(pixels.sum(axis=0))), raw.shape[1],
-                                     true_image_of(simtel_blocks.photoelectron_arrays(event, tel)[0]), truth, in_adc, pedestal, alpha)
+                                     true_image_of(simtel_blocks.photoelectron_arrays(event, tel)[0]), truth, in_adc, pedestal, alpha, geometry)
         finally:
             sim.close()
 
@@ -199,15 +230,19 @@ class _ConvertedReal:
         except ImportError:
             pass
         self.file = h5py.File(path, "r")
-        raw = layout.group_name(layout.R0) + "/tel_001"
-        if raw not in self.file:
-            raise KeyError(f"{path}: no raw r0 table {raw!r}: convert the real file with `triggerkit-convert --waveform r0 --pedestal-only`")
-        self.raw = self.file[raw]
-        layout.check_r0_is_raw(self.raw.dtype["waveform"].shape, repr(path))
-        self.real = self.file["real/event/telescope/tel_001"][()]
-        if len(self.real) != len(self.raw):
-            raise ValueError(f"{path}: the r0 table and the real/event/telescope table do not hold the same events")
-        self.has_flags = "pixels_flags" in (self.raw.dtype.names or ())
+        try:
+            raw = layout.group_name(layout.R0) + "/tel_001"
+            if raw not in self.file:
+                raise KeyError(f"{path}: no raw r0 table {raw!r}: convert the real file with `triggerkit-convert --waveform r0 --pedestal-only`")
+            self.raw = self.file[raw]
+            layout.check_r0_is_raw(self.raw.dtype["waveform"].shape, repr(path))
+            self.real = self.file["real/event/telescope/tel_001"][()]
+            if len(self.real) != len(self.raw) or not np.array_equal(self.raw["event_id"], self.real["event_id"]):      # the same rows, in the same order: event by event
+                raise ValueError(f"{path}: the r0 table and the real/event/telescope table do not hold the same events")
+            self.has_flags = "pixels_flags" in (self.raw.dtype.names or ())
+        except BaseException:
+            self.file.close()                                  # a file that is refused must not stay open
+            raise
 
     def pedestal_rows(self):
         return np.flatnonzero(layout.is_pedestal(self.real["event_type"])).tolist()
@@ -226,9 +261,7 @@ class _ConvertedReal:
 def real_noise_events(real_files):
     """The real events to put the gammas on, the pedestal events (INTERNAL bit), IN ORDER (the files one after the other, their events in file order), as dicts: ``raw`` (1296, T) int16,
     ``baseline`` (1296,) = recorded baseline / 16, ``flags``, the event's numbers, and ``file_index`` / ``row`` (where the event is in the ``real_files``). A file is a FITS file
-    (``*.fits.fz``) or one converted with ``triggerkit-convert --waveform r0`` (``*.hdf5``)."""
-    from protozfits import File
-
+    (``*.fits.fz``) or one converted with ``triggerkit-convert --waveform r0`` (``*.hdf5``): protozfits is only needed for a FITS file."""
     for file_index, path in enumerate(real_files):
         if _is_hdf5(path):
             source = _ConvertedReal(path)
@@ -238,6 +271,8 @@ def real_noise_events(real_files):
             finally:
                 source.close()
             continue
+        from protozfits import File
+
         with File(path) as source:
             for row, event in enumerate(source.Events):
                 if not layout.is_pedestal(convert_real._int(event.event_type)):          # an empty event_type (-1) is not a pedestal event
@@ -289,8 +324,10 @@ def pedestal_index(real_files, executor=None):
     for file_index, path in enumerate(real_files):
         if _is_hdf5(path):
             source = _ConvertedReal(path)
-            rows = source.pedestal_rows()
-            source.close()
+            try:
+                rows = source.pedestal_rows()
+            finally:
+                source.close()
         elif file_index in futures:
             rows = futures[file_index].result()
         else:
@@ -349,10 +386,28 @@ def random_noise_events(real_files, seed, workers=None):
 
 
 def merge(simtel_files, real_files, output_file, signal="true-signal", also_noise_alone=False, stages=False, stack_stages=False, true_signal=False, max_events=None, tel=1,
-          progress_every=100, keep_simulated_alpha=False, seed=None):
+          progress_every=100, keep_simulated_alpha=False, seed=None, rotations=(0,), loop_gammas=False):
     """Merge simulated gammas into real noise, write ``output_file`` (overwritten): see the module docstring. Returns the number of events written.
 
+    ``loop_gammas``: when the gammas run out before the pedestal events, start again from the first gamma, on the next pedestal events, until the pedestals run out (without ``seed``: the end of the
+    merge, not an error, once at least one pass over the gammas is done) or ``max_events`` is reached (required with ``seed``, whose pool never runs out: ``ValueError`` otherwise). A gamma is written in ALL its orientations or not at all: the one the pedestals run out on is dropped (``max_events`` alone can still cut a gamma). A file listed twice in ``simtel_files`` or ``real_files`` is refused.
+
+    ``rotations``: the orientations in which every gamma is written, among 0, 120 and 240 degrees (see :mod:`triggerkit.camera.rotation`): the signal (and its truth) is turned,
+    the real noise is not, and every copy gets a pedestal event of its own. ``(0,)``: the gamma as simulated. ``max_events`` counts the events written, i.e. the copies. Raises ``ValueError`` for a repeated
+    angle or one that is not 0, 120 or 240, and, at the first non-zero angle, when the simtel header has no pointing or telescope position; ``RuntimeError`` when the real files run out of pedestal events (without ``seed``) or
+    when nothing could be merged.
+
     The output is written as ``<output>.partial`` and renamed when done, like ``triggerkit-convert``."""
+    rotations = rotation.check_rotations(rotations)
+    simtel_files = [simtel_files] if isinstance(simtel_files, (str, os.PathLike)) else list(simtel_files)
+    real_files = [real_files] if isinstance(real_files, (str, os.PathLike)) else list(real_files)
+    for name, files in (("simtel", simtel_files), ("real", real_files)):          # a file twice would give every gamma twice (or every pedestal twice, against "each pedestal once")
+        duplicates = sorted({str(f) for f in files if [os.path.realpath(g) for g in files].count(os.path.realpath(f)) > 1})
+        if duplicates:
+            raise ValueError(f"the {name} files list {duplicates[0]} more than once (the same file under two names counts too): list each file once")
+    output_file = str(output_file)
+    if loop_gammas and seed is not None and max_events is None:
+        raise ValueError("loop_gammas with a seed never ends (the pool of pedestal events is shuffled again and again): give max_events")
     if seed is not None and int(seed) < 0:
         raise ValueError(f"seed must be >= 0 (or None for the pedestal events in order), got {seed}")
     if signal not in SIGNAL_MODES:
@@ -365,7 +420,7 @@ def merge(simtel_files, real_files, output_file, signal="true-signal", also_nois
                       "Nothing is modelled.", UserWarning, stacklevel=2)
     partial = output_file + ".partial"
     try:
-        written = _merge(list(simtel_files), list(real_files), partial, signal, also_noise_alone, stages, stack_stages, true_signal, max_events, tel, progress_every, keep_simulated_alpha, seed)
+        written = _merge(simtel_files, real_files, partial, signal, also_noise_alone, stages, stack_stages, true_signal, max_events, tel, progress_every, keep_simulated_alpha, seed, rotations, loop_gammas)
         os.replace(partial, output_file)
     except BaseException:
         if os.path.exists(partial):
@@ -374,87 +429,127 @@ def merge(simtel_files, real_files, output_file, signal="true-signal", also_nois
     return written
 
 
-def _merge(simtel_files, real_files, output_file, signal, also_noise_alone, stages, stack_stages, true_signal, max_events, tel, progress_every, keep_simulated_alpha=False, seed=None):
+def _merge(simtel_files, real_files, output_file, signal, also_noise_alone, stages, stack_stages, true_signal, max_events, tel, progress_every, keep_simulated_alpha=False, seed=None, rotations=(0,), loop_gammas=False):
+    noise_stream = real_noise_events(real_files) if seed is None else random_noise_events(real_files, seed)          # in order, or shuffled by the seed
+    with contextlib.closing(noise_stream):                         # the generators close the real files and the reader processes they opened, also when the merge fails
+        return _merge_events(noise_stream, simtel_files, real_files, output_file, signal, also_noise_alone, stages, stack_stages, true_signal, max_events, tel, progress_every, keep_simulated_alpha,
+                             seed, rotations, loop_gammas)
+
+
+def _merge_events(noise_stream, simtel_files, real_files, output_file, signal, also_noise_alone, stages, stack_stages, true_signal, max_events, tel, progress_every, keep_simulated_alpha,
+                  seed, rotations, loop_gammas):
     import tables
     from triggerkit.camera.true_signal import TrueSignalModel
 
-    noise_stream = real_noise_events(real_files) if seed is None else random_noise_events(real_files, seed)          # in order, or shuffled by the seed
     filters = tables.Filters(complevel=1, complib="zlib")
     written = 0
     with tables.open_file(output_file, "w") as h5:
         tables_ = merge_table = alone_table = stage_table = signal_table = sim_alpha_table = None
-        for gamma in simulated_gammas(simtel_files, signal, tel, keep_alpha=keep_simulated_alpha):
-            noise = next(noise_stream, None)
-            if noise is None:
-                raise RuntimeError(f"the real files have only {written} pedestal events for the simulated gammas to merge: give more real files")
-            n_samples = noise["raw"].shape[1]
-            if tables_ is None:
-                convert_real._write_configuration(h5, noise["tel_id"])
-                tables_ = convert_real._create_tables(h5, noise["tel_id"], n_samples, stacked=stack_stages, real_tables=False)
-                r0alpha_table = tables_.alpha
-                merge_table = h5.create_table("/merge/event/telescope", "tel_001", {
-                    "event_id": tables.Int64Col(pos=0), "sim_file": tables.Int16Col(pos=1), "sim_event_id": tables.Int64Col(pos=2), "real_event_id": tables.Int64Col(pos=3),
-                    "real_event_type": tables.Int64Col(pos=4), "real_time_s": tables.Int64Col(pos=5), "real_time_ns": tables.Int64Col(pos=6), "real_run_id": tables.Int64Col(pos=7),
-                    "shift": tables.Int16Col(pos=8), "peak_sample": tables.Int16Col(pos=9), "offset": tables.Float32Col(pos=10),
-                    "in_adc": tables.BoolCol(pos=11), "sim_pedestal": tables.Float32Col(pos=12), "real_file": tables.Int16Col(pos=13), "real_row": tables.Int32Col(pos=14)}, createparents=True,
-                    title="one row per merged event: simulated gamma (file, event id), real noise event, time shift in samples, model offset, simulated pedestal removed (ADC, 0 for the model)")
-                if also_noise_alone:
-                    alone_table = h5.create_table("/merge/event/noise_alpha", "tel_001", {
-                        "event_id": tables.Int64Col(pos=0), "waveform": tables.UInt8Col(shape=(sst1m.N_PATCHES, n_samples), pos=1)}, createparents=True, filters=filters,
-                        title="the alpha of the real event WITHOUT the gamma (same noise, the FADC of the real data), for paired comparisons")
-                if keep_simulated_alpha:
-                    sim_alpha_table = h5.create_table("/merge/event/simulated_r0alpha", "tel_001", {
-                        "event_id": tables.Int64Col(pos=0), "waveform": tables.UInt8Col(shape=(sst1m.N_PATCHES, gamma.alpha.shape[1]), pos=1)}, createparents=True, filters=filters,
-                        title="the r0alpha of the simulation AS SIMULATED: unshifted, in its own window (the samples of the simtel file), the FADC of its raw r0 with its stored pedestal")
-                if stages:
-                    stage_table = stages_table.create_table(h5, "tel_001", n_samples)
-                if true_signal:
-                    shape = (sst1m.N_PATCHES, n_samples)
-                    signal_table = h5.create_table("/simulation/event/telescope/true_signal", "tel_001", {
-                        "event_id": tables.Int64Col(pos=0), "has_signal": tables.BoolCol(pos=1), "offset": tables.Float32Col(pos=2),
-                        "true_signal_r0_alpha": tables.Int16Col(shape=shape, pos=3), "true_signal_fadc": tables.UInt8Col(shape=shape, pos=4),
-                        "pe_count": tables.UInt8Col(shape=shape, pos=5), "in_adc": tables.BoolCol(pos=6), "has_pe_count": tables.BoolCol(pos=7)},
-                        createparents=True, filters=filters,
-                        title="the gamma alone, in the window of the real event: true_signal_r0_alpha (ADC, int16 per patch, before the clip), true_signal_fadc (after the FADC stage, uint8) and pe_count (p.e. whose pulse starts in the sample)")
-            if gamma.pixels.shape[0] != noise["raw"].shape[0]:
-                raise ValueError(f"the simulated camera has {gamma.pixels.shape[0]} pixels, the real one {noise['raw'].shape[0]}")
-            shift = TARGET_SAMPLE - gamma.peak
-            if signal == "true-signal":
-                moved = TrueSignalModel.pixel_signal(gamma.result, sst1m.N_PIXELS, n_samples, offset=gamma.result.offset + shift)
-                offset = gamma.result.offset + shift
-            else:
-                moved, offset = window_signal(gamma.pixels, shift, n_samples), np.nan
-            alpha = merge_pixels(noise["raw"], noise["baseline"], noise["flags"], moved)
-            shower, images = tables_.shower, tables_.images
-            event_id = written
-            r0alpha_table.append([(0, event_id, 1, stages_table.stack_of(alpha) if stack_stages else alpha.astype(np.uint8))])
-            run, energy, alt, az, core_x, core_y, h_first, x_max, depth, primary = gamma.truth
-            shower.append([(run, event_id, energy, alt, az, core_x, core_y, h_first, x_max, depth, primary)])
-            images.append([(0, event_id, 1, int(gamma.true_image.sum()), gamma.true_image)])
-            merge_table.append([(event_id, gamma.file_index, gamma.event_id, noise["event_id"], noise["event_type"], noise["time_s"], noise["time_ns"], noise["run_id"], shift,
-                                 gamma.peak, offset, gamma.in_adc, gamma.pedestal, noise["file_index"], noise["row"])])
-            if stage_table is not None:
-                stage_table.append([(event_id, *stages_table.stages_of(alpha))])
-            if signal_table is not None:
+        exhausted = False                                          # loop_gammas: the pedestal events ran out during a later pass over the gammas: the normal end
+
+        def gamma_passes():
+            """``(pass index, gamma)``: the gammas once, or again and again with ``loop_gammas`` (a pass without any gamma ends it)."""
+            for pass_index in itertools.count():
+                found = False
+                for gamma in simulated_gammas(simtel_files, signal, tel, keep_alpha=keep_simulated_alpha):
+                    found = True
+                    yield pass_index, gamma
+                if not (loop_gammas and found):
+                    return
+
+        for pass_index, gamma in gamma_passes():
+            noises = []                                            # the pedestal events of ALL the orientations of this gamma first: a gamma is written whole or not at all
+            for _ in rotations:
+                noise = next(noise_stream, None)
+                if noise is None:
+                    break
+                noises.append(noise)
+            if len(noises) < len(rotations):
+                if pass_index > 0:
+                    exhausted = True                               # loop_gammas: the pedestals ran out in a later pass: the normal end, the incomplete gamma is not written
+                    break
+                raise RuntimeError(f"the real files have only {written + len(noises)} pedestal events for the events to merge (one per gamma and orientation): give more real files"
+                                   + (", fewer --rotations, or --max-events N" if not loop_gammas else "; with --loop-gammas the real files must cover at least one pass over the gammas (or give --max-events N)"))
+            for degrees, noise in zip(rotations, noises):
+                n_samples = noise["raw"].shape[1]
+                if tables_ is None:
+                    convert_real._write_configuration(h5, noise["tel_id"])
+                    tables_ = convert_real._create_tables(h5, noise["tel_id"], n_samples, stacked=stack_stages, real_tables=False)
+                    r0alpha_table = tables_.alpha
+                    merge_table = h5.create_table("/merge/event/telescope", "tel_001", {
+                        "event_id": tables.Int64Col(pos=0), "sim_file": tables.Int32Col(pos=1), "sim_event_id": tables.Int64Col(pos=2), "real_event_id": tables.Int64Col(pos=3),
+                        "real_event_type": tables.Int64Col(pos=4), "real_time_s": tables.Int64Col(pos=5), "real_time_ns": tables.Int64Col(pos=6), "real_run_id": tables.Int64Col(pos=7),
+                        "shift": tables.Int16Col(pos=8), "peak_sample": tables.Int16Col(pos=9), "offset": tables.Float32Col(pos=10),
+                        "in_adc": tables.BoolCol(pos=11), "sim_pedestal": tables.Float32Col(pos=12), "real_file": tables.Int32Col(pos=13), "real_row": tables.Int32Col(pos=14), "rotation": tables.Int16Col(pos=15)}, createparents=True,
+                        title="one row per merged event: simulated gamma (file, event id), real noise event, time shift in samples, model offset, simulated pedestal removed (ADC, 0 for the model), rotation of the gamma (degrees)")
+                    if also_noise_alone:
+                        alone_table = h5.create_table("/merge/event/noise_alpha", "tel_001", {
+                            "event_id": tables.Int64Col(pos=0), "waveform": tables.UInt8Col(shape=(sst1m.N_PATCHES, n_samples), pos=1)}, createparents=True, filters=filters,
+                            title="the alpha of the real event WITHOUT the gamma (same noise, the FADC of the real data), for paired comparisons")
+                    if keep_simulated_alpha:
+                        sim_alpha_table = h5.create_table("/merge/event/simulated_r0alpha", "tel_001", {
+                            "event_id": tables.Int64Col(pos=0), "waveform": tables.UInt8Col(shape=(sst1m.N_PATCHES, gamma.alpha.shape[1]), pos=1)}, createparents=True, filters=filters,
+                            title="the r0alpha of the simulation AS SIMULATED: unshifted, in its own window (the samples of the simtel file), the FADC of its raw r0 with its stored pedestal")
+                    if stages:
+                        stage_table = stages_table.create_table(h5, "tel_001", n_samples)
+                    if true_signal:
+                        shape = (sst1m.N_PATCHES, n_samples)
+                        signal_table = h5.create_table("/simulation/event/telescope/true_signal", "tel_001", {
+                            "event_id": tables.Int64Col(pos=0), "has_signal": tables.BoolCol(pos=1), "offset": tables.Float32Col(pos=2),
+                            "true_signal_r0_alpha": tables.Int16Col(shape=shape, pos=3), "true_signal_fadc": tables.UInt8Col(shape=shape, pos=4),
+                            "pe_count": tables.UInt8Col(shape=shape, pos=5), "in_adc": tables.BoolCol(pos=6), "has_pe_count": tables.BoolCol(pos=7)},
+                            createparents=True, filters=filters,
+                            title="the gamma alone, in the window of the real event: true_signal_r0_alpha (ADC, int16 per patch, before the clip), true_signal_fadc (after the FADC stage, uint8) and pe_count (p.e. whose pulse starts in the sample)")
+                if gamma.pixels.shape[0] != noise["raw"].shape[0]:
+                    raise ValueError(f"the simulated camera has {gamma.pixels.shape[0]} pixels, the real one {noise['raw'].shape[0]}")
+                if degrees and gamma.geometry is None:
+                    raise ValueError(f"rotations need where the telescope points and stands (the header of the simtel file: direction, tel_pos, tel_id): {simtel_files[gamma.file_index]} has none")
+                shift = TARGET_SAMPLE - gamma.peak
                 if signal == "true-signal":
-                    _, patch_signal, patch_fadc, counts = TrueSignalModel.arrays(gamma.result, n_samples, offset=offset)
-                else:                                          # the signal is the raw ADC of a noise-free simulation: no model, no p.e. placed in time
-                    patch_signal, patch_fadc = TrueSignalModel.adc_of(moved), TrueSignalModel.fadc_of(moved).astype(np.uint8)
-                    counts = np.zeros((sst1m.N_PATCHES, n_samples), dtype=np.uint8)
-                signal_table.append([(event_id, True, offset, patch_signal, patch_fadc, counts, gamma.in_adc, signal == "true-signal")])
-            if sim_alpha_table is not None:
-                if gamma.alpha.shape[1] != sim_alpha_table.coldescrs["waveform"].shape[1]:
-                    raise ValueError(f"the simtel files do not have the same number of samples ({gamma.alpha.shape[1]} against {sim_alpha_table.coldescrs['waveform'].shape[1]}): merge them separately")
-                sim_alpha_table.append([(event_id, gamma.alpha)])
-            if alone_table is not None:
-                alone_table.append([(event_id, convert_real.emulated_traces(noise["raw"], noise["baseline"], noise["flags"]).astype(np.uint8))])
-            written += 1
-            if progress_every and written % progress_every == 0:
-                print(f"Merged {written} events...", flush=True)
-            if max_events is not None and written >= max_events:
+                    moved = TrueSignalModel.pixel_signal(gamma.result, sst1m.N_PIXELS, n_samples, offset=gamma.result.offset + shift)
+                    offset = gamma.result.offset + shift
+                else:
+                    moved, offset = window_signal(gamma.pixels, shift, n_samples), np.nan
+                moved = rotation.turn_pixels(moved, degrees)                             # the signal is turned, the real noise is not
+                alpha = merge_pixels(noise["raw"], noise["baseline"], noise["flags"], moved)
+                shower, images = tables_.shower, tables_.images
+                event_id = written
+                run, energy, alt, az, core_x, core_y, h_first, x_max, depth, primary = gamma.truth
+                true_image = rotation.turn_patches(gamma.true_image, degrees)
+                if degrees:
+                    pointing_az, pointing_alt, position = gamma.geometry
+                    az, alt, core_x, core_y = (float(v) for v in rotation.turn_truth(az, alt, core_x, core_y, pointing_az=pointing_az, pointing_alt=pointing_alt, telescope=position, deg=degrees))
+                # the same obs_id (the simtel run) in every table of the event: a reader that joins on (obs_id, event_id) finds its truth
+                r0alpha_table.append([(run, event_id, 1, stages_table.stack_of(alpha) if stack_stages else alpha.astype(np.uint8))])
+                shower.append([(run, event_id, energy, alt, az, core_x, core_y, h_first, x_max, depth, primary)])
+                images.append([(run, event_id, 1, int(true_image.sum()), true_image)])
+                merge_table.append([(event_id, gamma.file_index, gamma.event_id, noise["event_id"], noise["event_type"], noise["time_s"], noise["time_ns"], noise["run_id"], shift,
+                                     gamma.peak, offset, gamma.in_adc, gamma.pedestal, noise["file_index"], noise["row"], degrees)])
+                if stage_table is not None:
+                    stage_table.append([(event_id, *stages_table.stages_of(alpha))])
+                if signal_table is not None:
+                    if signal == "true-signal":
+                        _, patch_signal, patch_fadc, counts = TrueSignalModel.arrays(gamma.result, n_samples, offset=offset)
+                        patch_signal, patch_fadc, counts = (rotation.turn_patches(a, degrees) for a in (patch_signal, patch_fadc, counts))
+                    else:                                          # the signal is the raw ADC of a noise-free simulation: no model, no p.e. placed in time
+                        patch_signal, patch_fadc = TrueSignalModel.adc_of(moved), TrueSignalModel.fadc_of(moved).astype(np.uint8)
+                        counts = np.zeros((sst1m.N_PATCHES, n_samples), dtype=np.uint8)
+                    signal_table.append([(event_id, True, offset, patch_signal, patch_fadc, counts, gamma.in_adc, signal == "true-signal")])
+                if sim_alpha_table is not None:
+                    if gamma.alpha.shape[1] != sim_alpha_table.coldescrs["waveform"].shape[1]:
+                        raise ValueError(f"the simtel files do not have the same number of samples ({gamma.alpha.shape[1]} against {sim_alpha_table.coldescrs['waveform'].shape[1]}): merge them separately")
+                    sim_alpha_table.append([(event_id, rotation.turn_patches(gamma.alpha, degrees))])
+                if alone_table is not None:
+                    alone_table.append([(event_id, convert_real.emulated_traces(noise["raw"], noise["baseline"], noise["flags"]).astype(np.uint8))])
+                written += 1
+                if progress_every and written % progress_every == 0:
+                    print(f"Merged {written} events...", flush=True)
+                if max_events is not None and written >= max_events:
+                    break
+            if exhausted or (max_events is not None and written >= max_events):
                 break
         if merge_table is not None:
-            merge_table.attrs.settings = json.dumps({"signal": signal, "target_sample": TARGET_SAMPLE, "also_noise_alone": also_noise_alone, "true_signal": true_signal, "keep_simulated_alpha": keep_simulated_alpha, "seed": seed, "tel": tel,
+            merge_table.attrs.settings = json.dumps({"signal": signal, "target_sample": TARGET_SAMPLE, "also_noise_alone": also_noise_alone, "true_signal": true_signal, "keep_simulated_alpha": keep_simulated_alpha, "seed": seed, "tel": tel, "rotations": list(rotations), "loop_gammas": loop_gammas,
                                                      "simtel_files": [os.path.basename(f) for f in simtel_files], "real_files": [os.path.basename(f) for f in real_files]})
     if written == 0:
         raise RuntimeError("no simulated event could be merged: none has a signal (for --signal true-signal: a photoelectron list), or the telescope number --tel is not in the file")
@@ -478,15 +573,21 @@ HOW THEY ARE ADDED (pixel by pixel, BEFORE the FADC, which is not linear: it cli
 
 OUTPUT (what the loader reads for a gamma file, plus the provenance)
   r0alpha                            the merged alpha (with --stack-stages the table is r0 and holds np.stack([alpha, beta, gamma]), int16)
-  simulation/event/subarray/shower   the true energy, direction, core, first interaction, x_max, primary of the simulated gamma
-  simulation/event/telescope/images  the true image per patch (photoelectrons of the simulated gamma)
-  simulation/event/telescope/true_signal/tel_001   with --true-signal: the gamma alone in the real window, true_signal_r0_alpha / true_signal_fadc / pe_count (patch x sample)
-  merge/event/simulated_r0alpha/tel_001   with --keep-simulated-alpha: the r0alpha of the simulation AS SIMULATED (unshifted, in its own window, e.g. 432 x 50 or 432 x 82): the FADC of its raw r0
+  simulation/event/subarray/shower   the true energy, direction, core, first interaction, x_max, primary of the simulated gamma (direction and core turned with --rotations)
+  simulation/event/telescope/images  the true image per patch (photoelectrons of the simulated gamma; turned with --rotations)
+  simulation/event/telescope/true_signal/tel_001   with --true-signal: the gamma alone in the real window, true_signal_r0_alpha / true_signal_fadc / pe_count (patch x sample; turned with --rotations)
+  merge/event/simulated_r0alpha/tel_001   with --keep-simulated-alpha: the r0alpha of the simulation AS SIMULATED (unshifted, turned with --rotations, in its own window, e.g. 432 x 50 or 432 x 82): the FADC of its raw r0
                                      with the pedestal stored in its file, what triggerkit-convert writes, kept to reuse
   merge/event/noise_alpha/tel_001    with --also-noise-alone: the alpha of the same real event WITHOUT the gamma (same noise), for paired comparisons
-  merge/event/telescope/tel_001      per event: simulated file and event id, real event id / type / time / run, shift, peak sample, model offset, in_adc, sim_pedestal (the simulated
-                                     pedestal Psi that was subtracted, ADC: 0 for true-signal and for a simulated r0 that has none);
-                                     the settings and file names are attributes of this table
+  merge/event/telescope/tel_001      per event: simulated file and event id, real event id / type / time / run, real_file (index in --real) and real_row, shift, peak sample, model offset, in_adc,
+                                     sim_pedestal (the simulated pedestal Psi that was subtracted, ADC: 0 for true-signal and for a simulated r0 that has none), rotation (degrees, 0 unless
+                                     --rotations); the settings and file names are attributes of this table
+
+ROTATIONS (--rotations 0 120 240, default 0)
+  Every gamma is written once per angle: its SIGNAL and its TRUTH (true_az, true_alt, true_core_x, true_core_y, true image, true-signal tables, kept simulated alpha) are turned about the optical axis; energy,
+  heights and depths do not change. The real noise is NOT turned and each copy takes the next pedestal event, so N angles need N pedestal events per gamma. The copies share sim_file / sim_event_id and differ in
+  rotation; --max-events counts the copies. They are not new showers: an efficiency read on such a file is too high by the number of orientations (for training, not for statistics). Needs the pointing
+  and the telescope position of the simtel header (direction, tel_pos, tel_id).
 """
 
 EPILOG = """\
@@ -494,22 +595,28 @@ WHAT IT ASSUMES AND DOES NOT CHECK
   - the gain of the simulated telescope is the one of the camera (nothing is rescaled: the production has 6.57 ADC per p.e. and a pulse shape tuned for SST1M2, not measured
     on the night of the real file); the pixel numbering is the same (camera_config.cfg); no trigger time is involved: the window holds the gamma at sample 25,
     the trigger of the test (the TDSCAN) must find it.
-  - the real files need a pedestal event per simulated gamma: the command stops with an error, and writes nothing, if they have fewer.
-  - the baseline stored with a real event is a snapshot: the emulated FADC equals the recorded one at sample 6 and to about 97 % over all samples (see triggerkit-convert).
+  - without --seed the real files need a pedestal event per merged event (per gamma and orientation with --rotations): the command stops with an error, and writes nothing, if they have fewer (--seed reuses them).
+  - a file written with --rotations holds copies of the same showers: not for an efficiency (see ROTATIONS above).
+  - the baseline stored with a real event is a snapshot: the emulated FADC equals the recorded one at sample 6 on almost every patch, not all (every patch of the
+    first 50 events of 2026-09-22 file 0296, 98.4 % of those of 2026-09-23 file 0000), and on 82.5 % of all the samples on a file of the 2026-10-26 session
+    (97.7 % on one of 2026-09-23; see triggerkit-convert).
 
 ENVIRONMENT  one environment with protozfits (real data), eventio, scipy (true-signal), pytables and numpy: the sst1mpipe 0.9.0 environment has them all.
 
 FILE LISTS AND THE PAIRING
   --simtel and --real take any number of files, or a shell glob (--simtel gammas/*.simtel.gz --real real/*.fits.fz): the SHELL expands it, so leave it unquoted (a quoted pattern is refused as "no such file").
-  The pairing is IN ORDER, never random: the k-th simulated gamma (the simtel files one after the other, events in file order, only those with a photoelectron list) gets the k-th pedestal event
-  (the real files one after the other, pedestal events in file order). If the pedestals run out before the gammas the command stops with an error and writes nothing: give more real files or --max-events N.
+  --simtel-list LIST and --real-list LIST take a text file instead (one path per line, # for comments), or in addition.
+  Without --seed the pairing is IN ORDER: the k-th merged event (a gamma, or one orientation of it with --rotations; the simtel files one after the other, events in file order, only those with a photoelectron
+  list) gets the k-th pedestal event (the real files one after the other, pedestal events in file order). If the pedestals run out before the events the command stops with an error and writes nothing: give more
+  real files, fewer --rotations, --max-events N, or --seed (below). With the opposite problem, fewer gammas than pedestals (17 000 gammas, 100 000 pedestals), --loop-gammas starts again
+  from the first gamma on the next pedestal events until the pedestals run out (the end, not an error) or --max-events is reached (needed with --seed).
   triggerkit-merge --simtel gammas/*.simtel.gz --real real/*.fits.fz --output-hdf5-file gamma_on_real.hdf5 --max-events 197000
 
 RANDOM PAIRING (--seed N)
-  With --seed N each gamma gets a pedestal event drawn at random instead of the next one: the pool of pedestal events is shuffled with that seed, each one is used once before any is used again (then it is shuffled
+  With --seed N each merged event (each gamma, or each orientation of a gamma with --rotations) gets a pedestal event drawn at random instead of the next one: the pool of pedestal events is shuffled with that seed, each one is used once before any is used again (then it is shuffled
   again, so there is no error when the gammas outnumber the pedestals). Same seed and same real files, same output. --real takes FITS files or files converted with `triggerkit-convert --waveform r0
   --no-emulated --pedestal-only` (70 MB per night): events are read by position, from a FITS file by 4 reader processes (about 18 ms per gamma in all instead of 40 with one: 197 000 gammas about 60 min), from a converted file in about 1 ms (no extra cost). More gammas than pedestals (10 000 gammas, 500 pedestals): each pedestal is used 20 times, evenly. merge/event/telescope/tel_001 gives
-  real_event_id, real_file (index in the --real list) and real_row (position in that file) for every gamma.
+  real_event_id, real_file (index in the --real list) and real_row (position in that file: among all the events of a FITS file, among the rows of a converted one) for every merged event.
 
 HOW TO RUN IT (the same arguments each time; /path/to is the clone of ll-ml-triggerkit)
   triggerkit-merge ARGS                                                                      the package installed (pip install -e .)
@@ -519,8 +626,12 @@ HOW TO RUN IT (the same arguments each time; /path/to is the clone of ll-ml-trig
   package: use the PYTHONPATH forms there.
 
 EXAMPLES
+  # real pedestals converted once (raw pixels of the pedestal events only), noise-free gammas read from their simtel files; output: r0alpha + r0_stages (alpha, beta, gamma), no raw r0, no emulated traces
+  triggerkit-convert --to-process-file real.fits.fz --output-hdf5-file ped.hdf5 --waveform r0 --no-emulated --pedestal-only
+  triggerkit-merge --signal r0 --stages --simtel gammas/*.simtel.gz --real ped/*.hdf5 --output-hdf5-file merged.hdf5 [--seed 1234]
   triggerkit-merge --simtel gamma_200000.simtel.gz gamma_200005.simtel.gz --real SST1M2_20261026_0012.fits.fz --output-hdf5-file gamma_on_real.hdf5
   triggerkit-merge --signal r0 --simtel gammas_without_noise.simtel.gz --real real_a.fits.fz real_b.fits.fz --output-hdf5-file merged.hdf5 --also-noise-alone
+  triggerkit-merge --signal r0 --rotations 0 120 240 --seed 1234 --simtel-list gammas.txt --real-list pedestals.txt --keep-simulated-alpha --output-hdf5-file gammas_on_real.hdf5
 
 THE np.stack LAYOUT (--stack-stages: table r0 = np.stack([alpha, beta, gamma]), (n, 3, 432, 50) int16), the noise being the pedestal events of the real file in both cases
   1. simtel.gz productions with NSB and noise: the signal is the noise-free signal rebuilt from the photoelectrons (the true_signal_r0 of triggerkit-convert --true-signal, computed here)
@@ -533,16 +644,27 @@ THE np.stack LAYOUT (--stack-stages: table r0 = np.stack([alpha, beta, gamma]), 
 def build_parser():
     parser = argparse.ArgumentParser(prog="triggerkit-merge", description=DESCRIPTION, epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
     files = parser.add_argument_group("input and output")
-    files.add_argument("--simtel", required=True, nargs="+", metavar="FILE", help="simulated gammas (*.simtel.gz); see --signal for what they must be")
-    files.add_argument("--real", required=True, nargs="+", metavar="FILE", help="real data files that provide the noise: FITS (*.fits.fz) or already converted with `triggerkit-convert --waveform r0 --no-emulated --pedestal-only` (*.hdf5: 70 MB per night, fast random access, see --seed)")
+    files.add_argument("--simtel", nargs="+", metavar="FILE", help="simulated gammas (*.simtel.gz); see --signal for what they must be (give them here or with --simtel-list)")
+    files.add_argument("--simtel-list", metavar="LIST", help="a text file with one simulated gamma file per line (whole lines starting with # are comments; absolute paths, or relative to the directory the command is run from), instead of or after the files of --simtel")
+    files.add_argument("--real", nargs="+", metavar="FILE", help="real data files that provide the noise: FITS (*.fits.fz) or already converted with `triggerkit-convert --waveform r0 --no-emulated --pedestal-only` (*.hdf5: 70 MB per night, fast random access, see --seed)")
+    files.add_argument("--real-list", metavar="LIST", help="a text file with one real file per line (whole lines starting with # are comments; absolute paths, or relative to the directory the command is run from), instead of or after the files of --real")
     files.add_argument("--output-hdf5-file", required=True, metavar="FILE.hdf5", help="the HDF5 file to write (overwritten)")
-    files.add_argument("--max-events", type=int, default=None, metavar="N", help="stop after N merged events (testing)")
+    files.add_argument("--max-events", type=int, default=None, metavar="N", help="stop after N merged events (testing); with --rotations each orientation of a gamma counts as one event, so the last gamma may be written in only some of them")
     how = parser.add_argument_group("the signal")
     how.add_argument("--signal", choices=SIGNAL_MODES, default="true-signal", help="where the signal of a gamma comes from: its modelled true signal (ordinary simtel files) or the raw ADC of a noise-free simtel file (default: true-signal)")
     how.add_argument("--tel", type=int, default=1, metavar="ID", help="telescope number in the simtel files (default: 1)")
+    how.add_argument("--rotations", type=int, nargs="+", default=[0], metavar="DEG", choices=rotation.ROTATIONS,
+                     help="the orientations in which every gamma is written, among 0, 120 and 240 degrees (default: 0): `--rotations 0 120 240` writes each gamma three times, "
+                          "its signal and its truth (azimuth, altitude, core, true image, true-signal tables, kept simulated alpha) turned about the optical axis, on three DIFFERENT real pedestal events "
+                          "(the noise is not turned, each copy takes the next pedestal event); the table merge/event/telescope/tel_001 has a `rotation` column. Needs the pointing and the telescope position of "
+                          "the simtel header. The copies are not new showers: for training, not for an efficiency (the number of simulated showers does not change)")
+    how.add_argument("--loop-gammas", action="store_true",
+                     help="when the gammas run out before the real pedestal events (e.g. 17 000 gammas and 100 000 pedestals), start again from the first gamma, each time on new pedestal events, until the pedestals "
+                          "run out (the end, not an error) or --max-events is reached (required with --seed, whose pool never runs out). The same gamma then meets different noise: "
+                          "`sim_event_id` repeats in the merge table. Without it the merge stops with the gammas")
     extra = parser.add_argument_group("extra content")
     noise_group = parser.add_argument_group("the real noise")
-    noise_group.add_argument("--seed", type=int, default=None, metavar="N", help="pair each gamma with a real pedestal event drawn AT RANDOM from N (reproducible: the same N and the same real files give the same pairs) instead of in order: the whole pool of pedestal events is shuffled and each is used once before any is used again; slower with FITS files (events are read by position by 4 processes: about 18 ms per gamma instead of 40), no extra cost with files converted by `triggerkit-convert --waveform r0 --no-emulated --pedestal-only`; more gammas than pedestals is fine, they are reused evenly")
+    noise_group.add_argument("--seed", type=int, default=None, metavar="N", help="pair each merged event (each gamma, or each orientation of a gamma with --rotations) with a real pedestal event drawn AT RANDOM from N (reproducible: the same N and the same real files give the same pairs) instead of in order: the whole pool of pedestal events is shuffled and each is used once before any is used again; slower with FITS files (events are read by position by 4 processes: about 18 ms per gamma instead of 40), no extra cost with files converted by `triggerkit-convert --waveform r0 --no-emulated --pedestal-only`; more gammas than pedestals is fine, they are reused evenly")
     extra.add_argument("--keep-simulated-alpha", action="store_true", help="also write the r0alpha of the simulation AS SIMULATED (merge/event/simulated_r0alpha): unshifted, in its own window (the samples of the simtel file), the FADC of its raw r0 with the pedestal stored in its file; about 15 kB per event")
     extra.add_argument("--also-noise-alone", action="store_true", help="also write the alpha of each real event WITHOUT the gamma (merge/event/noise_alpha), same noise, for paired comparisons")
     extra.add_argument("--true-signal", action="store_true", help="also write the gamma ALONE in the window of the real event: true_signal_r0_alpha, true_signal_fadc and pe_count per patch and sample (table true_signal, the patch columns of triggerkit-convert --true-signal plus has_pe_count). With --signal r0 these come from the r0 of the simulation minus the pedestal stored in its file (0 for a production with FADC_PEDESTAL 0) and shifted (a warning says so), not from a reconstruction from the photoelectrons")
@@ -558,11 +680,21 @@ def main(argv=None):
         parser.error(f"--max-events must be at least 1 (or left out for all the events), got {args.max_events}")
     if args.seed is not None and args.seed < 0:
         parser.error(f"--seed must be >= 0, got {args.seed}")
+    if args.loop_gammas and args.seed is not None and args.max_events is None:
+        parser.error("--loop-gammas with --seed never ends (the pool of pedestal events is shuffled again and again): give --max-events")
+    try:
+        rotation.check_rotations(args.rotations)
+        args.simtel, args.real = join_files(args.simtel, args.simtel_list), join_files(args.real, args.real_list)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
+    if not args.simtel or not args.real:
+        parser.error("give the simulated files (--simtel and / or --simtel-list) and the real files (--real and / or --real-list)")
     for path in (*args.simtel, *args.real):
         if not os.path.exists(path):
             parser.error(f"{path}: no such file")
     n = merge(args.simtel, args.real, args.output_hdf5_file, signal=args.signal, also_noise_alone=args.also_noise_alone, stages=args.stages, stack_stages=args.stack_stages,
-              true_signal=args.true_signal, max_events=args.max_events, tel=args.tel, keep_simulated_alpha=args.keep_simulated_alpha, seed=args.seed)
+              true_signal=args.true_signal, max_events=args.max_events, tel=args.tel, keep_simulated_alpha=args.keep_simulated_alpha, seed=args.seed, rotations=args.rotations,
+              loop_gammas=args.loop_gammas)
     print(f"{n} merged events written to {args.output_hdf5_file}")
 
 

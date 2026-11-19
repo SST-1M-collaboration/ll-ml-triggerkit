@@ -64,6 +64,7 @@ samples, -1 where undefined).
 import json
 import os
 import re
+import warnings
 from dataclasses import dataclass
 from typing import Optional
 
@@ -77,6 +78,7 @@ from triggerkit.FileIO.FileOpenerCTAO import (
     SimTelTFDatasetConfig,
 )
 from triggerkit.Stages.OrMerge import OrMerge
+from triggerkit.Stages.TrainableThreshold import CHAIN_LOCK, chain_fired
 from triggerkit.Stages.TrainSoftMaxPool2D import TrainSoftMaxPool2D
 from triggerkit.Statistics.H5StatsWriter import H5StatsWriter
 
@@ -166,6 +168,43 @@ def _crop(wf, starts, length):
     idx = starts[:, None] + np.arange(length)[None, :]
     idx = np.broadcast_to(idx[:, None, :], (n, n_pix, length))
     return np.take_along_axis(wf, idx, axis=2)
+
+
+
+def _publish_together(writers):
+    """Publish the ``.partial`` files of ``writers`` onto their final paths as one step: the files they replace are first set aside (``<path>.previous``); if a
+    rename fails half way, the stages already published are taken back and the old files restored, so the folder never holds new files of some stages
+    and old ones of others. The set-aside files are removed once every stage is published (a file that cannot be removed then is only warned about:
+    the new files are published). A ``.previous`` left by a run killed in the middle of this step is treated as the old file of its stage (if the run was killed BETWEEN the renames and the next run fails, the restore brings back that mixed state: rare, and the files are then to be made again)."""
+    previous = {}
+    try:
+        for writer in writers:
+            final, old = writer.final_path, writer.final_path + ".previous"
+            if os.path.exists(final):
+                os.replace(final, old)
+                previous[final] = old
+            elif os.path.exists(old):
+                previous[final] = old           # the old file a killed run had set aside: restored or removed with the others
+        for writer in writers:
+            writer.publish()
+    except BaseException:
+        for writer in writers:
+            try:
+                if writer.final_path in previous:
+                    os.replace(previous[writer.final_path], writer.final_path)      # the old file back (over a new one already published)
+                elif os.path.exists(writer.final_path) and not os.path.exists(writer.path):
+                    os.remove(writer.final_path)                                   # published by this call, no old file to restore: taken back
+            except OSError as exc:                                                 # the restore must not hide the error that made it necessary
+                warnings.warn(f"could not restore {writer.final_path!r} after a failed publication: {exc}", RuntimeWarning, stacklevel=2)
+        raise
+    for old in previous.values():
+        try:
+            os.remove(old)
+        except OSError as exc:
+            try:
+                warnings.warn(f"the new statistics files are published, but the old {old!r} could not be removed: {exc}", RuntimeWarning, stacklevel=2)
+            except Exception:                                                      # ``-W error``: the files ARE published, a warning must not turn that into a failure
+                pass
 
 
 class TriggerCascade:
@@ -376,8 +415,9 @@ class TriggerCascade:
 
     def _fire_mask(self, stage, wf, ped):
         """Boolean (B,) mask: which events this stage fires on."""
-        out = stage.model(self._pack_inputs(stage, wf, ped), training=False)
-        return _collapse_to_event(out) > 0.5
+        with CHAIN_LOCK:                                # the call and the decision on its score are one step (the score is an attribute of the layer)
+            out = stage.model(self._pack_inputs(stage, wf, ped), training=False)
+            return chain_fired(stage.model, out)        # the threshold's comparison of its score, not a soft output against 0.5
 
     def _pre_threshold_model(self, stage):
         """Keras model outputting the stage's score just before its last threshold."""
@@ -409,9 +449,10 @@ class TriggerCascade:
     def _run_stage(self, k, inputs):
         """Fire mask, pre-threshold score and trigger time (in the stage's window) of stage ``k``."""
         model, thr, has_score, has_map = self._probe(k)
-        res = model(inputs, training=False)
-        res = res if isinstance(res, (list, tuple)) else [res]
-        fired = _collapse_to_event(res[0]) > 0.5
+        with CHAIN_LOCK:
+            res = model(inputs, training=False)
+            res = res if isinstance(res, (list, tuple)) else [res]
+            fired = chain_fired(self.stages[k].model, res[0])      # the threshold layers are the stage's own: their last score is this call's
         n = fired.shape[0]
         score = (_collapse_to_event(res[1]).astype(np.float32) if has_score
                  else np.full(n, np.nan, np.float32))
@@ -651,8 +692,7 @@ class TriggerCascade:
                 gamma_files, nsb_files, 0, config, max_nsb_events, writers)
             for writer in writers:
                 writer.close(window_sec=ws, publish=False)
-            for writer in writers:                       # published one after the other only when every stage is written: a failure before leaves the old files untouched
-                writer.publish()
+            _publish_together(writers)                   # only when every stage is written, and all or none: a failure leaves the old files untouched
         except BaseException:
             for writer in writers:                       # never leave partial files behind (the writers work on <path>.partial: a previous file is kept)
                 writer.abort()

@@ -25,6 +25,7 @@ The alignment itself is applied by ``TriggerDataset``; this module only describe
 """
 import glob
 import os
+import warnings
 from dataclasses import dataclass
 from typing import Optional, Sequence, Union
 
@@ -59,8 +60,27 @@ def expand_files(files, *, name="files"):
     return out
 
 
+def copies_of_showers(h5file):
+    """``(orientations, passes)`` of an open HDF5 file: how many orientations each shower is written in (``triggerkit-convert --rotations``, ``triggerkit-merge --rotations``) and how many
+    times the whole set of gammas was used (``triggerkit-merge --loop-gammas``). ``(1, 1)`` for an ordinary file. The copies are not new showers: the number of simulated showers
+    does not change, so an efficiency (triggered / simulated) counted on the copies is too high by ``orientations * passes`` unless the denominator is scaled."""
+    import numpy as np
+
+    if "simulation/event/subarray/rotation" in h5file:
+        return len(np.unique(h5file["simulation/event/subarray/rotation"]["rotation"])), 1
+    if "merge/event/telescope/tel_001" in h5file:
+        table = h5file["merge/event/telescope/tel_001"]
+        if "rotation" in table.dtype.names:
+            rotations = len(np.unique(table["rotation"]))
+            rows = table.shape[0]
+            distinct = len(np.unique(np.stack([table["sim_file"], table["sim_event_id"]], axis=1), axis=0)) if rows else 0
+            passes = max(1, int(round(rows / (rotations * distinct)))) if distinct else 1
+            return rotations, passes
+    return 1, 1
+
+
 def read_n_simulated(files):
-    """Showers simulated for ``files``: the sum of ``n_showers * shower_reuse`` of each file's ``configuration/simulation/run`` table.
+    """Showers simulated for ``files``: the sum of ``n_showers * shower_reuse`` of each file's ``configuration/simulation/run`` table, times the number of orientations a file holds each shower in (``--rotations``).
 
     This is the denominator of "triggered / simulated": the events WRITTEN are only those that passed the simulation's own selection
     (a minimum of photons / photo-electrons), so they are a fraction of it.
@@ -74,12 +94,22 @@ def read_n_simulated(files):
             if "configuration/simulation/run" not in f:
                 raise KeyError(f"{path}: no configuration/simulation/run table, give n_simulated by hand.")
             run = f["configuration/simulation/run"][0]
-            total += int(run["n_showers"]) * int(run["shower_reuse"])
+            total += int(run["n_showers"]) * int(run["shower_reuse"]) * copies_of_showers(f)[0]
     return total
 
 
+def warn_if_rotated(h5file, path):
+    """Warn when an open HDF5 file holds each shower several times (orientations, or passes of ``--loop-gammas``): the copies are not new showers, so a count of showers that ignores it is too high."""
+    orientations, passes = copies_of_showers(h5file)
+    if orientations * passes > 1:
+        warnings.warn(f"{path} holds each shower {orientations * passes} times ({orientations} orientation(s) x {passes} pass(es) over the gammas: triggerkit-convert / triggerkit-merge --rotations, "
+                      f"--loop-gammas): the copies are not new showers, so an efficiency (triggered / simulated) counted on this file is too high by a factor {orientations * passes} unless the "
+                      "denominator is scaled (the statistics scale it for the orientations of a file with a run table, and refuse a file made with --loop-gammas). Such a file is for training.",
+                      UserWarning, stacklevel=3)
+
+
 def count_written(files, tel_id_only=None):
-    """Events recorded in ``files``: rows of the waveform table (r0alpha, else r0, else r1) of ``tel_id_only`` (all telescopes if ``None``)."""
+    """Events recorded in ``files``: rows of the waveform table (r0alpha, else r0, else r1) of ``tel_id_only`` (all telescopes if ``None``). A file holding several orientations of each shower (``triggerkit-convert --rotations``) gives a ``UserWarning``: its efficiency would be too high."""
     import h5py
     import hdf5plugin  # noqa: F401
 
@@ -89,9 +119,97 @@ def count_written(files, tel_id_only=None):
             from triggerkit.FileIO import layout
             layout.check_file(path)                      # a file of the old layout is refused, not counted: it would not be read, and the efficiency would divide by it
             group = f[layout.group_name(layout.waveform_tables(f)[0])]
+            warn_if_rotated(f, path)
             names = [f"tel_{int(tel_id_only):03d}"] if tel_id_only is not None else list(group)
             total += sum(group[name].shape[0] for name in names if name in group)
     return total
+
+
+def _copies_of_file(path):
+    import h5py
+    import hdf5plugin  # noqa: F401
+
+    with h5py.File(path, "r") as f:
+        return copies_of_showers(f)
+
+
+def denominators_by_file(source, tel_id_only=None, ignore_errors=False):
+    """Events written and showers simulated, file by file, for the files of a :class:`Source`, read BEFORE its events are.
+
+    Returns ``{"rows": [(path, written, simulated)], "failed": [(path, reason)], "simulated_error": None or str}``:
+
+    - ``simulated`` is ``None`` when it is not read from the files: given by hand (``n_simulated``), a NSB aligned by a trigger, or a file
+      without a run table (``simulated_error`` then says why the total is not known, as :meth:`Source.simulated` would);
+    - ``simulated`` already counts the orientations of a file written with ``--rotations`` (:func:`read_n_simulated`); ``"orientations"`` gives them per file, for a total given by hand;
+      a file made with ``triggerkit-merge --loop-gammas`` is refused (``ValueError``);
+    - ``failed`` lists the files that cannot be opened (``ignore_errors=True``); with ``ignore_errors=False`` the first one raises a
+      :class:`~triggerkit.FileIO.AsyncFileOpener.FileReadError` (the error of a file that cannot be read), before anything is read.
+    """
+    from triggerkit.FileIO.AsyncFileOpener import FileReadError
+
+    given = source.n_simulated is not None
+    simulated_error = None
+    if not given and getattr(source, "align", None) == "given":
+        try:
+            source.simulated()
+        except ValueError as exc:
+            simulated_error = str(exc)
+    read_simulated = not given and simulated_error is None
+    rows, failed, orientations = [], [], {}
+    for path in source.files:
+        path = str(path)
+        try:
+            written = count_written([path], tel_id_only)
+            orientations[path], passes = _copies_of_file(path)
+            if passes > 1:
+                raise ValueError(f"{path} was made with triggerkit-merge --loop-gammas (each gamma used {passes} times on different noise): the number of showers simulated is not defined for it, "
+                                 "so an efficiency cannot be counted on it. Use it for training, or merge again without --loop-gammas.")
+            simulated = None
+            if read_simulated:
+                try:
+                    simulated = read_n_simulated([path])
+                except KeyError as exc:
+                    simulated_error = simulated_error or str(exc)
+        except OSError as exc:
+            if not ignore_errors:
+                raise FileReadError(f"{source.particle} file {path!r} cannot be opened ({exc}); with ignore_errors=True it would be left out "
+                                    "of the read and of the denominators") from exc
+            failed.append((path, f"{type(exc).__name__}: {exc}".splitlines()[0]))
+            continue
+        rows.append((path, int(written), simulated))
+    return {"rows": rows, "failed": failed, "simulated_error": simulated_error, "orientations": orientations}
+
+
+def kept_denominators(source, by_file, skipped):
+    """``(written, simulated)`` of a :class:`Source` without what was not read: the files that could not be opened (``by_file["failed"]``, see
+    :func:`denominators_by_file`) and the rest of the files the reader skipped (``skipped``: ``{path: events read before the error}``).
+
+    A file read up to its event ``k`` of ``n`` counts ``k`` written events and ``k / n`` of its simulated showers (its first events stand for
+    all of it, the assumption a budget already makes). A total given by hand (``n_simulated``) is scaled by the mean of these fractions over
+    every file, which assumes the files hold the same number of showers each (true for the productions). ``simulated`` is ``None`` when
+    ``by_file["simulated_error"]`` is set. A total given by hand is also multiplied by the number of orientations the files hold each shower in (``by_file["orientations"]``; files that
+    disagree raise ``ValueError``): the events written are those of every orientation, the showers simulated are counted once.
+    """
+    written, simulated, fraction_sum = 0, 0.0, 0.0
+    for path, n_written, n_simulated in by_file["rows"]:
+        read = skipped.get(path)
+        kept = n_written if read is None else min(int(read), n_written)
+        fraction = 1.0 if read is None else (kept / n_written if n_written > 0 else 0.0)
+        written += kept
+        fraction_sum += fraction
+        if n_simulated is not None:
+            simulated += n_simulated * fraction
+    if by_file["simulated_error"] is not None:
+        return written, None
+    if source.n_simulated is not None:
+        n_files = len(by_file["rows"]) + len(by_file["failed"])
+        complete = not by_file["failed"] and not any(path in skipped for path, _, _ in by_file["rows"])
+        factors = set(by_file.get("orientations", {}).values()) or {1}
+        if len(factors) > 1:
+            raise ValueError(f"the files of the {source.particle} source hold the showers in different numbers of orientations ({sorted(factors)}): a total given by hand cannot be scaled")
+        total = int(source.n_simulated) * factors.pop()                  # the showers counted by hand, once per orientation they are written in
+        return written, total if complete else int(round(total * fraction_sum / n_files))
+    return written, int(round(simulated))
 
 
 @dataclass

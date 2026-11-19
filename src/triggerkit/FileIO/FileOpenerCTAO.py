@@ -68,8 +68,14 @@ class SimTelTFDatasetConfig:
     # a window (see interleave_max_concurrent_files), NOT the classes: a file is picked,
     # not a label, so one NSB file among many gamma files is only ~1 draw in 8. With
     # load_ram the cached split is therefore permuted once after loading (see
-    # _permute_cached_split); the streaming path (load_ram=False) is not.
+    # _permute_cached_split); the streaming path (load_ram=False) mixes the classes with
+    # interleave_labels (below).
     interleave_files: bool = True
+
+    # With interleave_files, mix the CLASSES too (streaming path, load_ram=False): each draw first picks a label, with a probability proportional to what is left of its
+    # cap (an uncapped label counts as the mean of the capped ones), then one of that label's open files. Without it, a file is picked: 6 noise files among 158 shower files
+    # give long runs of one class (a training epoch that is mostly protons, then mostly gammas, the NSB only now and then: batches without NSB, an unstable loss).
+    interleave_labels: bool = True
 
     # Cap on how many files (each an AsyncFileOpenerProcess subprocess + Queue)
     # are open at once when interleave_files=True. Previously every file in
@@ -84,8 +90,8 @@ class SimTelTFDatasetConfig:
     # Which waveform to use: "r0" or "r1"
     waveform_level: str = "r0"  # "r0" or "r1"
 
-    # If set, keep only this tel_id for gamma files (label=1)
-    gamma_tel_id_only: Optional[int] = 2
+    # If set, keep only this tel_id for the shower files (gamma, proton, muon); 1 is the one telescope of the converted SST-1M files
+    gamma_tel_id_only: Optional[int] = 1
 
     # -------- NEW: gamma filter by n_pe --------
     # Keep gamma only if (n_pe_min < n_pe < n_pe_max), when bounds are set.
@@ -197,14 +203,17 @@ class SimTelTFDataset:
         # the HDF5 files must be readable by the loader: refused here, for the training and for the statistics alike, because the readers below run under ignore_errors and would only
         # skip a file of the old layout (an r0 of 432 patches) with a warning
         from triggerkit.FileIO import layout
+        real_nsb = set(self.nsb_files) if self.cfg.real_noise is not None else set()      # read by RealNoiseOpener from their raw r0, the same alpha at both levels: no r1 needed
         for path in self.file_list:
             if str(path).endswith((".h5", ".hdf5")) and os.path.exists(path):
                 try:
-                    layout.check_file(path, self.cfg.waveform_level)
+                    layout.check_file(path, "r0" if path in real_nsb else self.cfg.waveform_level)
                 except OSError:
                     pass                    # not an HDF5 file / unreadable: the reader's ignore_errors decides (a FileReadError, or a warning and a skipped file); a ValueError (layout) is raised here
-        # global quota trackers {label: events still allowed or None}, set/reset in dataset()
+        # quota trackers {label: events still allowed or None} of the RAM loader, set/reset in dataset() (a streaming pass has its own)
         self._quota: Dict[int, Optional[int]] = {}
+        #: the files the reader skipped under ignore_errors: {path: {"label", "events" read before the error, "reason"}}
+        self.skipped_files: Dict[str, Dict[str, Any]] = {}
         self._labels_present = sorted(
             ([1] if self.gamma_files else []) + ([0] if self.nsb_files else []) + list(self.extra_files))
 
@@ -228,9 +237,13 @@ class SimTelTFDataset:
         zero-step progress bar. Only the load_ram path was immune, because it
         caches everything in RAM.
         """
+        self._quota = self._fresh_quotas()
+
+    def _fresh_quotas(self) -> Dict[int, Optional[int]]:
+        """``{label: events allowed (None: no cap)}``, full."""
         caps = {1: self.cfg.max_gamma_samples_total, 0: self.cfg.max_nsb_samples_total}
         caps.update(self.cfg.max_samples_by_label or {})
-        self._quota = {int(label): (None if cap is None else int(cap)) for label, cap in caps.items()}
+        return {int(label): (None if cap is None else int(cap)) for label, cap in caps.items()}
 
     def dataset(self) -> tf.data.Dataset:
         self._reset_quotas()
@@ -255,26 +268,45 @@ class SimTelTFDataset:
             ds = self._maybe_apply_nsb_roll(ds)
             return ds.prefetch(tf.data.AUTOTUNE)
 
+        def one_pass(pairs, pass_rng, quota):
+            if self.cfg.interleave_files and self.cfg.interleave_labels:
+                yield from self._label_interleaved_files(pairs, pass_rng, quota)
+            elif self.cfg.interleave_files:
+                yield from self._interleaved_files(pairs, pass_rng, quota)
+            else:
+                for filepath, label in pairs:
+                    yield from self._iter_one_file(filepath, label, pass_rng, quota)
+
         def infinite_generator() -> Iterator[Tuple[Dict[str, np.ndarray], np.ndarray]]:
-            # every pass starts from full quotas, so the stream is re-iterable
-            self._reset_quotas()
+            # every pass starts from full quotas of ITS OWN, so the stream is re-iterable, and two iterators open at the same time (the
+            # training epoch and a callback that takes a sample, with prefetching) do not eat each other's events
+            quota = self._fresh_quotas()
             pass_rng = np.random.default_rng(self.cfg.seed) if self.cfg.reseed_each_pass else rng      # validation: the same draws at every pass, so a capped subset is the same
             while True:
-                if self._quotas_exhausted():
+                if self._quotas_exhausted(quota):
                     break
                 pairs = list(file_label_pairs)
                 if self.cfg.shuffle_files:
                     pass_rng.shuffle(pairs)
 
-                if self.cfg.interleave_files:
-                    yield from self._interleaved_files(pairs, pass_rng)
-                else:
-                    for filepath, label in pairs:
-                        yield from self._iter_one_file(filepath, label, pass_rng)
+                yielded = 0
+                stream = one_pass(pairs, pass_rng, quota)
+                try:
+                    for item in stream:
+                        yielded += 1
+                        yield item
+                finally:
+                    stream.close()          # an abandoned stream closes its open file (and its reader process) now
 
                 if not self.cfg.repeat:
                     break
-                if self._quotas_exhausted():
+                if self._quotas_exhausted(quota):
+                    break
+                if yielded == 0:
+                    # with repeat=True a pass that gives nothing (every file failed under ignore_errors, or the filters keep no event) would
+                    # start again forever without a word
+                    warnings.warn(f"a whole pass over the {len(pairs)} file(s) gave no event (every file failed or the filters keep none of its "
+                                  "events): the stream ends here instead of starting again forever", RuntimeWarning, stacklevel=2)
                     break
 
         ds = tf.data.Dataset.from_generator(
@@ -408,6 +440,7 @@ class SimTelTFDataset:
         self,
         pairs: List[Tuple[str, int]],
         rng: np.random.Generator,
+        quota: Optional[Dict[int, Optional[int]]] = None,
     ) -> Iterator[Tuple[Dict[str, np.ndarray], np.ndarray]]:
         """
         Pull samples from multiple files in a random round-robin fashion to avoid
@@ -424,12 +457,12 @@ class SimTelTFDataset:
         def _refill():
             while backlog and len(active_streams) < max_active:
                 fp, lbl = backlog.pop(0)
-                active_streams.append(self._iter_one_file(fp, lbl, rng))
+                active_streams.append(self._iter_one_file(fp, lbl, rng, quota))
 
         _refill()
         try:
             while active_streams:
-                if self._quotas_exhausted():
+                if self._quotas_exhausted(quota):
                     break
                 idx = int(rng.integers(len(active_streams))) if len(active_streams) > 1 else 0
                 try:
@@ -446,6 +479,51 @@ class SimTelTFDataset:
             # __exit__ right away.
             for stream in active_streams:
                 stream.close()
+
+    def _label_interleaved_files(
+        self,
+        pairs: List[Tuple[str, int]],
+        rng: np.random.Generator,
+        quota: Optional[Dict[int, Optional[int]]] = None,
+    ) -> Iterator[Tuple[Dict[str, np.ndarray], np.ndarray]]:
+        """Like :meth:`_interleaved_files`, but the next event comes from a label drawn with a probability proportional to what is left of its cap, then from one of the open
+        files of that label (at most ``interleave_max_concurrent_files`` open in all, shared among the labels). A label whose files are all read, or whose cap is used up, leaves
+        the draw; the pass ends when none is left."""
+        by_label: Dict[int, List[str]] = {}
+        for filepath, label in pairs:
+            by_label.setdefault(int(label), []).append(filepath)
+        per_label = max(1, int(self.cfg.interleave_max_concurrent_files) // max(1, len(by_label)))
+        backlog = {label: list(files) for label, files in by_label.items()}
+        active: Dict[int, List[Iterator]] = {label: [] for label in by_label}
+
+        def _refill(label):
+            while backlog[label] and len(active[label]) < per_label:
+                active[label].append(self._iter_one_file(backlog[label].pop(0), label, rng, quota))
+
+        for label in by_label:
+            _refill(label)
+        try:
+            while True:
+                if self._quotas_exhausted(quota):
+                    break
+                labels = [label for label in active if active[label] and not self._quota_exhausted_label(label, quota)]
+                if not labels:
+                    break
+                remaining = [(quota or {}).get(label) for label in labels]
+                known = [r for r in remaining if r is not None]
+                fallback = float(np.mean(known)) if known else 1.0
+                weights = np.array([float(fallback if r is None else r) for r in remaining])
+                label = labels[int(rng.choice(len(labels), p=weights / weights.sum()))] if len(labels) > 1 else labels[0]
+                idx = int(rng.integers(len(active[label]))) if len(active[label]) > 1 else 0
+                try:
+                    yield next(active[label][idx])
+                except StopIteration:
+                    active[label].pop(idx)
+                    _refill(label)
+        finally:
+            for streams in active.values():
+                for stream in streams:
+                    stream.close()
 
     def _one_pass_stream(
         self,
@@ -569,6 +647,7 @@ class SimTelTFDataset:
         simtel_file: str,
         label: int,
         rng: np.random.Generator,
+        quota: Optional[Dict[int, Optional[int]]] = None,
     ) -> Iterator[Tuple[Dict[str, np.ndarray], np.ndarray]]:
         """Stream one file; a file that cannot be read costs only itself.
 
@@ -576,15 +655,33 @@ class SimTelTFDataset:
         then end the WHOLE dataset. So a FileReadError is confined here: with
         ignore_errors the rest of that file is skipped (the opener already
         warned loudly) and the other files keep streaming; otherwise it raises.
+
+        A skipped file is recorded in ``self.skipped_files`` ``{path: {"label", "events", "reason"}}``, ``events`` being the events it gave
+        before the error (the rolled NSB copies of an event count once): the statistics take it out of their denominators.
         """
+        events, last = 0, None
         try:
-            yield from self._iter_one_file_unguarded(simtel_file, label, rng)
+            for item in self._iter_one_file_unguarded(simtel_file, label, rng, quota):
+                key = (int(item[0]["event_id"]), int(item[0]["tel_id"]))
+                if key != last:
+                    events, last = events + 1, key
+                yield item
         except FileReadError as exc:
             if not self.cfg.ignore_errors:
                 raise
+            self.skipped_files[simtel_file] = {"label": int(label), "events": events, "reason": str(exc).splitlines()[0]}
             warnings.warn(
                 f"ignore_errors=True: skipping the unread rest of {simtel_file!r} "
                 f"and continuing with the other files ({str(exc).splitlines()[0]})",
+                RuntimeWarning, stacklevel=2)
+        except Exception as exc:
+            # any other error would kill the generator, and tf.data's ignore_errors would then end the whole dataset WITHOUT a word: say it, and skip only this file
+            if not self.cfg.ignore_errors:
+                raise
+            self.skipped_files[simtel_file] = {"label": int(label), "events": events, "reason": f"{type(exc).__name__}: {exc}".splitlines()[0]}
+            warnings.warn(
+                f"ignore_errors=True: unexpected {type(exc).__name__} while reading {simtel_file!r}, skipping the rest of this file and continuing with "
+                f"the other files: {exc}",
                 RuntimeWarning, stacklevel=2)
 
     def _iter_one_file_unguarded(
@@ -592,9 +689,10 @@ class SimTelTFDataset:
         simtel_file: str,
         label: int,
         rng: np.random.Generator,
+        quota: Optional[Dict[int, Optional[int]]] = None,
     ) -> Iterator[Tuple[Dict[str, np.ndarray], np.ndarray]]:
         # bail out early if this label quota is already exhausted
-        if self._quota_exhausted_label(label):
+        if self._quota_exhausted_label(label, quota):
             return
 
         # This is the only opener_cls call site that knows upfront exactly what
@@ -619,6 +717,8 @@ class SimTelTFDataset:
             opener_cls = RealNoiseOpener                  # the NSB files are real files: their pedestal events
         if getattr(opener_cls, "accepts_native_waveform", False):
             opener_kwargs["native_waveform"] = True        # the waveform is cast to uint16 below: no need to send it as float32
+        tel_filter = int(self.cfg.gamma_tel_id_only) if label != 0 and self.cfg.gamma_tel_id_only is not None else None
+        tels_seen, tel_kept = set(), False                 # a telescope filter that matches nothing in the file must not drop its showers silently
         with opener_cls(
             simtel_file,
             waveform_level=self.cfg.waveform_level,
@@ -632,7 +732,7 @@ class SimTelTFDataset:
                 tel_ids_list, wf_r0_list, wf_r1_list, dl0_list, dl1_list, true_image_list,
                 peak_time_list, pedestal_per_sample_list, event_stat_list, i_event
             ) in fo:
-                if self._quota_exhausted_label(label):
+                if self._quota_exhausted_label(label, quota):
                     break
 
                 if not event_stat_list:
@@ -659,9 +759,11 @@ class SimTelTFDataset:
                     tel_id_i = int(tel_id)
 
                     # tel_id filter of the shower types (gamma, proton, muon), not of the NSB
-                    if label != 0 and self.cfg.gamma_tel_id_only is not None:
-                        if tel_id_i != int(self.cfg.gamma_tel_id_only):
+                    if tel_filter is not None:
+                        tels_seen.add(tel_id_i)
+                        if tel_id_i != tel_filter:
                             continue
+                        tel_kept = True
 
                     sd = stats_by_tel.get(tel_id_i, ev0)
 
@@ -720,6 +822,8 @@ class SimTelTFDataset:
                             pt_arr = np.asarray(pt_list[i_tel], dtype=np.float32)
                         if pt_arr is None or pt_arr.shape != (n_pix,):
                             pt_arr = np.zeros(n_pix, dtype=np.float32)
+                        if merged_signal is not None:                  # a merged row: the peak of the simulation's own waveform is not where the shifted signal sits, take it from the merged waveform
+                            pt_arr = np.argmax(x[0], axis=-1).astype(np.float32)
 
                     ts_arr = None
                     if self.cfg.emit_true_signal:
@@ -781,10 +885,10 @@ class SimTelTFDataset:
                 
                     # Yield original
                     if label != 0:  # a shower (gamma, proton, muon)
-                        if self._consume_quota(label):
+                        if self._consume_quota(label, quota):
                             yield make_features(x, ped_arr), y
                     else:
-                        if not self.cfg.nsb_skip_original_events and self._consume_quota(label):
+                        if not self.cfg.nsb_skip_original_events and self._consume_quota(label, quota):
                             yield make_features(x, ped_arr), y
 
                     if label == 0 and self.cfg.nsb_roll_copies > 0:
@@ -806,13 +910,17 @@ class SimTelTFDataset:
                                 pt_aug = np.roll(pt_aug, shift=1, axis=0).copy()
                             if ts_aug is not None:
                                 ts_aug = np.roll(ts_aug, shift=1, axis=0).copy()
-                            if self._consume_quota(label):
+                            if self._consume_quota(label, quota):
                                 yield make_features(wf_aug, ped_aug, ti_aug, pt_aug, ts_aug), y
                             else:
                                 break
 
-                if self._quota_exhausted_label(label):
+                if self._quota_exhausted_label(label, quota):
                     break
+        if tel_filter is not None and tels_seen and not tel_kept:
+            warnings.warn(
+                f"{simtel_file!r}: no event of telescope {tel_filter} (tel_id_only / gamma_tel_id_only), the file holds telescope(s) {sorted(tels_seen)}: "
+                f"none of its showers is read", RuntimeWarning, stacklevel=2)
 
     def _output_signature(self):
         feat = {
@@ -888,19 +996,22 @@ class SimTelTFDataset:
         return (feat_vals, tf.constant(0, tf.int32))
 
     # ---------- Global quota helpers ----------
-    def _consume_quota(self, label: int) -> bool:
-        remaining = self._quota.get(int(label))
+    # ``quota`` is the pass's own ``{label: events still allowed}`` (a streaming pass has one, see dataset()); None: the dataset's
+    # ``self._quota`` (the RAM loader, which reads once)
+    def _consume_quota(self, label: int, quota: Optional[Dict[int, Optional[int]]] = None) -> bool:
+        quota = self._quota if quota is None else quota
+        remaining = quota.get(int(label))
         if remaining is None:
             return True
         if remaining <= 0:
             return False
-        self._quota[int(label)] = remaining - 1
+        quota[int(label)] = remaining - 1
         return True
 
-    def _quota_exhausted_label(self, label: int) -> bool:
-        remaining = self._quota.get(int(label))
+    def _quota_exhausted_label(self, label: int, quota: Optional[Dict[int, Optional[int]]] = None) -> bool:
+        remaining = (self._quota if quota is None else quota).get(int(label))
         return remaining is not None and remaining <= 0
 
-    def _quotas_exhausted(self) -> bool:
+    def _quotas_exhausted(self, quota: Optional[Dict[int, Optional[int]]] = None) -> bool:
         """Every event type that has files has a cap, and every cap is used up."""
-        return bool(self._labels_present) and all(self._quota_exhausted_label(l) for l in self._labels_present)
+        return bool(self._labels_present) and all(self._quota_exhausted_label(l, quota) for l in self._labels_present)

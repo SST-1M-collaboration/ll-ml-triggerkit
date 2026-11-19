@@ -32,6 +32,7 @@ What a batch holds
   of the real data (50). It is what ``triggerkit-merge`` makes, pixel by pixel, BEFORE the FADC (which is not linear: it clips each triplet sum at 0 and 255). The other features
   (``n_pe``, energy, core, ``true_image``) are those of the simulation. With ``targets=("class", "true_signal")`` the ``true_signal`` of the batch is the gamma alone in that
   window (the sum of the 3 pixels of each patch), moved like the signal that was added.
+* Every SHOWER type the training reads or watches (``proton`` and ``muon`` as well as ``gamma``, with ``train_on`` / ``watch``) is merged the same way, on the same pool, and keeps its own label and ``features["particle"]``: a merged proton is a row of label 0, a muon one of label 0 or 1 (``positive_types``). Their files must also be converted with ``--true-signal`` (or ``--waveform r0`` for ``signal="r0"``).
 
 Which noise a gamma gets
 ------------------------
@@ -73,9 +74,9 @@ Limits
   correlations. A warning is given; pass ``nsb_roll=False``.
 * The pool lives in the memory of the process, as raw pixels: 130 kB per pedestal event (a night file: 871 events, 113 MB), against 78 kB per event on disk (zlib).
 * The merge adds about 0.37 ms per gamma (pixel level, measured on the GPU box after the cache of ``sst1m.patch_triplets``; 1.9 ms before). A patch-level addition, which no longer exists, is not possible: a real ``r0alpha`` is clipped at 0 by the FPGA, so it cannot be added to exactly.
-* ``features["true_signal"]`` of a batch is a float16, as for every true signal: whole numbers above 2048 are rounded to 2 ADC (2049 gives 2048), which does not matter for the 16 ADC threshold of the maps and does for an exact comparison with ``true_signal_r0_alpha`` of a bright patch.
+* ``features["true_signal"]`` of a batch is a float32 whose values went through a float16 in the reader, as for every true signal: whole numbers above 2048 are rounded to 2 ADC (2049 gives 2048), which does not matter for the 16 ADC threshold of the maps and does for an exact comparison with ``true_signal_r0_alpha`` of a bright patch.
 * A gamma whose whole pulse leaves the window (a large ``max_shift``) is skipped; ``target_sample`` outside the real window is refused at once, and a ``target_sample`` +- ``max_shift`` that can leave it gives a warning.
-* Validation: ``TriggerDataset`` splits the gamma files between training and validation but NOT the NSB (here the pool): training and validation then see the same noise events.
+* Validation: ``TriggerDataset`` splits the gamma files between training and validation but by default NOT the NSB (here the pool): training and validation then see the same noise events. ``TriggerDataset(split_nsb=True)`` splits the real FILES like the gamma files and each split's showers meet only the noise of its own files (several real files needed).
 """
 import os
 import zlib
@@ -128,7 +129,8 @@ class NoisePool:
         self.waveforms = np.ascontiguousarray(chosen["waveform"])
         self.pedestal = np.ascontiguousarray(chosen["pedestal"], dtype=np.float32)
         self.off = (np.asarray(chosen["pixels_flags"]) == 0) if "pixels_flags" in (chosen.dtype.names or ()) else np.zeros(self.pedestal.shape, dtype=bool)
-        self.event_id = np.asarray(chosen["event_id"])
+        self.event_id = np.array(chosen["event_id"])                 # a COPY: a view of the structured array would keep all of it (the raw pixels twice over) alive for as long as the pool lives
+        del chosen
         if self.waveforms.ndim != 3 or self.waveforms.shape[1] != sst1m.N_PIXELS:
             raise ValueError(f"{path}: the raw waveforms have shape {self.waveforms.shape}, expected (events, {sst1m.N_PIXELS}, samples)")
 
@@ -174,6 +176,10 @@ class RealNoise(NsbSet):
         if int(target_sample) < 0 or int(max_shift) < 0 or int(seed) < 0:
             raise ValueError(f"target_sample, max_shift and seed must be >= 0, got {target_sample}, {max_shift} and {seed}")
         self.signal, self.target_sample, self.max_shift, self.seed = signal, int(target_sample), int(max_shift), int(seed)
+
+    def subset(self, files):
+        """A :class:`RealNoise` with the same settings on only ``files`` (the pools are the ones already loaded: nothing is read twice)."""
+        return RealNoise(list(files), signal=self.signal, target_sample=self.target_sample, max_shift=self.max_shift, seed=self.seed)
 
     # ---- the pool
     def pools(self):

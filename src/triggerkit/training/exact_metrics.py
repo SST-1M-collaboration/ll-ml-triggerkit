@@ -7,16 +7,20 @@ batches of the training stream and of the validation set with the model in infer
 
     EXACT epoch=3 train_auc=0.7551 val_auc=0.7569 train_eff1=0.384 val_eff1=0.390 train_n=19200 val_n=19200
 
-``eff1`` is the efficiency on the positives when the cut keeps 1 % of the negatives (the cut only depends on the negatives).
+``eff1`` is the efficiency on the positives when the cut keeps 1 % of the negatives (the cut only depends on the negatives): the achievable cut closest to 1 %
+(:func:`triggerkit.Statistics.metrics.pick_threshold_from_scores`, the rule of the statistics), not a quantile, which undershoots on quantized scores.
 
 The datasets yield ``(inputs, targets)`` with ``targets[output]`` the HARD 0/1 label, ``(B, 1)`` (not the soft target of a weighted training: use
 ``triggerkit.training.eval_targets`` to build them). When ``targets`` also holds ``zone_key`` (1 for a gamma in the n_pe zone of an
 ``NpeWeighting``), the same two numbers are computed for the zone only (the gammas in the zone against all the negatives), named
-``*_zone_auc`` / ``*_zone_eff1``; this is the number to monitor for a model trained on a n_pe range.
+``*_zone_auc`` / ``*_zone_eff1``; this is the number to monitor for a model trained on a n_pe range. A batch with no event is skipped, and a stream with no batch at all gives NaN for the epoch
+(it does not end the training).
 """
 import numpy as np
 from sklearn.metrics import roc_auc_score
 from tensorflow import keras
+
+from triggerkit.Statistics.metrics import pick_threshold_from_scores
 
 
 class ExactMetrics(keras.callbacks.Callback):
@@ -32,7 +36,7 @@ class ExactMetrics(keras.callbacks.Callback):
         if not positives.any() or not negatives.any():
             return float("nan"), float("nan")
         keep = positives | negatives
-        cut = np.quantile(scores[negatives], 0.99)
+        cut, _fraction, _mode = pick_threshold_from_scores(scores[negatives], 0.01, "gt")      # a quantile let 0.63 % of integer-valued negatives through, not 1 %
         return float(roc_auc_score(positives[keep], scores[keep])), float((scores[positives] > cut).mean())
 
     def _score(self, dataset):
@@ -40,10 +44,15 @@ class ExactMetrics(keras.callbacks.Callback):
         for x, y in dataset.take(self.batches):
             # a compiled call, not ``self.model(x)``: the eager call of the quantized hexagonal layers re-materializes their kernels op by op and failed at
             # random on the GPU (InvalidArgumentError in SelectV2 for a batch that works when called again) while the data pipeline was running
-            scores.append(np.asarray(self.model.predict_on_batch(x)[self.output])[:, 0])
-            labels.append(np.asarray(y[self.output])[:, 0])
+            label = np.asarray(y[self.output])
+            if label.shape[0] == 0:                                   # a batch every event of which was dropped (a mask on the labels, an upstream trigger)
+                continue
+            scores.append(np.asarray(self.model.predict_on_batch(x)[self.output]).reshape(label.shape[0], -1)[:, 0])
+            labels.append(label.reshape(label.shape[0], -1)[:, 0])
             if self.zone_key in y:
-                zone.append(np.asarray(y[self.zone_key])[:, 0])
+                zone.append(np.asarray(y[self.zone_key]).reshape(label.shape[0], -1)[:, 0])
+        if not scores:                                                # an empty stream: nothing to measure (NaN), not an error that would end the training
+            return {"all": (float("nan"), float("nan")), "n": 0, **({"zone": (float("nan"), float("nan"))} if self.zone_key else {})}
         scores, labels = np.concatenate(scores), np.concatenate(labels)
         out = {"all": self._auc_eff(scores, labels, labels == 1), "n": len(labels)}
         if zone:

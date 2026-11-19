@@ -2,7 +2,7 @@
 
 ``/r0_stages/event/telescope/tel_NNN``, one row per written event, three (432, T) arrays on the time axis of the waveform of the file:
 
-* ``alpha`` uint8: the FADC output (the same numbers as the ``r0`` waveform: kept here so the three stages sit together);
+* ``alpha`` uint8: the FADC output (the same numbers as the ``r0alpha`` waveform: kept here so the three stages sit together);
 * ``beta`` uint16: the patch7 sums of ``alpha`` (``triggerkit.camera.trigger_numpy.patch7_sums``), BEFORE any threshold, up to 7 x 255 = 1785;
 * ``gamma`` int16: the score of the deployed TDSCAN in REGISTER units, ``score * 128`` (``trigger_numpy.tdscan_register``), BEFORE any threshold; divide by 128 for the
   score units of the thresholds of the simulations (8.109374 = 50 kHz), compare with the register value of the camera (2050 on the real data of 2026-10-26).
